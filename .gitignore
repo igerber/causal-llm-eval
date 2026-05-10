@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.hypothesis/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code - local settings and generated files
+.claude/settings.local.json
+.claude/reviews/
+.claude/paper-review/
+.claude/scheduled_tasks.lock
+
+# MCP configuration (may contain tokens)
+.mcp.json
+
+# Eval run outputs (large; reproducible from harness)
+runs/case_study_v*/
+runs/preflight/
+runs/scratch/
+*.parquet.partial
+
+# Per-run venv pool (rebuildable)
+.venv-pool/
+
+# Per-initiative briefing notes (local only)
+BRIEFING.md
+briefings/
