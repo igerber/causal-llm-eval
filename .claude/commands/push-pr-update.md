@@ -69,7 +69,7 @@ Parse `$ARGUMENTS` to extract:
        - If ahead count > 0:
          - **Scan for secrets in commits to push** (see Section 3a below)
          - Compute `<files-changed-count>`: `git diff --name-only <comparison-ref>..HEAD | wc -l`
-         - Proceed to Section 3a (secret scan), then 3b (methodology checks), then Section 4 (Push to Remote) — will push with `-u` to set upstream
+         - Proceed to Section 3a (secret scan), then 3b (eval-validity checks), then Section 4 (Push to Remote) — will push with `-u` to set upstream
        - If ahead count = 0: Abort (new branch with nothing to push):
          ```
          No changes detected. Working directory is clean and branch has no commits ahead of <default-branch>.
@@ -80,7 +80,7 @@ Parse `$ARGUMENTS` to extract:
        - If ahead count > 0:
          - **Scan for secrets in commits to push** (see Section 3a below)
          - Compute `<files-changed-count>`: `git diff --name-only @{u}..HEAD | wc -l`
-         - Proceed to Section 3a (secret scan), then 3b (methodology checks), then Section 4 (Push to Remote) — there are committed changes to push
+         - Proceed to Section 3a (secret scan), then 3b (eval-validity checks), then Section 4 (Push to Remote) — there are committed changes to push
        - If ahead count = 0: Abort:
          ```
          No changes detected. Working directory is clean and branch is up to date.
@@ -123,7 +123,7 @@ When the working tree is clean but commits are ahead, check for eval-validity is
    ```
 
 2. If harness/grader/analysis or prompt/rubric files are present:
-   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt versioning) for pattern check definitions.
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt/rubric versioning) for pattern check definitions.
    2. Run those pattern checks on the changed files. Note: the canonical Section 2.1 Check A (subprocess spawn AST scan) operates on the working tree, not staged changes - it works equally well for already-committed changes.
    3. For any matches, display the file:line and flag message from that section.
 
@@ -148,7 +148,7 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    ```
 
    If harness/grader/analysis or prompt/rubric files are present:
-   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt versioning) for pattern check definitions.
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt/rubric versioning) for pattern check definitions.
    2. Run those pattern checks on the staged files.
    3. For any matches, display the file:line and flag message from that section.
 

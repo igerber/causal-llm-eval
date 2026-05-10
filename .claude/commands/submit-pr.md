@@ -162,7 +162,7 @@ Categorize changes for the template:
 ## Summary
 - <bullet point for each commit>
 
-## Eval validity references (required if harness / telemetry / prompt changes)
+## Eval validity references (required if harness / telemetry / prompt / rubric changes)
 - Affected validity guarantee(s): <cold-start | telemetry | prompt-contamination | reproducibility | comparator-fairness | "N/A">
 - Plan-file section / decision: <link or section name in plan, or "N/A">
 - Any intentional deviations from the plan (and why): <if applicable, or "None">

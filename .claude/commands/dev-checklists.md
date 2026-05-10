@@ -35,7 +35,7 @@ When adding a new field to `RunConfig`, `RunMetadata`, or another harness/grader
 
 ## Touching Eval-Validity Code
 
-When implementing or modifying code that affects eval validity (cold-start integrity, telemetry completeness, prompt versioning, comparator fairness, reproducibility):
+When implementing or modifying code that affects eval validity (cold-start integrity, telemetry completeness, prompt/rubric versioning, comparator fairness, reproducibility):
 
 1. **Before coding - consult the locked decisions**:
    - [ ] Read the latest plan in `~/.claude/plans/` (the active wave's plan)
@@ -172,7 +172,7 @@ grep -rn 'subprocess\.\(run\|Popen\|check_call\|check_output\)' harness/ graders
 grep -rn 'TelemetryRecord(' harness/ graders/ analysis/
 
 # Prompt registry version refs (catch in-place edits to recorded prompts)
-git log --oneline -- prompts/
+git log --oneline -- prompts/ rubrics/
 
 # Cold-start verification doc references
 grep -rn 'COLD_START_VERIFICATION' harness/ graders/ tests/ docs/ 2>/dev/null
