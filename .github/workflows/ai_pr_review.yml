@@ -144,15 +144,24 @@ jobs:
               echo "---"
             fi
             echo ""
+            # Use the merge-base of base and head, not base directly, so the
+            # diff is PR-shaped (only this branch's changes) even when the
+            # branch is behind base. Mirrors GitHub's three-dot PR view and
+            # the local /ai-review-local script's behavior.
+            MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            if [ -z "$MERGE_BASE" ]; then
+              # Disjoint history fallback - use base directly
+              MERGE_BASE="$BASE_SHA"
+            fi
             echo "Changed files:"
-            git --no-pager diff --name-status "$BASE_SHA" "$HEAD_SHA"
+            git --no-pager diff --name-status "$MERGE_BASE" "$HEAD_SHA"
             echo ""
             echo "Unified diff (context=5):"
             # Exclude large generated artifacts (per-run records, transcripts,
             # parquet outputs, dataset binaries) from the full diff to stay
             # within the model's input limit. The --name-status above still
             # lists them so the reviewer knows they exist.
-            git --no-pager diff --unified=5 "$BASE_SHA" "$HEAD_SHA" \
+            git --no-pager diff --unified=5 "$MERGE_BASE" "$HEAD_SHA" \
               -- . ':!runs/**/*.parquet' ':!runs/**/*.jsonl' \
                    ':!runs/**/transcript.txt' ':!datasets/*.parquet' \
                    ':!datasets/*.csv'

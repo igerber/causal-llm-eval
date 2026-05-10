@@ -57,4 +57,54 @@ def test_telemetry_contract():
         "called_get_llm_guide",
         "saw_fit_time_warning",
     }
-    assert flags <= set(typing.get_type_hints(TelemetryRecord))
+    hints = typing.get_type_hints(TelemetryRecord)
+    assert flags <= set(hints)
+    # arm field is required so downstream graders can validate the sentinel
+    # pattern (None for not-applicable surfaces) against the arm's contract.
+    assert "arm" in hints and hints["arm"] is str
+
+
+def test_telemetry_sentinel_semantics():
+    """Guide-discovery flags are tri-state to distinguish "no access" from "no surface".
+
+    For arm 1 (diff-diff): True = agent accessed; False = agent did not access.
+    For arm 2 (statsmodels): None = surface does not exist (not applicable).
+
+    Collapsing None into False would bias comparator-fairness analysis in
+    favor of statsmodels because absence-of-feature would look like
+    absence-of-discovery.
+    """
+    from pathlib import Path
+
+    from harness.telemetry import TelemetryRecord
+
+    # Default construction is statsmodels-shaped: guide fields are None.
+    record_statsmodels = TelemetryRecord(
+        arm="statsmodels",
+        stream_json_path=Path("/tmp/x"),
+        in_process_events_path=Path("/tmp/y"),
+        stderr_path=Path("/tmp/z"),
+    )
+    assert record_statsmodels.opened_llms_txt is None
+    assert record_statsmodels.opened_llms_practitioner is None
+    assert record_statsmodels.opened_llms_autonomous is None
+    assert record_statsmodels.opened_llms_full is None
+    assert record_statsmodels.called_get_llm_guide is None
+    # Always-applicable fields default to False, not None.
+    assert record_statsmodels.saw_fit_time_warning is False
+
+    # diff-diff arm: caller must explicitly set guide fields to True/False.
+    record_diff_diff = TelemetryRecord(
+        arm="diff_diff",
+        stream_json_path=Path("/tmp/x"),
+        in_process_events_path=Path("/tmp/y"),
+        stderr_path=Path("/tmp/z"),
+        opened_llms_txt=False,
+        opened_llms_practitioner=True,
+        opened_llms_autonomous=False,
+        opened_llms_full=False,
+        called_get_llm_guide=True,
+    )
+    assert record_diff_diff.opened_llms_txt is False
+    assert record_diff_diff.opened_llms_practitioner is True
+    assert record_diff_diff.called_get_llm_guide is True
