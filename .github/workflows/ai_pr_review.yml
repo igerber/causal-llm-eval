@@ -8,10 +8,10 @@ on:
   pull_request_review_comment:
     types: [created]
 
+# Top-level permissions are intentionally minimal. The review job downgrades
+# further; the post-comment job opts up to pull-requests/issues write.
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
 
 concurrency:
   group: ai-pr-review-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
 
     # Run if:
-    # - PR opened, OR
+    # - PR opened/reopened/synchronize, OR
     # - Comment "/ai-review" on a PR by a collaborator/member/owner (issue or inline diff comment)
     if: |
       (github.event_name == 'pull_request') ||
@@ -45,6 +45,18 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
+
+    # Read-only permissions for the secret-bearing job. issues/pull-requests
+    # read are needed to fetch PR metadata and any prior AI-review comments.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    outputs:
+      review_text: ${{ steps.run_codex.outputs.final-message }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
 
     steps:
       - name: Resolve PR number + metadata
@@ -78,9 +90,13 @@ jobs:
             core.setOutput("base_ref", pr.data.base.ref);
             core.setOutput("head_ref", pr.data.head.ref);
 
+      # Check out the PR merge ref WITHOUT persisting GITHUB_TOKEN to the
+      # workspace. We need the working tree for `git diff`, but the Codex step
+      # should not have ambient access to a write-capable token.
       - uses: actions/checkout@v6
         with:
           ref: refs/pull/${{ steps.pr.outputs.number }}/merge
+          persist-credentials: false
 
       - name: Pre-fetch base and head refs
         run: |
@@ -88,6 +104,30 @@ jobs:
           git fetch --no-tags origin \
             "${{ steps.pr.outputs.base_ref }}" \
             +refs/pull/${{ steps.pr.outputs.number }}/head
+
+      # SECURITY: load the reviewer prompt from the BASE ref (trusted), not
+      # from the PR checkout. A PR that modifies .github/codex/prompts/pr_review.md
+      # cannot use this run to swap the reviewer's instructions before Codex sees
+      # them. The compiled prompt is written under $RUNNER_TEMP, outside the
+      # repo workspace, so PR-controlled file paths cannot collide with it.
+      #
+      # Bootstrap fallback: if the prompt does not exist on the base ref (e.g.,
+      # the PR that introduces the prompt itself), fall back to the PR checkout
+      # with a stderr warning. After that bootstrap PR lands, every subsequent
+      # PR loads from base.
+      - name: Load reviewer prompt from trusted base ref
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/codex"
+          if git cat-file -e "${BASE_SHA}:.github/codex/prompts/pr_review.md" 2>/dev/null; then
+            git show "${BASE_SHA}:.github/codex/prompts/pr_review.md" \
+              > "$RUNNER_TEMP/codex/pr_review.md"
+          else
+            echo "::warning::Prompt not present on base ref ${BASE_SHA}; falling back to PR checkout. This bypasses prompt-injection protection and should only happen for the bootstrap PR that introduces the prompt." >&2
+            cp .github/codex/prompts/pr_review.md "$RUNNER_TEMP/codex/pr_review.md"
+          fi
 
       - name: Fetch previous AI review (if any)
         id: prev_review
@@ -118,12 +158,21 @@ jobs:
           PREV_REVIEW_FOUND: ${{ steps.prev_review.outputs.found }}
         run: |
           set -euo pipefail
-          PROMPT=.github/codex/prompts/pr_review_compiled.md
+          PROMPT="$RUNNER_TEMP/codex/pr_review_compiled.md"
 
-          cat .github/codex/prompts/pr_review.md > "$PROMPT"
+          cat "$RUNNER_TEMP/codex/pr_review.md" > "$PROMPT"
 
           {
             echo ""
+            # Use the merge-base of base and head, not base directly, so the
+            # diff is PR-shaped (only this branch's changes) even when the
+            # branch is behind base. Mirrors GitHub's three-dot PR view and
+            # the local /ai-review-local script's behavior.
+            MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            if [ -z "$MERGE_BASE" ]; then
+              # Disjoint history fallback - use base directly
+              MERGE_BASE="$BASE_SHA"
+            fi
             echo "---"
             echo "PR Title:"
             printf '%s\n' "$PR_TITLE"
@@ -144,15 +193,6 @@ jobs:
               echo "---"
             fi
             echo ""
-            # Use the merge-base of base and head, not base directly, so the
-            # diff is PR-shaped (only this branch's changes) even when the
-            # branch is behind base. Mirrors GitHub's three-dot PR view and
-            # the local /ai-review-local script's behavior.
-            MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-            if [ -z "$MERGE_BASE" ]; then
-              # Disjoint history fallback - use base directly
-              MERGE_BASE="$BASE_SHA"
-            fi
             echo "Changed files:"
             git --no-pager diff --name-status "$MERGE_BASE" "$HEAD_SHA"
             echo ""
@@ -172,19 +212,32 @@ jobs:
         uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: .github/codex/prompts/pr_review_compiled.md
+          prompt-file: ${{ runner.temp }}/codex/pr_review_compiled.md
           sandbox: read-only
           safety-strategy: drop-sudo
           # Recommended by OpenAI for review quality/consistency:
           model: gpt-5.5
           effort: xhigh
 
-      - name: Post PR comment (new on /ai-review, update on opened)
+  post-comment:
+    needs: review
+    if: needs.review.outputs.review_text != ''
+    runs-on: ubuntu-latest
+
+    # Write permissions are isolated to this no-secrets job so the secret-bearing
+    # Codex job above cannot use them even if a malicious prompt slipped through.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Post PR comment (new on /ai-review, update on opened/synchronize)
         uses: actions/github-script@v9
         env:
-          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          CODEX_FINAL_MESSAGE: ${{ needs.review.outputs.review_text }}
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.review.outputs.head_sha }}
         with:
           script: |
             const msg = (process.env.CODEX_FINAL_MESSAGE || "").trim();
