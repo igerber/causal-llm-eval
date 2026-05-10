@@ -256,9 +256,12 @@ For all code:
 #### Dimension 5: Architecture & Patterns
 
 Check against CLAUDE.md conventions:
-- Does it respect the estimator inheritance map? (Adding a param to `DifferenceInDifferences` auto-propagates to `TwoWayFixedEffects` and `MultiPeriodDiD`; standalone estimators need individual updates)
-- Does it use `linalg.py` for OLS/variance instead of reimplementing?
-- Does it follow the sklearn-like `fit()` / results-object pattern?
+- Does it respect the cold-start agent runner contract? (Locked `claude --bare ...` invocation, `cwd=<tmpdir>` + `env=clean_env` hygiene, no operator-state inheritance)
+- Does it preserve three-layer telemetry capture? (Stream-JSON + in-process shim + stderr; new tracked surfaces get the in-process layer, not just stream-JSON)
+- Does it use the per-arm venv pool abstraction (`build_arm_template` + `clone_for_run`) instead of ad-hoc venv creation?
+- Does it use the immutable prompts/ and rubrics/ registries (versioned, no in-place edit) rather than embedding prompts/rubrics inline?
+- Does it use the two-stage extraction pattern (deterministic from in-process events + AI judge from transcript) rather than a single-stage approach?
+- Does it pin all RunMetadata reproducibility fields (harness/library/Claude/model versions, dataset/prompt/rubric refs, random_seed, run_id, arm)?
 - Is there a simpler alternative that avoids new abstraction?
 - Does it match existing code patterns in the codebase?
 

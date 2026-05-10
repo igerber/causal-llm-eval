@@ -81,12 +81,15 @@ If already on a feature branch, use the current branch name.
 git add -A
 ```
 
-If harness/grader/analysis/prompt files are staged, run pattern checks per `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt versioning):
+If harness/grader/analysis/prompt/rubric files are staged, run pattern checks per `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt and rubric versioning):
 
 ```bash
 git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" >/dev/null && echo "harness changes detected"
 git diff --cached --name-only | grep -E "^prompts/" >/dev/null && echo "prompt changes detected"
+git diff --cached --name-only | grep -E "^rubrics/" >/dev/null && echo "rubric changes detected"
 ```
+
+A rubric-only change must also bump the rubric registry version (no in-place edit of recorded rubrics; new rubric = `vN+1.yaml`). The pre-merge-check pattern guidance covers both prompts and rubrics under the same versioning convention.
 
 Run all relevant pattern checks (A through E) on the staged files. For matches, display file:line and offer:
 ```

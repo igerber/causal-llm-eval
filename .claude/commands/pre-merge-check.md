@@ -88,26 +88,33 @@ git diff --name-only HEAD -- harness/sitecustomize_template.py harness/sitecusto
 ```
 Flag if only one arm's shim changed without documented rationale.
 
-#### 2.2 Prompt Versioning Patterns (for prompt changes)
+#### 2.2 Prompt / Rubric Versioning Patterns (for prompt or rubric changes)
 
-If `prompts/**/*.txt` changed:
+If `prompts/**/*.txt` OR `rubrics/**/*.yaml` changed:
 ```bash
-git diff --name-only HEAD -- prompts/
+git diff --name-only HEAD -- prompts/ rubrics/
 ```
 
-**Check D - Prompt edited in place vs new version**:
-Versioned prompts (e.g., `prompts/case_study/v1.txt`) should NOT be edited after first run. New prompt = new version file.
+**Check D - Versioned artifact edited in place vs new version**:
+Versioned prompts (e.g., `prompts/case_study/v1.txt`) and rubrics (e.g., `rubrics/case_study_v1.yaml`) should NOT be edited after first use in a recorded run. New artifact = new version file (`v2.txt`, `case_study_v2.yaml`).
 ```bash
-# Flag in-place edits to existing versioned prompts
-git diff --name-only HEAD -- prompts/ | xargs -I {} sh -c 'echo "Edited: {}"; git log --oneline {} | head -3'
+# Flag in-place edits to existing versioned prompts/rubrics
+git diff --name-only HEAD -- prompts/ rubrics/ | xargs -I {} sh -c 'echo "Edited: {}"; git log --oneline {} | head -3'
 ```
-Flag: "If this prompt has been used in a recorded run, create `vN+1.txt` instead of editing `vN.txt` in place."
+Flag: "If this prompt/rubric has been used in a recorded run, create `vN+1` instead of editing `vN` in place. Per-run records reference the version string; mutating a recorded artifact breaks reproducibility."
 
 **Check E - Prompt contamination patterns**:
 ```bash
 grep -rn -E '(get_llm_guide|llms\.txt|llms-practitioner|practitioner workflow|CallawaySantAnna|SunAbraham|dCDH|de Chaisemartin|HonestDiD|BaconDecomposition|pre-trends|sensitivity analysis|placebo)' prompts/case_study/ 2>/dev/null
 ```
 Flag: "Case-study prompts must NOT contain guidance hints (estimator names, methodology terms, library-specific surfaces). See pr_review.md anti-pattern #3."
+
+**Check F - Rubric schema sanity** (rubric files only):
+```bash
+# Verify YAML parses
+python3 -c "import yaml; yaml.safe_load(open('rubrics/<changed-file>.yaml'))"
+```
+Flag: "Rubric YAML must parse cleanly; downstream judge code consumes the structured fields."
 
 #### 2.3 Test Existence Check
 
