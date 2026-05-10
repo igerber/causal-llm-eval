@@ -56,7 +56,7 @@ make preflight
 
 ## Key Design Patterns
 
-1. **Cold-start agent runner**: Spawn `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands --print --output-format stream-json --add-dir <tmpdir>` in a fresh tmpdir with a per-run venv. The `--bare` flag is load-bearing; without it the spawned agent inherits operator state (`$HOME/.claude/CLAUDE.md`, auto-memory, plugins, keychain). Verified by `make smoke`'s inheritance probe.
+1. **Cold-start agent runner**: Spawn `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands --print --output-format stream-json --add-dir <tmpdir>` in a fresh tmpdir with a per-run venv. The `--bare` flag is load-bearing; without it the spawned agent inherits operator state (`$HOME/.claude/CLAUDE.md`, auto-memory, plugins, keychain). The runner ALSO pins `cwd=<run tmpdir>` and `env=clean_env` (an explicit allowlist of variables, not a denylist) so operator state cannot leak via `$HOME`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, AWS/MCP/GitHub env, etc. See `harness/COLD_START_VERIFICATION.md` for the full env contract. Verified by `make smoke`'s inheritance probe.
 
 2. **Three-layer telemetry**: Every run captures (a) stream-JSON event log from Claude Code (transcript + tool calls + file reads), (b) in-process Python instrumentation via `sitecustomize.py` (logs `import diff_diff`, `get_llm_guide(variant)`, fit-time `warnings.warn`, diagnostic method calls, estimator instantiations), and (c) subprocess stderr capture. Stream-JSON alone misses Python-internal access; the in-process layer is the discoverability ground truth.
 

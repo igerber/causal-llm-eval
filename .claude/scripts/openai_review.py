@@ -58,18 +58,28 @@ def _git(args: "list[str]", cwd: "str | None" = None) -> str:
 
 
 def capture_diff(base_ref: str, repo_root: str) -> "tuple[str, str]":
-    """Return (changed_files_text, unified_diff_text) for working tree vs base_ref.
+    """Return (changed_files_text, unified_diff_text) for working tree vs merge-base(base_ref).
+
+    Diffs against the merge-base of base_ref and HEAD rather than base_ref directly.
+    This produces the PR-shaped diff (only this branch's changes) even when the
+    branch is behind base_ref, mirroring the GitHub PR view's three-dot diff.
+    Diffing directly against base_ref would mix in unrelated upstream deltas if
+    the branch was created from an older base_ref.
 
     Captures both staged and unstaged changes, plus committed-on-branch.
     Excludes large generated artifacts (per-run records, transcripts, dataset binaries)
     matching the same patterns as the CI workflow.
     """
-    name_status = _git(["diff", "--name-status", base_ref], cwd=repo_root)
+    merge_base = _git(["merge-base", base_ref, "HEAD"], cwd=repo_root).strip()
+    if not merge_base:
+        # Fall back to direct base_ref diff if merge-base is empty (e.g., disjoint history)
+        merge_base = base_ref
+    name_status = _git(["diff", "--name-status", merge_base], cwd=repo_root)
     diff = _git(
         [
             "diff",
             "--unified=5",
-            base_ref,
+            merge_base,
             "--",
             ".",
             ":!runs/**/*.parquet",

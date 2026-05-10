@@ -19,6 +19,25 @@ claude --bare \
 
 `--bare` is load-bearing - it suppresses CLAUDE.md auto-discovery, auto-memory, plugin sync, attribution, and keychain reads. The other flags strip the remaining surfaces.
 
+## Subprocess hygiene (equally load-bearing)
+
+CLI flags are necessary but not sufficient. The runner also pins:
+
+- **`cwd=<run tmpdir>`** - the spawned Claude process starts in the per-run tmpdir, not the harness's working directory. This prevents the agent from discovering files in the harness repo itself (CLAUDE.md, .claude/, etc.).
+- **`env=clean_env`** - the parent's environment is NOT inherited. The runner constructs a minimal `clean_env` containing ONLY the variables required for the agent to function:
+
+  | Variable | Why allowed |
+  |---|---|
+  | `PATH` | needed for the agent to find `python`, `pip`, etc. (set to the per-run venv's bin first) |
+  | `HOME` | set to the per-run tmpdir, NOT the operator's `$HOME`, so any file lookup against `~` lands in the sandbox |
+  | `LANG`, `LC_*` | locale; harmless |
+  | `ANTHROPIC_API_KEY` | the agent needs to call the Claude API to function |
+  | `CAUSAL_LLM_EVAL_EVENT_LOG` | tells the in-process shim where to write |
+
+  Anything else (especially `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_PROJECT_*`, `OPENAI_*`, `AWS_*`, MCP-related vars, GitHub auth tokens, `CODEX_*`) is dropped. The runner enforces this via an explicit allowlist in the spawn site, not a denylist.
+
+- **No symlink tricks**: the per-run tmpdir is a real directory containing only the dataset and the prompt; no symlinks back into the operator's homedir.
+
 ## Inheritance probe
 
 The smoke test runs the agent with a probe prompt:
@@ -44,5 +63,8 @@ The pre-merge-check skill (Section 2.1) runs an AST-based scan for required cold
 | Skills | Probe asks "what slash commands or skills are available"; agent reports only built-in `/help` etc. |
 | MCP servers | `--strict-mcp-config` plus no MCP config file; probe confirms no MCP tools |
 | Keychain / auth | `--bare` suppresses keychain reads; verify no Anthropic OAuth token in env |
+| Operator `$HOME` | Spawned process's `$HOME` points at the per-run tmpdir, not the operator's homedir; probe confirms `~` resolves inside the sandbox |
+| Inherited env vars | `env=clean_env` allowlist enforced at spawn time; probe asks `printenv` and asserts only allowed keys are present |
+| Operator cwd | Spawn site uses `cwd=<run tmpdir>`, not the harness repo; probe confirms `pwd` is the tmpdir |
 
 This file is updated when a new surface is identified that the probe should check.
