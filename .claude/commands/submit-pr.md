@@ -81,15 +81,16 @@ If already on a feature branch, use the current branch name.
 git add -A
 ```
 
-If harness/grader/analysis/prompt/rubric files are staged, run pattern checks per `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt and rubric versioning):
+If harness/grader/analysis/prompt/rubric/Makefile files are staged, run pattern checks per `/pre-merge-check` Sections 2.1 (cold-start integrity), 2.2 (prompt and rubric versioning), and 2.5 (reproducibility schema):
 
 ```bash
-git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" >/dev/null && echo "harness changes detected"
+git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" >/dev/null && echo "harness/grader/analysis changes detected"
 git diff --cached --name-only | grep -E "^prompts/" >/dev/null && echo "prompt changes detected"
 git diff --cached --name-only | grep -E "^rubrics/" >/dev/null && echo "rubric changes detected"
+git diff --cached --name-only | grep -E "^Makefile$" >/dev/null && echo "Makefile changes detected (reproducibility-target surface)"
 ```
 
-A rubric-only change must also bump the rubric registry version (no in-place edit of recorded rubrics; new rubric = `vN+1.yaml`). The pre-merge-check pattern guidance covers both prompts and rubrics under the same versioning convention.
+A rubric-only change must also bump the rubric registry version (no in-place edit of recorded rubrics; new rubric = `vN+1.yaml`). The pre-merge-check pattern guidance covers both prompts and rubrics under the same versioning convention. Makefile changes that touch `case-study-v1`, `preflight`, `calibration`, or `smoke` targets are reproducibility-relevant - run Section 2.5.
 
 Run all relevant pattern checks (A through F) on the staged files. For matches, display file:line and offer:
 ```
@@ -180,7 +181,7 @@ Generated with Claude Code
 ```
 
 **Template logic**:
-- **Eval validity**: Mark "N/A" only if NO files changed in `harness/`, `prompts/`, `rubrics/`, or `graders/`. If any changed, identify which validity guarantee is affected.
+- **Eval validity**: Mark "N/A" only if NO files changed in `harness/`, `graders/`, `analysis/`, `prompts/`, `rubrics/`, or any reproducibility-relevant `Makefile` targets (`case-study-v1`, `preflight`, `calibration`, `smoke`). If any changed, identify which validity guarantee is affected.
 - **Validation**: List `test_*.py` files changed; report `make smoke` status.
 - **Security**: Default "Yes"; warn if `.env`, credentials, or API key patterns detected.
 

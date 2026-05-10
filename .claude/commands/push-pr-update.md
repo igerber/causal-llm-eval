@@ -120,6 +120,7 @@ When the working tree is clean but commits are ahead, check for eval-validity is
    git diff --name-only <comparison-ref>..HEAD | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
    git diff --name-only <comparison-ref>..HEAD | grep -E "^prompts/" 2>/dev/null
    git diff --name-only <comparison-ref>..HEAD | grep -E "^rubrics/" 2>/dev/null
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^Makefile$" 2>/dev/null
    ```
 
 2. If harness/grader/analysis or prompt/rubric files are present:
@@ -153,11 +154,12 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
    git diff --cached --name-only | grep -E "^prompts/" 2>/dev/null
    git diff --cached --name-only | grep -E "^rubrics/" 2>/dev/null
+   git diff --cached --name-only | grep -E "^Makefile$" 2>/dev/null
    ```
 
-   If harness/grader/analysis or prompt/rubric files are present:
-   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt/rubric versioning) for pattern check definitions.
-   2. Run those pattern checks on the staged files.
+   If harness/grader/analysis or prompt/rubric or Makefile files are present:
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity), 2.2 (prompt/rubric versioning), and 2.5 (reproducibility schema) for pattern check definitions.
+   2. Run those pattern checks on the staged files. (Sections 2.1/2.2/2.5 use `git diff --cached` references that work in the staged flow without an override.)
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found:
