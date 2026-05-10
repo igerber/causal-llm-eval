@@ -28,9 +28,12 @@ by removing REGISTRY.md section extraction, import-graph expansion, and
 re-review state tracking. Re-add features here as the eval grows.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -91,6 +94,69 @@ def capture_diff(base_ref: str, repo_root: str) -> "tuple[str, str]":
         cwd=repo_root,
     )
     return name_status, diff
+
+
+# ---------------------------------------------------------------------------
+# Secret scanning (canonical patterns mirrored from /pre-merge-check Section 2.6)
+# ---------------------------------------------------------------------------
+
+# These patterns are kept in sync with .claude/commands/pre-merge-check.md
+# Section 2.6. Editing here should be paired with a corresponding edit there.
+SECRET_CONTENT_PATTERN = re.compile(
+    r"AKIA[A-Z0-9]{16}"
+    r"|ghp_[a-zA-Z0-9]{36}"
+    r"|sk-[a-zA-Z0-9]{48}"
+    r"|gho_[a-zA-Z0-9]{36}"
+    r"|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][\s]*[=:]"
+    r"|[Ss][Ee][Cc][Rr][Ee][Tt][_-]?[Kk][Ee][Yy][\s]*[=:]"
+    r"|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][\s]*[=:]"
+    r"|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy]"
+    r"|[Bb][Ee][Aa][Rr][Ee][Rr][\s]+[a-zA-Z0-9_-]+"
+    r"|[Tt][Oo][Kk][Ee][Nn][\s]*[=:]"
+)
+
+SENSITIVE_FILENAME_PATTERN = re.compile(
+    r"(\.env|credentials|secret|\.pem|\.key|\.p12|\.pfx|id_rsa|id_ed25519)$",
+    re.IGNORECASE,
+)
+
+
+def scan_diff_for_secrets(diff_text: str, name_status: str) -> "tuple[list[str], list[str]]":
+    """Return (content_hits_filenames, sensitive_filenames).
+
+    Mirrors the /pre-merge-check Section 2.6 patterns. Walks the unified diff,
+    flags any added line containing a content pattern, and any changed file
+    whose name matches the sensitive filename pattern.
+    """
+    content_hits: set[str] = set()
+    current_file: str | None = None
+    for line in diff_text.splitlines():
+        # Track the current file via the +++ header
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/") :]
+            continue
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        # Only scan added lines (not removed or context)
+        if not line.startswith("+"):
+            continue
+        if line.startswith("+++"):  # safety; already handled
+            continue
+        # Strip the leading '+'
+        added = line[1:]
+        if SECRET_CONTENT_PATTERN.search(added) and current_file is not None:
+            content_hits.add(current_file)
+
+    sensitive_files: set[str] = set()
+    for raw in name_status.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 2:
+            continue
+        path = parts[-1]
+        if SENSITIVE_FILENAME_PATTERN.search(path):
+            sensitive_files.add(path)
+
+    return sorted(content_hits), sorted(sensitive_files)
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +290,7 @@ def call_openai(
     if content.strip() and status == "incomplete":
         detail = result.get("incomplete_details") or ""
         print(
-            "Error: Review was truncated (status='incomplete'). "
-            "Output may be missing findings.",
+            "Error: Review was truncated (status='incomplete'). " "Output may be missing findings.",
             file=sys.stderr,
         )
         if detail:
@@ -302,6 +367,16 @@ def main() -> None:
         default=None,
         help="Repo root to run git from (default: current directory).",
     )
+    parser.add_argument(
+        "--allow-sensitive",
+        action="store_true",
+        help=(
+            "Skip the script-internal secret scan. The /ai-review-local skill "
+            "scans before calling and passes this flag once the user has "
+            "confirmed transmission. Direct callers of this script should "
+            "leave it off so accidental secret disclosure is caught."
+        ),
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -317,6 +392,30 @@ def main() -> None:
     if not diff_text.strip():
         print(f"No diff against {args.base}. Nothing to review.", file=sys.stderr)
         sys.exit(0)
+
+    # Defense in depth: even though /ai-review-local scans before calling, scan
+    # again here so direct callers of openai_review.py don't accidentally upload
+    # secrets. The skill passes --allow-sensitive after the user has confirmed.
+    if not args.allow_sensitive:
+        content_hits, sensitive_files = scan_diff_for_secrets(diff_text, name_status)
+        if content_hits or sensitive_files:
+            print(
+                "Error: potential secrets detected in the diff that would be "
+                "transmitted to OpenAI:",
+                file=sys.stderr,
+            )
+            for f in content_hits:
+                print(f"  [content match] {f}", file=sys.stderr)
+            for f in sensitive_files:
+                print(f"  [sensitive filename] {f}", file=sys.stderr)
+            print(
+                "\nReview and remove these before retrying, or pass "
+                "--allow-sensitive to override (only do this if the matches are "
+                "false positives, e.g., regex patterns in source code rather "
+                "than actual secret values).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     criteria_text = _read_file(args.review_criteria, "review criteria")
     prompt = compile_prompt(criteria_text, name_status, diff_text, branch, args.base)

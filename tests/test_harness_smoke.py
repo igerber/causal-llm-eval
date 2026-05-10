@@ -108,3 +108,65 @@ def test_telemetry_sentinel_semantics():
     assert record_diff_diff.opened_llms_txt is False
     assert record_diff_diff.opened_llms_practitioner is True
     assert record_diff_diff.called_get_llm_guide is True
+
+
+def test_telemetry_post_init_rejects_invalid_arm():
+    """Unknown arm strings are rejected at construction time."""
+    from pathlib import Path
+
+    import pytest
+
+    from harness.telemetry import TelemetryRecord
+
+    with pytest.raises(ValueError, match="not one of"):
+        TelemetryRecord(
+            arm="unknown_lib",
+            stream_json_path=Path("/tmp/x"),
+            in_process_events_path=Path("/tmp/y"),
+            stderr_path=Path("/tmp/z"),
+        )
+
+
+def test_telemetry_post_init_rejects_diff_diff_with_none_guide_fields():
+    """diff-diff arm requires bool guide fields; None violates the contract."""
+    from pathlib import Path
+
+    import pytest
+
+    from harness.telemetry import TelemetryRecord
+
+    # Constructing with arm="diff_diff" and guide fields left at default None
+    # is invalid - the merger must record discovery outcome, not leave None.
+    with pytest.raises(ValueError, match="must be bool"):
+        TelemetryRecord(
+            arm="diff_diff",
+            stream_json_path=Path("/tmp/x"),
+            in_process_events_path=Path("/tmp/y"),
+            stderr_path=Path("/tmp/z"),
+            # opened_llms_txt left as default None - should raise
+            opened_llms_practitioner=False,
+            opened_llms_autonomous=False,
+            opened_llms_full=False,
+            called_get_llm_guide=False,
+        )
+
+
+def test_telemetry_post_init_rejects_statsmodels_with_bool_guide_fields():
+    """statsmodels arm requires None guide fields; bool violates the contract."""
+    from pathlib import Path
+
+    import pytest
+
+    from harness.telemetry import TelemetryRecord
+
+    # Constructing arm="statsmodels" with a bool guide field is invalid -
+    # statsmodels has no guide surfaces, so True/False conflates "not
+    # applicable" with "not discovered".
+    with pytest.raises(ValueError, match="must be None"):
+        TelemetryRecord(
+            arm="statsmodels",
+            stream_json_path=Path("/tmp/x"),
+            in_process_events_path=Path("/tmp/y"),
+            stderr_path=Path("/tmp/z"),
+            opened_llms_txt=False,  # invalid for statsmodels
+        )

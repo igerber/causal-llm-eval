@@ -18,7 +18,7 @@ smoke:
 	@false
 
 test:
-	pytest -v --tb=short -m "not slow and not live"
+	pytest
 
 lint:
 	ruff check harness graders analysis tests

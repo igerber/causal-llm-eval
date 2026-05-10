@@ -93,6 +93,8 @@ If either is non-empty, use AskUserQuestion to confirm transmission to OpenAI be
 
 ### Step 4: Run the Review Script
 
+The skill scanned the diff in Step 3b and the user confirmed any false-positive matches. Pass `--allow-sensitive` to tell the script not to re-scan and refuse - it would otherwise duplicate the prompt and could surprise the user with a second confirmation flow.
+
 ```bash
 output_path=".claude/reviews/local-review-latest.md"
 python3 .claude/scripts/openai_review.py \
@@ -100,6 +102,7 @@ python3 .claude/scripts/openai_review.py \
     --output "$output_path" \
     --base "$comparison_ref" \
     --repo-root "$(pwd)" \
+    --allow-sensitive \
     [--model <model>] \
     [--timeout <seconds>]
 ```

@@ -52,7 +52,10 @@ include = ["harness*", "graders*", "analysis*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+# Slow and live tests are excluded by default at the addopts level so plain
+# `pytest` matches `make test` behavior. Run `pytest -m slow` or `pytest -m live`
+# to include them; `pytest -m ''` runs everything.
+addopts = "-v --tb=short -m \"not slow and not live\""
 markers = [
     "slow: marks tests as slow (exclude by default)",
     "live: tests that hit the live Claude API or spawn real claude subprocesses",

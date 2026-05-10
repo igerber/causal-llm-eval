@@ -62,6 +62,51 @@ class TelemetryRecord:
     diagnostic_methods_invoked: tuple[str, ...] = ()
     estimator_classes_instantiated: tuple[str, ...] = ()
 
+    # Set of fields whose tri-state encoding depends on arm.
+    _ARM_SENTINEL_FIELDS = (
+        "opened_llms_txt",
+        "opened_llms_practitioner",
+        "opened_llms_autonomous",
+        "opened_llms_full",
+        "called_get_llm_guide",
+    )
+    _VALID_ARMS = ("diff_diff", "statsmodels")
+
+    def __post_init__(self) -> None:
+        """Enforce arm-specific contracts on construction.
+
+        - Reject unknown arms.
+        - For arm == "diff_diff", every sentinel-bearing field MUST be a bool
+          (not None). The diff-diff arm has guide surfaces; the merger is
+          obligated to fill them in.
+        - For arm == "statsmodels", every sentinel-bearing field MUST be None
+          (not bool). The statsmodels arm has no guide surfaces; encoding
+          False would conflate "not applicable" with "not discovered".
+
+        Catching this at construction prevents downstream graders/analysis from
+        silently consuming corrupted records.
+        """
+        if self.arm not in self._VALID_ARMS:
+            raise ValueError(f"TelemetryRecord.arm={self.arm!r} is not one of {self._VALID_ARMS}")
+        for field_name in self._ARM_SENTINEL_FIELDS:
+            value = getattr(self, field_name)
+            if self.arm == "diff_diff":
+                if not isinstance(value, bool):
+                    raise ValueError(
+                        f"TelemetryRecord(arm='diff_diff').{field_name} must be "
+                        f"bool (True/False), got {value!r}. The diff-diff arm "
+                        f"has guide surfaces; the merger must record discovery "
+                        f"outcome, not leave the field as None."
+                    )
+            elif self.arm == "statsmodels":
+                if value is not None:
+                    raise ValueError(
+                        f"TelemetryRecord(arm='statsmodels').{field_name} must "
+                        f"be None (not applicable), got {value!r}. statsmodels "
+                        f"has no guide surfaces; encoding True/False would "
+                        f"conflate 'not applicable' with 'not discovered'."
+                    )
+
 
 def merge_layers(
     arm: str,
