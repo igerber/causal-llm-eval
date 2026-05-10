@@ -81,7 +81,7 @@ rg -U --multiline -n 'subprocess\.(run|Popen|check_call|check_output)\(\s*\[.*?"
 ```
 and manually verify each match contains all four flags.
 
-**Check C - In-process telemetry shim parity**:
+**Check B - In-process telemetry shim parity**:
 For changes touching the diff-diff arm shim, check the statsmodels arm shim was updated:
 ```bash
 git diff --name-only HEAD -- harness/sitecustomize_template.py harness/sitecustomize_*.py | head
@@ -95,7 +95,7 @@ If `prompts/**/*.txt` OR `rubrics/**/*.yaml` changed:
 git diff --name-only HEAD -- prompts/ rubrics/
 ```
 
-**Check D - Versioned artifact edited in place vs new version**:
+**Check C - Versioned artifact edited in place vs new version**:
 Versioned prompts (e.g., `prompts/case_study/v1.txt`) and rubrics (e.g., `rubrics/case_study_v1.yaml`) should NOT be edited after first use in a recorded run. New artifact = new version file (`v2.txt`, `case_study_v2.yaml`).
 ```bash
 # Flag in-place edits to existing versioned prompts/rubrics
@@ -103,13 +103,13 @@ git diff --name-only HEAD -- prompts/ rubrics/ | xargs -I {} sh -c 'echo "Edited
 ```
 Flag: "If this prompt/rubric has been used in a recorded run, create `vN+1` instead of editing `vN` in place. Per-run records reference the version string; mutating a recorded artifact breaks reproducibility."
 
-**Check E - Prompt contamination patterns**:
+**Check D - Prompt contamination patterns**:
 ```bash
 grep -rn -E '(get_llm_guide|llms\.txt|llms-practitioner|practitioner workflow|CallawaySantAnna|SunAbraham|dCDH|de Chaisemartin|HonestDiD|BaconDecomposition|pre-trends|sensitivity analysis|placebo)' prompts/case_study/ 2>/dev/null
 ```
 Flag: "Case-study prompts must NOT contain guidance hints (estimator names, methodology terms, library-specific surfaces). See pr_review.md anti-pattern #3."
 
-**Check F - Rubric schema sanity** (rubric files only):
+**Check E - Rubric schema sanity** (rubric files only):
 ```bash
 # Verify YAML parses
 python3 -c "import yaml; yaml.safe_load(open('rubrics/<changed-file>.yaml'))"

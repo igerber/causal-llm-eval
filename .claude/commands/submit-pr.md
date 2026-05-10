@@ -92,7 +92,7 @@ git diff --cached --name-only | grep -E "^Makefile$" >/dev/null && echo "Makefil
 
 A rubric-only change must also bump the rubric registry version (no in-place edit of recorded rubrics; new rubric = `vN+1.yaml`). The pre-merge-check pattern guidance covers both prompts and rubrics under the same versioning convention. Makefile changes that touch `case-study-v1`, `preflight`, `calibration`, or `smoke` targets are reproducibility-relevant - run Section 2.5.
 
-Run all relevant pattern checks (A through F) on the staged files. For matches, display file:line and offer:
+Run all relevant pattern checks (A through E) on the staged files. For matches, display file:line and offer:
 ```
 Pre-commit pattern check found N potential issues:
 <list warnings>
