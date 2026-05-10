@@ -222,9 +222,9 @@ Use your findings from Step 3. Flag:
 Is the scope right — not too much, not too little?
 
 Check for **missing related changes**:
-- Tests for new/changed functionality
-- `__init__.py` export updates
-- `get_params()` / `set_params()` updates for new parameters
+- Tests for new/changed functionality (smoke tests for new module surfaces; behavioral tests for new contracts)
+- `__init__.py` export updates if a new public surface was added
+- `RunConfig` / `RunMetadata` / `TelemetryRecord` field additions if a new per-run dimension was introduced (with `__post_init__` validation if arm-specific)
 - Documentation updates: CLAUDE.md if conventions changed; `prompts/` and `rubrics/` registry version bumps if recorded prompts/rubrics changed (no in-place edits); `harness/COLD_START_VERIFICATION.md` if the cold-start contract changed; `TODO.md` for new tracked tech debt; `ROADMAP.md` if a planned-feature item is shipped or rescoped. README updates only for landing-page-relevant changes (status, hero/tagline, top-level capability summary).
 - For bug fixes: did the plan grep for ALL occurrences of the pattern, or just the one reported?
 
@@ -362,7 +362,7 @@ Present the review in the following format. Number each issue sequentially withi
 
 Cross-reference against the relevant development checklists in `.claude/commands/dev-checklists.md`. List which checklist items are not addressed by the plan.
 
-[Identify which checklist applies (e.g., "Adding a New Parameter to Estimators", "Implementing Methodology-Critical Code", "Fixing Bugs Across Multiple Locations") and list any items from that checklist that the plan doesn't cover.]
+[Identify which checklist applies (e.g., "Adding a New Configuration Parameter", "Touching Eval-Validity Code", "Adding Warning/Error/Fallback Handling", "Reviewing New Features or Code Paths", "Fixing Bugs Across Multiple Locations") and list any items from that checklist that the plan doesn't cover.]
 
 **Locked-Decisions Alignment** (if plan touches harness contracts):
 - [ ] Plan-described behavior matches locked architectural decisions in the latest plan + CLAUDE.md (or deviations documented with `**Note:**` / `**Deviation from plan:**`)
