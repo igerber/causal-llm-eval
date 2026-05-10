@@ -48,7 +48,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["harness*", "graders*"]
+include = ["harness*", "graders*", "analysis*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

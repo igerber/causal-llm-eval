@@ -100,7 +100,7 @@ The AI PR reviewer recognizes deviations as documented (and downgrades them to P
 
 ## Workflow
 
-- CI tests are gated behind the `ready-for-ci` label. The `CI Gate` required status check enforces this - PRs cannot merge until the label is added. Tests run automatically once the label is present.
+- CI tests are gated behind the `ready-for-ci` label. The `CI Gate` required status check enforces this - PRs cannot merge until the label is added. **Phase 0 status**: only the label gate is implemented; the actual test workflow (`pytest`, `make smoke`) lands in a follow-up PR alongside the harness implementation. Until then, the gate enforces the convention but does not run tests.
 - For non-trivial tasks, use `EnterPlanMode`. Consult the latest plan in `~/.claude/plans/` for locked decisions.
 - For bug fixes, grep for the pattern across all files before fixing.
 - Follow the relevant development checklists (run `/dev-checklists`).

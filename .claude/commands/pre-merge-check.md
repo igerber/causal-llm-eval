@@ -33,17 +33,53 @@ Categorize:
 
 If any harness files changed:
 
-**Check A - Subprocess spawn missing `--bare`**:
-```bash
-grep -rn 'subprocess.*claude' harness/ graders/ | grep -v '\-\-bare' | grep -v '^\s*#'
-```
-Flag: "Cold-start spawn must include `claude --bare` (locked architectural decision). Missing in <file:line>."
+The locked subprocess invocation is multiline (a Python list literal split across lines), so single-line `grep` will miss it. Use multiline-aware tooling: `rg -U` (or a small Python AST scanner) to inspect the full subprocess call block, not just one line at a time.
 
-**Check B - Subprocess spawn missing `--setting-sources ""`**:
+**Check A - Subprocess `claude` spawn missing required cold-start flags**:
 ```bash
-grep -rn '"claude".*"--bare"' harness/ graders/ | grep -v 'setting-sources' | grep -v '^\s*#'
+# Multiline rg: find each subprocess.run/Popen call that mentions "claude"
+# and verify it contains all four locked flags.
+python3 - <<'PY'
+import ast, pathlib, sys
+required = {"--bare", "--setting-sources", "--strict-mcp-config", "--disable-slash-commands"}
+problems = []
+for path in pathlib.Path(".").rglob("*.py"):
+    if any(part in {".venv", ".venv-pool", "__pycache__"} for part in path.parts):
+        continue
+    if not any(str(path).startswith(p) for p in ("harness/", "graders/", "tests/")):
+        continue
+    try:
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        continue
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+        if not any(name in func_str for name in ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output")):
+            continue
+        # Look for the literal "claude" in any positional or keyword arg
+        try:
+            args_str = " ".join(ast.unparse(a) for a in node.args)
+        except Exception:
+            continue
+        if '"claude"' not in args_str and "'claude'" not in args_str:
+            continue
+        missing = sorted(f for f in required if f not in args_str)
+        if missing:
+            problems.append((path, node.lineno, missing))
+for p, ln, missing in problems:
+    print(f"{p}:{ln}: missing cold-start flags: {missing}")
+sys.exit(1 if problems else 0)
+PY
 ```
-Flag: "Cold-start spawn must include `--setting-sources ""` to suppress global settings."
+Flag: "Cold-start spawn must include `--bare`, `--setting-sources \"\"`, `--strict-mcp-config`, `--disable-slash-commands` (locked architectural decision). Missing flags in <file:line>."
+
+The Python AST scan is robust to multiline subprocess calls; the previous single-line grep heuristic missed them. If `python3` is unavailable, fall back to:
+```bash
+rg -U --multiline -n 'subprocess\.(run|Popen|check_call|check_output)\(\s*\[.*?"claude".*?\]' harness/ graders/ tests/ 2>/dev/null
+```
+and manually verify each match contains all four flags.
 
 **Check C - In-process telemetry shim parity**:
 For changes touching the diff-diff arm shim, check the statsmodels arm shim was updated:

@@ -33,15 +33,20 @@ def test_graders_imports():
 
 def test_runner_contract():
     """RunConfig and RunResult dataclass shapes are present."""
+    import typing
+
     from harness.runner import RunConfig, RunResult, run_one
 
-    assert RunConfig.__annotations__["arm"] is str
-    assert "transcript_jsonl_path" in RunResult.__annotations__
+    # Use get_type_hints to resolve `from __future__ import annotations` strings
+    assert typing.get_type_hints(RunConfig)["arm"] is str
+    assert "transcript_jsonl_path" in typing.get_type_hints(RunResult)
     assert callable(run_one)
 
 
 def test_telemetry_contract():
     """TelemetryRecord exposes the discoverability flags the rubric expects."""
+    import typing
+
     from harness.telemetry import TelemetryRecord
 
     flags = {
@@ -52,4 +57,4 @@ def test_telemetry_contract():
         "called_get_llm_guide",
         "saw_fit_time_warning",
     }
-    assert flags <= set(TelemetryRecord.__annotations__)
+    assert flags <= set(typing.get_type_hints(TelemetryRecord))

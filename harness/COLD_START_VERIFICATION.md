@@ -29,9 +29,9 @@ A correctly cold-started agent reports nothing preloaded. The probe response is 
 
 ## CI gate
 
-`make smoke` runs the inheritance probe on every PR. The CI workflow (in `.github/workflows/`) blocks merge if `make smoke` fails. Adding a new code path that touches the cold-start invocation requires the smoke test to still pass.
+**Phase 0 status**: the label gate (`ready-for-ci`) is in place, but the actual test workflow that runs `make smoke` is not yet implemented. It lands in a follow-up PR alongside the runner implementation. Once present, the workflow will block merge if `make smoke` fails, ensuring every PR that touches the cold-start invocation re-verifies the inheritance probe.
 
-The pre-merge-check skill (Section 2.1) runs grep-based pattern checks for missing `--bare` in any new subprocess spawn site, providing a fast first-pass before the smoke test.
+The pre-merge-check skill (Section 2.1) runs an AST-based scan for required cold-start flags on any new subprocess spawn site, providing a fast first-pass before the smoke test. This catches multiline `subprocess.run([...])` invocations that single-line `grep` would miss.
 
 ## Verification matrix (run periodically)
 
