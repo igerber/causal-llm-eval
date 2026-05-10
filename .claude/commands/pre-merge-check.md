@@ -35,13 +35,31 @@ If any harness files changed:
 
 The locked subprocess invocation is multiline (a Python list literal split across lines), so single-line `grep` will miss it. Use multiline-aware tooling: `rg -U` (or a small Python AST scanner) to inspect the full subprocess call block, not just one line at a time.
 
-**Check A - Subprocess `claude` spawn missing required cold-start flags**:
+**Check A - Subprocess `claude` spawn missing required cold-start flags or hygiene**:
 ```bash
-# Multiline rg: find each subprocess.run/Popen call that mentions "claude"
-# and verify it contains all four locked flags.
+# Multiline AST scan: find each subprocess.run/Popen call that mentions "claude"
+# and verify it contains ALL seven locked flags AND the cwd/env hygiene keywords.
+# This is the canonical cold-start surface check; it must match the full locked
+# invocation in CLAUDE.md "Cold-start agent runner" and harness/COLD_START_VERIFICATION.md
+# "The locked invocation" + "Subprocess hygiene".
 python3 - <<'PY'
 import ast, pathlib, sys
-required = {"--bare", "--setting-sources", "--strict-mcp-config", "--disable-slash-commands"}
+
+# All seven locked CLI flags (per CLAUDE.md L59 and COLD_START_VERIFICATION.md L7-L20).
+required_flags = {
+    "--bare",
+    "--setting-sources",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--print",
+    "--output-format",
+    "--add-dir",
+}
+# Required subprocess kwargs (per COLD_START_VERIFICATION.md "Subprocess hygiene"
+# section). cwd= forces the spawn into the per-run tmpdir; env= constructs a
+# clean allowlist instead of inheriting the operator's environment.
+required_kwargs = {"cwd", "env"}
+
 problems = []
 for path in pathlib.Path(".").rglob("*.py"):
     if any(part in {".venv", ".venv-pool", "__pycache__"} for part in path.parts):
@@ -65,21 +83,36 @@ for path in pathlib.Path(".").rglob("*.py"):
             continue
         if '"claude"' not in args_str and "'claude'" not in args_str:
             continue
-        missing = sorted(f for f in required if f not in args_str)
-        if missing:
-            problems.append((path, node.lineno, missing))
-for p, ln, missing in problems:
-    print(f"{p}:{ln}: missing cold-start flags: {missing}")
+        missing_flags = sorted(f for f in required_flags if f not in args_str)
+        # Check for required keyword arguments on the subprocess.* call
+        provided_kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
+        missing_kwargs = sorted(required_kwargs - provided_kwargs)
+        # Bonus: verify --output-format is paired with stream-json (locked value)
+        bad_output_format = (
+            "--output-format" in args_str
+            and "stream-json" not in args_str
+        )
+        if missing_flags or missing_kwargs or bad_output_format:
+            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_output_format))
+for p, ln, mf, mk, bof in problems:
+    parts = []
+    if mf:
+        parts.append(f"missing flags: {mf}")
+    if mk:
+        parts.append(f"missing kwargs: {mk}")
+    if bof:
+        parts.append("output-format != stream-json")
+    print(f"{p}:{ln}: " + "; ".join(parts))
 sys.exit(1 if problems else 0)
 PY
 ```
-Flag: "Cold-start spawn must include `--bare`, `--setting-sources \"\"`, `--strict-mcp-config`, `--disable-slash-commands` (locked architectural decision). Missing flags in <file:line>."
+Flag: "Cold-start spawn must include all seven locked flags (`--bare`, `--setting-sources`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir`) AND the `cwd=` and `env=` keyword arguments (per `harness/COLD_START_VERIFICATION.md` 'Subprocess hygiene' section). Missing items in <file:line>."
 
 The Python AST scan is robust to multiline subprocess calls; the previous single-line grep heuristic missed them. If `python3` is unavailable, fall back to:
 ```bash
 rg -U --multiline -n 'subprocess\.(run|Popen|check_call|check_output)\(\s*\[.*?"claude".*?\]' harness/ graders/ tests/ 2>/dev/null
 ```
-and manually verify each match contains all four flags.
+and manually verify each match contains all seven flags plus `cwd=` and `env=`.
 
 **Check B - In-process telemetry shim parity**:
 For changes touching the diff-diff arm shim, check the statsmodels arm shim was updated:
