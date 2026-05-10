@@ -236,7 +236,7 @@ Check for **unnecessary additions**:
 #### Dimension 4: Edge Cases & Failure Modes
 
 For eval-validity-critical code (cold-start, telemetry, prompts, rubric, reproducibility):
-- Cold-start leakage: any new spawn site missing the locked `--bare`/`--setting-sources`/`--strict-mcp-config`/`--disable-slash-commands` flags or the `cwd=<tmpdir>` + `env=clean_env` hygiene
+- Cold-start leakage: any new spawn site missing the seven locked flags (`--bare`, `--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir <tmpdir>`) or the `cwd=<tmpdir>` + `env=clean_env` hygiene
 - Telemetry gaps: any new tracked surface that lacks the in-process layer (stream-JSON alone misses Python-internal access)
 - Prompt contamination: any case-study prompt mentioning `llms.txt`, `get_llm_guide`, estimator names, or methodology hints
 - Comparator-fairness asymmetry: any one-arm instrumentation change without documented rationale

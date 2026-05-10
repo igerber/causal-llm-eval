@@ -87,21 +87,35 @@ for path in pathlib.Path(".").rglob("*.py"):
         # Check for required keyword arguments on the subprocess.* call
         provided_kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
         missing_kwargs = sorted(required_kwargs - provided_kwargs)
-        # Bonus: verify --output-format is paired with stream-json (locked value)
-        bad_output_format = (
-            "--output-format" in args_str
-            and "stream-json" not in args_str
-        )
-        if missing_flags or missing_kwargs or bad_output_format:
-            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_output_format))
-for p, ln, mf, mk, bof in problems:
+        # Verify locked value pairings via pairwise scan of the args list.
+        # Walks the first positional arg if it's a list, looking for flag-value
+        # pairs. Flags whose locked value is empty string ("") or "stream-json"
+        # are checked here; --add-dir just needs SOME value (tmpdir-dependent).
+        bad_pairings = []
+        for arg in node.args:
+            if not isinstance(arg, ast.List):
+                continue
+            elements = arg.elts
+            for i, el in enumerate(elements):
+                if not isinstance(el, ast.Constant) or not isinstance(el.value, str):
+                    continue
+                next_el = elements[i + 1] if i + 1 < len(elements) else None
+                next_val = next_el.value if isinstance(next_el, ast.Constant) and isinstance(next_el.value, str) else None
+                if el.value == "--setting-sources" and next_val != "":
+                    bad_pairings.append("--setting-sources must be paired with empty string \"\"")
+                if el.value == "--output-format" and next_val != "stream-json":
+                    bad_pairings.append("--output-format must be paired with \"stream-json\"")
+                if el.value == "--add-dir" and next_val is None:
+                    bad_pairings.append("--add-dir requires a tmpdir value as next list element")
+        if missing_flags or missing_kwargs or bad_pairings:
+            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings))
+for p, ln, mf, mk, bp in problems:
     parts = []
     if mf:
         parts.append(f"missing flags: {mf}")
     if mk:
         parts.append(f"missing kwargs: {mk}")
-    if bof:
-        parts.append("output-format != stream-json")
+    parts.extend(bp)
     print(f"{p}:{ln}: " + "; ".join(parts))
 sys.exit(1 if problems else 0)
 PY
@@ -218,7 +232,8 @@ Based on your changes to: <list of changed files>
 #### If Harness Files Changed
 ```
 ### Cold-Start Integrity
-- [ ] Subprocess spawn includes `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands`
+- [ ] Subprocess spawn includes ALL seven locked flags: `--bare`, `--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir <tmpdir>`
+- [ ] Subprocess hygiene present: `cwd=<run tmpdir>` and `env=clean_env` (allowlist) keyword arguments on the subprocess.* call
 - [ ] `make smoke` still passes the inheritance probe (agent reports no skills/memory/CLAUDE.md)
 - [ ] No new code path reads from operator's env (`$HOME/.claude`, keychain) and passes into the spawned agent
 
