@@ -207,6 +207,15 @@ Based on your changes to: <list of changed files>
 - [ ] Arm 1 and arm 2 prompts identical word-for-word except library name (or amendment documented)
 ```
 
+#### If Rubrics Changed
+```
+### Rubric Versioning
+- [ ] In-place edit of recorded rubrics caught and corrected to vN+1.yaml naming (per-run records pin the rubric version; mutating a recorded rubric breaks reproducibility)
+- [ ] YAML parses cleanly (downstream judge code consumes the structured fields)
+- [ ] If a new dimension was added: extractor and judge updated to populate it; analysis code updated to consume it
+- [ ] If a dimension was renamed: spot-check old recorded grades for backward-compat or document the schema break
+```
+
 #### If Documentation Files Changed
 ```
 ### Documentation Sync

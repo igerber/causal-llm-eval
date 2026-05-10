@@ -91,7 +91,7 @@ git diff --cached --name-only | grep -E "^rubrics/" >/dev/null && echo "rubric c
 
 A rubric-only change must also bump the rubric registry version (no in-place edit of recorded rubrics; new rubric = `vN+1.yaml`). The pre-merge-check pattern guidance covers both prompts and rubrics under the same versioning convention.
 
-Run all relevant pattern checks (A through E) on the staged files. For matches, display file:line and offer:
+Run all relevant pattern checks (A through F) on the staged files. For matches, display file:line and offer:
 ```
 Pre-commit pattern check found N potential issues:
 <list warnings>
