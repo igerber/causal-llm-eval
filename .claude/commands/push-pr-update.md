@@ -111,35 +111,25 @@ When the working tree is clean but commits are ahead, scan for secrets in the co
    ```
    Note: Unlike Section 3, we cannot simply unstage these changes since they are already committed.
 
-### 3b. Methodology Checks for Already-Committed Changes (when skipping Section 3)
+### 3b. Eval-Validity Checks for Already-Committed Changes (when skipping Section 3)
 
-When the working tree is clean but commits are ahead, check for methodology issues before pushing:
+When the working tree is clean but commits are ahead, check for eval-validity issues before pushing:
 
-1. **Detect methodology files in committed changes**:
+1. **Detect eval-validity files in committed changes**:
    ```bash
-   git diff --name-only <comparison-ref>..HEAD | grep "^diff_diff/.*\.py$" | grep -v "__init__"
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^prompts/" 2>/dev/null
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^rubrics/" 2>/dev/null
    ```
 
-2. If methodology files are present:
-   1. Read `/pre-merge-check` Section 2.1 for pattern check definitions.
-   2. Run **all four pattern checks (A through D)** on those methodology files.
-      **Check C override**: The canonical Check C uses `git diff HEAD` which is empty on a clean working tree. For already-committed changes, substitute `git diff <comparison-ref>..HEAD -- <changed-methodology-files>` to extract new `self.X` assignments from the committed diff range.
+2. If harness/grader/analysis or prompt/rubric files are present:
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt versioning) for pattern check definitions.
+   2. Run those pattern checks on the changed files. Note: the canonical Section 2.1 Check A (subprocess spawn AST scan) operates on the working tree, not staged changes - it works equally well for already-committed changes.
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found, display them as warnings (non-blocking) since changes are already committed.
 
-3. **Documentation impact check**: Check which source files in `diff_diff/` are in the committed changes.
-   If source files are present, read `docs/doc-deps.yaml` and check which dependent
-   documentation files are NOT also in the committed changes. Warn about:
-   - ALL docs with `type: methodology` (regardless of `drift_risk`)
-   - All HIGH `drift_risk` docs (any type)
-   ```
-   Documentation impact: source files changed but related docs were not updated:
-     [METHODOLOGY] docs/methodology/REGISTRY.md — <section hint>
-     [HIGH] docs/survey-roadmap.md
-   Run /docs-impact for full details.
-   ```
-   This is a WARNING, not a blocker.
+3. **No `docs/doc-deps.yaml` analog yet** in this repo. When a doc-impact map is added (see ROADMAP.md), wire it in here.
 
 Note: Section 3b checks are informational warnings only — no AskUserQuestion prompt, since changes are already committed and cannot be unstaged. This differs from the staged-changes path (Section 3) which offers a "fix vs continue" choice.
 
@@ -150,14 +140,16 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    git add -A
    ```
 
-2. **Quick pattern check** (if methodology files are staged):
+2. **Quick pattern check** (if eval-validity files are staged):
    ```bash
-   git diff --cached --name-only | grep "^diff_diff/.*\.py$" | grep -v "__init__"
+   git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
+   git diff --cached --name-only | grep -E "^prompts/" 2>/dev/null
+   git diff --cached --name-only | grep -E "^rubrics/" 2>/dev/null
    ```
 
-   If methodology files are present:
-   1. Read `/pre-merge-check` Section 2.1 for pattern check definitions.
-   2. Run **all four pattern checks (A through D)** on the staged methodology files.
+   If harness/grader/analysis or prompt/rubric files are present:
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt versioning) for pattern check definitions.
+   2. Run those pattern checks on the staged files.
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found:
@@ -171,17 +163,7 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    ```
    Use AskUserQuestion. If user chooses to fix, abort the commit flow.
 
-   **Documentation impact check** (if source files are staged):
-   If source files in `diff_diff/` are present, read `docs/doc-deps.yaml` and check which
-   dependent documentation files are NOT also in the staged set. Warn about:
-   - ALL docs with `type: methodology` (regardless of `drift_risk`)
-   - All HIGH `drift_risk` docs (any type)
-   ```
-   Documentation impact: source files changed but related docs were not updated:
-     [METHODOLOGY] docs/methodology/REGISTRY.md — <section hint>
-   Run /docs-impact for full details.
-   ```
-   This is a WARNING, not a blocker.
+   **No `docs/doc-deps.yaml` analog yet** in this repo. When a doc-impact map is added (see ROADMAP.md), wire it in here.
 
 3. **Capture file count for reporting**:
    ```bash
