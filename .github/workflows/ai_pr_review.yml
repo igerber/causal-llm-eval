@@ -106,17 +106,24 @@ jobs:
             +refs/pull/${{ steps.pr.outputs.number }}/head
 
       # SECURITY: Scan the PR diff for secret-shaped content BEFORE sending it
-      # to OpenAI. Mirrors the script-internal scan in
-      # .claude/scripts/openai_review.py and the canonical patterns in
-      # .claude/commands/pre-merge-check.md Section 2.6. Fail-closed: an
-      # accidental secret in a PR diff must not be transmitted externally.
+      # to OpenAI. Fail-closed: an accidental secret in a PR diff must not be
+      # transmitted externally.
       #
-      # Pathspec exclusions: the security-tooling files BELOW intentionally
-      # contain the regex pattern definitions and references to "TOKEN" /
-      # "API_KEY" env-var names. Scanning them produces unavoidable false
-      # positives. Adding a new file that legitimately contains secret-shaped
-      # patterns requires extending this list AND adding a `# secret-tooling`
-      # comment near the pattern so future readers can find it.
+      # Two-tier scan:
+      #   Tier 1 (HIGH_CONFIDENCE_VALUES): patterns that match actual secret
+      #     VALUES (`AKIA...`, `ghp_...`, `sk-...`, `gho_...`). These have a
+      #     specific length + alphanumeric-only character set, so they cannot
+      #     match their own regex DEFINITIONS (which contain `[`, `]`, `{`,
+      #     `}`). Safe to scan ALL files - including the security tooling.
+      #   Tier 2 (LOW_CONFIDENCE_NAMES): patterns that match secret NAMES
+      #     ("TOKEN:", "API_KEY=") which legitimately appear in workflow
+      #     files, secret-tooling docs, and skill files. Excluded for the
+      #     security-tooling paths below; scanned everywhere else.
+      #
+      # Adding a new file that legitimately contains secret-shaped name
+      # references requires extending the tier-2 exclusion list. Tier 1 has
+      # no exclusions by design - if an accidental real secret lands in a
+      # tooling file, tier 1 still catches it.
       - name: Scan diff for secrets (defense in depth)
         env:
           BASE_SHA: ${{ steps.pr.outputs.base_sha }}
@@ -125,9 +132,14 @@ jobs:
           set -euo pipefail
           MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
 
-          # --name-only ensures secret VALUES never appear in workflow logs.
-          # The :! pathspecs exclude the security tooling itself.
-          secret_files=$(git diff -G "(AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48}|gho_[a-zA-Z0-9]{36}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Ss][Ee][Cc][Rr][Ee][Tt][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*[=:]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy]|[Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+[a-zA-Z0-9_-]+|[Tt][Oo][Kk][Ee][Nn][[:space:]]*[=:])" --name-only "$MERGE_BASE" "$HEAD_SHA" \
+          HIGH_CONFIDENCE_VALUES="(AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48}|gho_[a-zA-Z0-9]{36})"
+          LOW_CONFIDENCE_NAMES="([Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Ss][Ee][Cc][Rr][Ee][Tt][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*[=:]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy]|[Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+[a-zA-Z0-9_-]+|[Tt][Oo][Kk][Ee][Nn][[:space:]]*[=:])"
+
+          # Tier 1: scan EVERYTHING for real secret values
+          tier1_hits=$(git diff -G "$HIGH_CONFIDENCE_VALUES" --name-only "$MERGE_BASE" "$HEAD_SHA" 2>/dev/null || true)
+
+          # Tier 2: scan everything EXCEPT security tooling for name patterns
+          tier2_hits=$(git diff -G "$LOW_CONFIDENCE_NAMES" --name-only "$MERGE_BASE" "$HEAD_SHA" \
             -- . \
             ':!.claude/scripts/openai_review.py' \
             ':!.claude/commands/pre-merge-check.md' \
@@ -136,6 +148,9 @@ jobs:
             ':!.claude/commands/push-pr-update.md' \
             ':!.github/workflows/ai_pr_review.yml' \
             2>/dev/null || true)
+
+          # Merge + dedupe
+          secret_files=$(printf '%s\n%s\n' "$tier1_hits" "$tier2_hits" | sort -u | sed '/^$/d')
 
           sensitive_files=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA" | grep -iE "(\.env|credentials|secret|\.pem|\.key|\.p12|\.pfx|id_rsa|id_ed25519)$" || true)
 
@@ -150,10 +165,10 @@ jobs:
               echo "$sensitive_files" | sed 's/^/  /'
             fi
             echo ""
-            echo "Resolution: remove the secrets, rotate any leaked credentials, and re-push. If these are false positives (regex strings in source code, not actual secret values), redact or restructure the file before retrying. There is intentionally no maintainer-override flag here - a compromised CI secret has wider blast radius than a re-pushed PR."
+            echo "Resolution: remove the secrets, rotate any leaked credentials, and re-push. If these are false positives, the tier-1 patterns are designed not to match their own regex definitions (specific length + alphanumeric character set); if you've hit tier 2, the file likely belongs in the security-tooling exclusion list above. There is intentionally no maintainer-override flag here - a compromised CI secret has wider blast radius than a re-pushed PR."
             exit 1
           fi
-          echo "Diff secret scan: clean."
+          echo "Diff secret scan: clean (tier 1 scanned all files; tier 2 excluded security tooling)."
 
       # SECURITY: load the reviewer prompt from the BASE ref (trusted), not
       # from the PR checkout. A PR that modifies .github/codex/prompts/pr_review.md

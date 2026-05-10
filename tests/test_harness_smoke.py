@@ -43,6 +43,36 @@ def test_runner_contract():
     assert callable(run_one)
 
 
+def test_run_metadata_schema_has_all_reproducibility_fields():
+    """RunMetadata locks the reproducibility schema from the plan.
+
+    Plan section "Reproducibility schema" requires every per-run record to
+    pin these fields. Locking them in the dataclass at Phase 0 prevents
+    subsequent PRs from satisfying surface tests while quietly omitting
+    reproducibility metadata. Each field name corresponds to a documented
+    requirement.
+    """
+    import typing
+
+    from harness.runner import RunMetadata
+
+    required = {
+        "harness_version",
+        "library_version",
+        "claude_code_version",
+        "model_version",
+        "dataset_sha",
+        "prompt_version",
+        "rubric_version",
+        "random_seed",
+        "run_id",
+        "arm",
+    }
+    hints = typing.get_type_hints(RunMetadata)
+    missing = required - set(hints)
+    assert not missing, f"RunMetadata missing required reproducibility fields: {missing}"
+
+
 def test_telemetry_contract():
     """TelemetryRecord exposes the discoverability flags the rubric expects."""
     import typing

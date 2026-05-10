@@ -59,6 +59,33 @@ class RunResult:
     exit_code: int
 
 
+@dataclass
+class RunMetadata:
+    """Reproducibility metadata pinned per run.
+
+    Every per-run record MUST carry these fields. Missing any one of them
+    invalidates the reproducibility schema check in `make case-study-v1`
+    (see plan section "Reproducibility schema"). Defining the contract here
+    in Phase 0 prevents subsequent PRs from satisfying the surface tests
+    while quietly omitting reproducibility metadata.
+    """
+
+    # Versioning: every layer that influences the per-run record's bytes
+    harness_version: str  # git SHA of causal-llm-eval at run time
+    library_version: str  # PyPI version (arm 1: diff-diff; arm 2: statsmodels)
+    claude_code_version: str  # output of `claude --version`
+    model_version: str  # the string passed to claude's --print (e.g. "claude-opus-4-7")
+    # Inputs
+    dataset_sha: str  # sha256 of the dataset parquet
+    prompt_version: str  # registry id (e.g. "case_study/v1")
+    rubric_version: str  # registry id (e.g. "case_study_v1")
+    # Stochasticity
+    random_seed: int  # captured per cell for any harness-side randomness
+    # Identity
+    run_id: str  # ULID or equivalent unique id; primary key for the record
+    arm: str  # "diff_diff" or "statsmodels"
+
+
 def run_one(config: RunConfig, output_dir: Path) -> RunResult:
     """Spawn a single cold-start agent and return its run record.
 
