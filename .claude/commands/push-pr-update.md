@@ -123,8 +123,16 @@ When the working tree is clean but commits are ahead, check for eval-validity is
    ```
 
 2. If harness/grader/analysis or prompt/rubric files are present:
-   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity) and 2.2 (prompt/rubric versioning) for pattern check definitions.
-   2. Run those pattern checks on the changed files. Note: the canonical Section 2.1 Check A (subprocess spawn AST scan) operates on the working tree, not staged changes - it works equally well for already-committed changes.
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity), 2.2 (prompt/rubric versioning), and 2.5 (reproducibility schema) for pattern check definitions.
+   2. Run those pattern checks on the changed files.
+
+      **Already-committed override**: several canonical checks use `git diff --name-only HEAD` or `git diff HEAD --` patterns, which are empty on a clean working tree. For the already-committed flow, substitute `<comparison-ref>..HEAD` for `HEAD` in those calls so the diff range covers the committed changes. Specifically:
+      - **Section 2.1 Check A (subprocess spawn AST scan)**: operates on the working tree (`pathlib.Path(".").rglob`); no override needed - works equally well for already-committed changes.
+      - **Section 2.1 Check B (subprocess spawn missing flags)**: uses `grep -rn` over working tree files; no override needed.
+      - **Section 2.1 Check C (in-process telemetry shim parity)**: uses `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`.
+      - **Section 2.2 Checks D/E (prompt/rubric versioning + contamination)**: use `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`. Check F (YAML parse) operates on the file content directly; no override needed.
+      - **Section 2.5 (reproducibility schema)**: uses `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`.
+
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found, display them as warnings (non-blocking) since changes are already committed.
