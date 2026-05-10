@@ -110,6 +110,13 @@ jobs:
       # .claude/scripts/openai_review.py and the canonical patterns in
       # .claude/commands/pre-merge-check.md Section 2.6. Fail-closed: an
       # accidental secret in a PR diff must not be transmitted externally.
+      #
+      # Pathspec exclusions: the security-tooling files BELOW intentionally
+      # contain the regex pattern definitions and references to "TOKEN" /
+      # "API_KEY" env-var names. Scanning them produces unavoidable false
+      # positives. Adding a new file that legitimately contains secret-shaped
+      # patterns requires extending this list AND adding a `# secret-tooling`
+      # comment near the pattern so future readers can find it.
       - name: Scan diff for secrets (defense in depth)
         env:
           BASE_SHA: ${{ steps.pr.outputs.base_sha }}
@@ -118,8 +125,17 @@ jobs:
           set -euo pipefail
           MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "$BASE_SHA")
 
-          # --name-only ensures secret VALUES never appear in workflow logs
-          secret_files=$(git diff -G "(AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48}|gho_[a-zA-Z0-9]{36}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Ss][Ee][Cc][Rr][Ee][Tt][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*[=:]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy]|[Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+[a-zA-Z0-9_-]+|[Tt][Oo][Kk][Ee][Nn][[:space:]]*[=:])" --name-only "$MERGE_BASE" "$HEAD_SHA" 2>/dev/null || true)
+          # --name-only ensures secret VALUES never appear in workflow logs.
+          # The :! pathspecs exclude the security tooling itself.
+          secret_files=$(git diff -G "(AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{48}|gho_[a-zA-Z0-9]{36}|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Ss][Ee][Cc][Rr][Ee][Tt][_-]?[Kk][Ee][Yy][[:space:]]*[=:]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*[=:]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy]|[Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+[a-zA-Z0-9_-]+|[Tt][Oo][Kk][Ee][Nn][[:space:]]*[=:])" --name-only "$MERGE_BASE" "$HEAD_SHA" \
+            -- . \
+            ':!.claude/scripts/openai_review.py' \
+            ':!.claude/commands/pre-merge-check.md' \
+            ':!.claude/commands/ai-review-local.md' \
+            ':!.claude/commands/submit-pr.md' \
+            ':!.claude/commands/push-pr-update.md' \
+            ':!.github/workflows/ai_pr_review.yml' \
+            2>/dev/null || true)
 
           sensitive_files=$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA" | grep -iE "(\.env|credentials|secret|\.pem|\.key|\.p12|\.pfx|id_rsa|id_ed25519)$" || true)
 
