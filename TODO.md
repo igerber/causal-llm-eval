@@ -16,7 +16,8 @@ For planned features and deliverables, see [ROADMAP.md](ROADMAP.md).
 
 | Issue | Location | PR | Priority |
 |-------|----------|----|----------|
-| Fail-early on unwritable event-log path: shim raises `OSError` on first write attempt (mid-agent-execution); add upfront `os.access`/touch-test in the runner before agent spawn so misconfiguration aborts the run before the agent starts. | `harness/runner.py` (new check) + `harness/sitecustomize_template.py` (current behavior) | #1 | Low |
+| Sitecustomize instrumentation hooks not yet wired (only env-var contract + empty event-log file as integration point). Layer 2 of the three-layer telemetry contract is unfilled until the hooks land. | `harness/sitecustomize_template.py` | #3 | Medium |
+| Probe leakage assessment uses substring blacklist with hardcoded operator-token list; could miss novel leakage forms or false-fire on unanticipated negation contexts. Revisit with negation-aware matching or AI-judge if real-world probe runs reveal heuristic gaps. | `harness/probe.py` | #3 | Low |
 
 ### Performance
 
@@ -29,7 +30,7 @@ For planned features and deliverables, see [ROADMAP.md](ROADMAP.md).
 | Issue | Location | PR | Priority |
 |-------|----------|----|----------|
 | Pyright "unused" warning on `_write_event` (intentional helper for not-yet-written hooks). Either silence with a `noqa` comment, restructure, or accept until the hook callers land. | `harness/sitecustomize_template.py:_write_event` | #1 | Low |
-| Smoke test does not yet execute the inheritance probe (deferred until runner is implemented). `make smoke` is a placeholder that intentionally fails. | `tests/test_harness_smoke.py` + `Makefile:smoke` | #1 | Medium |
+| `telemetry.py` layer-3 docstring says "captures Python warnings from agent's Python subprocesses"; in practice the CLI captures those into stream-JSON and layer 3 only catches CLI-level errors. Refine wording when the telemetry merger lands. | `harness/telemetry.py:14-16` | #3 | Low |
 
 ## Adapting Diff-Diff-Ported Files
 

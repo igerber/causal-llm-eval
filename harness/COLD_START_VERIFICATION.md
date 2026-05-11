@@ -32,7 +32,8 @@ CLI flags are necessary but not sufficient. The runner also pins:
   | `HOME` | set to the per-run tmpdir, NOT the operator's `$HOME`, so any file lookup against `~` lands in the sandbox |
   | `LANG`, `LC_*` | locale; harmless |
   | `ANTHROPIC_API_KEY` | the agent needs to call the Claude API to function |
-  | `CAUSAL_LLM_EVAL_EVENT_LOG` | tells the in-process shim where to write |
+  | `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `LC_COLLATE`, `LC_MONETARY` | locale specifics (POSIX-defined keys; explicit enumeration so unrelated `LC_*` vars cannot leak) |
+  | `_PYRUNTIME_EVENT_LOG` | tells the in-process shim where to write. The underscore prefix + Python-runtime framing is a deliberate low-reactivity choice (less likely to be flagged as eval-related by an agent enumerating `os.environ`). Runner-controlled — any inherited operator value is ignored. |
 
   Anything else (especially `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_PROJECT_*`, `OPENAI_*`, `AWS_*`, MCP-related vars, GitHub auth tokens, `CODEX_*`) is dropped. The runner enforces this via an explicit allowlist in the spawn site, not a denylist.
 
@@ -48,7 +49,9 @@ A correctly cold-started agent reports nothing preloaded. The probe response is 
 
 ## CI gate
 
-**Phase 0 status**: the label gate (`ready-for-ci`) is in place, but the actual test workflow that runs `make smoke` is not yet implemented. It lands in a follow-up PR alongside the runner implementation. Once present, the workflow will block merge if `make smoke` fails, ensuring every PR that touches the cold-start invocation re-verifies the inheritance probe.
+The label gate (`ready-for-ci`) blocks merge until a maintainer applies the label. The `.github/workflows/tests.yml` workflow runs `pytest` (default excludes `slow` and `live`) on labeled PRs and on push to main, catching regressions in the cold-start invocation and supporting harness contracts.
+
+`make smoke` (the live inheritance probe) is a developer command, not a CI hook: it spawns a real agent and costs ~$0.05 per invocation. Run it locally before push when the cold-start invocation changes.
 
 The pre-merge-check skill (Section 2.1) runs an AST-based scan for required cold-start flags on any new subprocess spawn site, providing a fast first-pass before the smoke test. This catches multiline `subprocess.run([...])` invocations that single-line `grep` would miss.
 

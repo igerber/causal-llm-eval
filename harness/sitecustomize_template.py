@@ -2,7 +2,10 @@
 
 Copied into each per-run venv as `sitecustomize.py` (Python's standard
 auto-import-on-startup hook). Logs library access events to a per-run JSON
-event log specified by the `CAUSAL_LLM_EVAL_EVENT_LOG` environment variable.
+event log specified by the `_PYRUNTIME_EVENT_LOG` environment variable. The
+underscore prefix + Python-runtime framing is a deliberate low-reactivity
+choice: an agent enumerating `os.environ` is less likely to flag the name as
+eval-related.
 
 Tracked events for arm 1 (diff-diff) - this contract pairs 1:1 with the
 discoverability fields on `TelemetryRecord` and the rubric's "Discovered LLM
@@ -30,7 +33,7 @@ Tracked events for arm 2 (statsmodels) - parity instrumentation:
 
 ## Failure mode: fail closed, not open
 
-If `CAUSAL_LLM_EVAL_EVENT_LOG` is unset or its path is unwritable, the shim
+If `_PYRUNTIME_EVENT_LOG` is unset or its path is unwritable, the shim
 MUST raise rather than silently no-op. A misconfigured run that returns a
 record with all-`False` discoverability flags is indistinguishable from a real
 "agent never accessed any guide" outcome and would corrupt the eval. Failure
@@ -63,11 +66,11 @@ def _get_event_log_path() -> str:
 
     Fail-closed contract: missing/empty env var raises TelemetryConfigError.
     """
-    path = os.environ.get("CAUSAL_LLM_EVAL_EVENT_LOG")
+    path = os.environ.get("_PYRUNTIME_EVENT_LOG")
     if not path:
         raise TelemetryConfigError(
-            "CAUSAL_LLM_EVAL_EVENT_LOG is unset; in-process telemetry cannot "
-            "be written. The runner must set this env var before spawning the "
+            "_PYRUNTIME_EVENT_LOG is unset; in-process telemetry cannot be "
+            "written. The runner must set this env var before spawning the "
             "agent."
         )
     return path
