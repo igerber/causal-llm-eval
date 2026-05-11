@@ -77,23 +77,28 @@ def find_argv_node(call, scope_body):
       (ast.List, "inline-kwarg")      - subprocess.run(args=[...])
       (ast.List, "resolved-variable") - cmd = [...]; subprocess.run(cmd) (or args=cmd)
       (None,     "dynamic")           - argv is a non-list expression we can't resolve; FAIL CLOSED
-      (None,     "no-argv")           - call has no positional and no args= keyword
+      (None,     "no-argv")           - call has neither a positional argv nor an args= keyword
     """
-    candidate = None  # the ast.Name or ast.List we'll try to resolve
-    if call.args and isinstance(call.args[0], (ast.List, ast.Name)):
-        candidate = call.args[0]
-        kind_inline = "inline-positional"
-    else:
-        for kw in call.keywords:
-            if kw.arg == "args" and isinstance(kw.value, (ast.List, ast.Name)):
-                candidate = kw.value
-                kind_inline = "inline-kwarg"
-                break
+    # Check positional argv first.
+    if call.args:
+        if isinstance(call.args[0], (ast.List, ast.Name)):
+            candidate = call.args[0]
+            kind_inline = "inline-positional"
         else:
-            # Positional 0 exists but isn't a List/Name (e.g., tuple, function call, comprehension)
-            if call.args:
-                return (None, "dynamic")
+            # Positional 0 exists but isn't List/Name (function call, tuple,
+            # comprehension, etc.). Fail closed.
+            return (None, "dynamic")
+    else:
+        # No positional - look for args= keyword
+        args_kw = next((kw for kw in call.keywords if kw.arg == "args"), None)
+        if args_kw is None:
             return (None, "no-argv")
+        if not isinstance(args_kw.value, (ast.List, ast.Name)):
+            # args= present but value is non-list/non-name (e.g.,
+            # subprocess.run(args=make_cmd("claude"))). Fail closed.
+            return (None, "dynamic")
+        candidate = args_kw.value
+        kind_inline = "inline-kwarg"
 
     if isinstance(candidate, ast.List):
         return (candidate, kind_inline)
@@ -116,6 +121,50 @@ def find_argv_node(call, scope_body):
         return (resolved.value, "resolved-variable")
     # Variable can't be resolved to a simple List literal - fail closed
     return (None, "dynamic")
+
+
+def check_env_cwd_values(call):
+    """Verify cwd= and env= aren't obviously inheriting operator state.
+
+    Returns a list of warning strings (empty if clean).
+
+    Hard-fails on:
+      env=os.environ                    # inherits operator env
+      env=os.environ.copy()             # inherits
+      env={**os.environ, ...}           # inherits
+      cwd=os.getcwd()                   # inherits operator cwd
+      cwd=Path.cwd() / pathlib.Path.cwd()
+      cwd="." or cwd=None               # default-cwd inheritance
+
+    Other patterns (env=clean_env variable, env={...} dict literal,
+    cwd=<Name>, cwd=<str literal>) pass without comment - the deep "is
+    this env actually clean?" check is left to manual review with a soft
+    note when the value is a non-obvious expression.
+    """
+    warnings = []
+    for kw in call.keywords:
+        if kw.arg not in ("env", "cwd"):
+            continue
+        try:
+            src = ast.unparse(kw.value)
+        except Exception:
+            src = ""
+        # Hard-fails: explicit operator-state inheritance
+        if kw.arg == "env":
+            if "os.environ" in src or "environ.copy" in src:
+                warnings.append(
+                    "env= inherits operator state (os.environ reference); use a clean allowlist instead"
+                )
+        elif kw.arg == "cwd":
+            if "os.getcwd" in src or "Path.cwd" in src or "Path('.').resolve" in src:
+                warnings.append(
+                    "cwd= references operator working directory; pass the per-run tmpdir explicitly"
+                )
+            if isinstance(kw.value, ast.Constant) and kw.value.value in (".", None, ""):
+                warnings.append(
+                    "cwd= is the operator default; pass the per-run tmpdir explicitly"
+                )
+    return warnings
 
 
 def list_contains_claude(list_node):
@@ -201,8 +250,11 @@ for path in pathlib.Path(".").rglob("*.py"):
             if el.value == "--add-dir" and next_val is None:
                 bad_pairings.append("--add-dir requires a tmpdir value as next list element")
 
-        if missing_flags or missing_kwargs or bad_pairings:
-            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings))
+        # Value-level check on cwd= and env= (operator-state inheritance)
+        env_cwd_warnings = check_env_cwd_values(node)
+
+        if missing_flags or missing_kwargs or bad_pairings or env_cwd_warnings:
+            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings + env_cwd_warnings))
 
 for p, ln, mf, mk, bp in problems:
     parts = []
