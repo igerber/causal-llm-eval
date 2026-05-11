@@ -69,7 +69,7 @@ Parse `$ARGUMENTS` to extract:
        - If ahead count > 0:
          - **Scan for secrets in commits to push** (see Section 3a below)
          - Compute `<files-changed-count>`: `git diff --name-only <comparison-ref>..HEAD | wc -l`
-         - Proceed to Section 3a (secret scan), then 3b (methodology checks), then Section 4 (Push to Remote) — will push with `-u` to set upstream
+         - Proceed to Section 3a (secret scan), then 3b (eval-validity checks), then Section 4 (Push to Remote) — will push with `-u` to set upstream
        - If ahead count = 0: Abort (new branch with nothing to push):
          ```
          No changes detected. Working directory is clean and branch has no commits ahead of <default-branch>.
@@ -80,7 +80,7 @@ Parse `$ARGUMENTS` to extract:
        - If ahead count > 0:
          - **Scan for secrets in commits to push** (see Section 3a below)
          - Compute `<files-changed-count>`: `git diff --name-only @{u}..HEAD | wc -l`
-         - Proceed to Section 3a (secret scan), then 3b (methodology checks), then Section 4 (Push to Remote) — there are committed changes to push
+         - Proceed to Section 3a (secret scan), then 3b (eval-validity checks), then Section 4 (Push to Remote) — there are committed changes to push
        - If ahead count = 0: Abort:
          ```
          No changes detected. Working directory is clean and branch is up to date.
@@ -111,35 +111,33 @@ When the working tree is clean but commits are ahead, scan for secrets in the co
    ```
    Note: Unlike Section 3, we cannot simply unstage these changes since they are already committed.
 
-### 3b. Methodology Checks for Already-Committed Changes (when skipping Section 3)
+### 3b. Eval-Validity Checks for Already-Committed Changes (when skipping Section 3)
 
-When the working tree is clean but commits are ahead, check for methodology issues before pushing:
+When the working tree is clean but commits are ahead, check for eval-validity issues before pushing:
 
-1. **Detect methodology files in committed changes**:
+1. **Detect eval-validity files in committed changes**:
    ```bash
-   git diff --name-only <comparison-ref>..HEAD | grep "^diff_diff/.*\.py$" | grep -v "__init__"
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^prompts/" 2>/dev/null
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^rubrics/" 2>/dev/null
+   git diff --name-only <comparison-ref>..HEAD | grep -E "^Makefile$" 2>/dev/null
    ```
 
-2. If methodology files are present:
-   1. Read `/pre-merge-check` Section 2.1 for pattern check definitions.
-   2. Run **all four pattern checks (A through D)** on those methodology files.
-      **Check C override**: The canonical Check C uses `git diff HEAD` which is empty on a clean working tree. For already-committed changes, substitute `git diff <comparison-ref>..HEAD -- <changed-methodology-files>` to extract new `self.X` assignments from the committed diff range.
+2. If harness/grader/analysis, prompt/rubric, OR Makefile files are present:
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity), 2.2 (prompt/rubric versioning), and 2.5 (reproducibility schema) for pattern check definitions. Makefile-only changes that touch `case-study-v1`, `smoke`, `preflight`, or `calibration` targets must run Section 2.5.
+   2. Run those pattern checks on the changed files.
+
+      **Already-committed override**: several canonical checks use `git diff --name-only HEAD` or `git diff HEAD --` patterns, which are empty on a clean working tree. For the already-committed flow, substitute `<comparison-ref>..HEAD` for `HEAD` in those calls so the diff range covers the committed changes. Specifically:
+      - **Section 2.1 Check A (subprocess spawn AST scan)**: operates on the working tree (`pathlib.Path(".").rglob`); no override needed - works equally well for already-committed changes.
+      - **Section 2.1 Check B (in-process telemetry shim parity)**: uses `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`.
+      - **Section 2.2 Checks C/D (prompt/rubric versioning + contamination)**: use `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`. Check E (YAML parse) operates on the file content directly; no override needed.
+      - **Section 2.5 (reproducibility schema)**: uses `git diff --name-only HEAD --`; substitute `git diff --name-only <comparison-ref>..HEAD --`.
+
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found, display them as warnings (non-blocking) since changes are already committed.
 
-3. **Documentation impact check**: Check which source files in `diff_diff/` are in the committed changes.
-   If source files are present, read `docs/doc-deps.yaml` and check which dependent
-   documentation files are NOT also in the committed changes. Warn about:
-   - ALL docs with `type: methodology` (regardless of `drift_risk`)
-   - All HIGH `drift_risk` docs (any type)
-   ```
-   Documentation impact: source files changed but related docs were not updated:
-     [METHODOLOGY] docs/methodology/REGISTRY.md — <section hint>
-     [HIGH] docs/survey-roadmap.md
-   Run /docs-impact for full details.
-   ```
-   This is a WARNING, not a blocker.
+3. **No `docs/doc-deps.yaml` analog yet** in this repo. When a doc-impact map is added (see ROADMAP.md), wire it in here.
 
 Note: Section 3b checks are informational warnings only — no AskUserQuestion prompt, since changes are already committed and cannot be unstaged. This differs from the staged-changes path (Section 3) which offers a "fix vs continue" choice.
 
@@ -150,14 +148,17 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    git add -A
    ```
 
-2. **Quick pattern check** (if methodology files are staged):
+2. **Quick pattern check** (if eval-validity files are staged):
    ```bash
-   git diff --cached --name-only | grep "^diff_diff/.*\.py$" | grep -v "__init__"
+   git diff --cached --name-only | grep -E "^(harness|graders|analysis)/.*\.py$" | grep -v "__init__"
+   git diff --cached --name-only | grep -E "^prompts/" 2>/dev/null
+   git diff --cached --name-only | grep -E "^rubrics/" 2>/dev/null
+   git diff --cached --name-only | grep -E "^Makefile$" 2>/dev/null
    ```
 
-   If methodology files are present:
-   1. Read `/pre-merge-check` Section 2.1 for pattern check definitions.
-   2. Run **all four pattern checks (A through D)** on the staged methodology files.
+   If harness/grader/analysis or prompt/rubric or Makefile files are present:
+   1. Read `/pre-merge-check` Sections 2.1 (cold-start integrity), 2.2 (prompt/rubric versioning), and 2.5 (reproducibility schema) for pattern check definitions.
+   2. Run those pattern checks on the staged files. (Sections 2.1/2.2/2.5 use `git diff --cached` references that work in the staged flow without an override.)
    3. For any matches, display the file:line and flag message from that section.
 
    If warnings are found:
@@ -171,17 +172,7 @@ Note: Section 3b checks are informational warnings only — no AskUserQuestion p
    ```
    Use AskUserQuestion. If user chooses to fix, abort the commit flow.
 
-   **Documentation impact check** (if source files are staged):
-   If source files in `diff_diff/` are present, read `docs/doc-deps.yaml` and check which
-   dependent documentation files are NOT also in the staged set. Warn about:
-   - ALL docs with `type: methodology` (regardless of `drift_risk`)
-   - All HIGH `drift_risk` docs (any type)
-   ```
-   Documentation impact: source files changed but related docs were not updated:
-     [METHODOLOGY] docs/methodology/REGISTRY.md — <section hint>
-   Run /docs-impact for full details.
-   ```
-   This is a WARNING, not a blocker.
+   **No `docs/doc-deps.yaml` analog yet** in this repo. When a doc-impact map is added (see ROADMAP.md), wire it in here.
 
 3. **Capture file count for reporting**:
    ```bash

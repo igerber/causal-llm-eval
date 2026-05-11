@@ -1,73 +1,74 @@
 ---
-description: Development checklists for code changes (params, methodology, warnings, reviews, bugs)
+description: Development checklists for code changes (params, eval-validity, warnings, reviews, bugs)
 argument-hint: "[checklist-name]"
 ---
 
 # Development Checklists
 
-## Adding a New Parameter to Estimators
+## Adding a New Configuration Parameter
 
-When adding a new `__init__` parameter that should be available across estimators:
+When adding a new field to `RunConfig`, `RunMetadata`, or another harness/grader/analysis dataclass:
 
-1. **Implementation** (for each affected estimator):
-   - [ ] Add to `__init__` signature with default value
-   - [ ] Store as `self.param_name`
-   - [ ] Add to `get_params()` return dict
-   - [ ] Handle in `set_params()` (usually automatic via `hasattr`)
+1. **Implementation**:
+   - [ ] Add to dataclass with type annotation; default value if optional
+   - [ ] If it influences per-run behavior, also add to `RunMetadata` so it's pinned in the per-run record
+   - [ ] If it's tri-state with arm-specific contracts (e.g., `opened_llms_*`), update `__post_init__` validation
 
-2. **Consistency** - apply to all applicable estimators per the **Estimator inheritance** map in CLAUDE.md
+2. **Consistency** - apply to all relevant call sites:
+   - [ ] Runner spawn site (`harness/runner.py`)
+   - [ ] Telemetry merge (`harness/telemetry.py:merge_layers`)
+   - [ ] Grader (`graders/ai_judge.py`) if the field affects rubric scoring
+   - [ ] Reproducibility check (`analysis/reproducibility_check.py`) if the field is part of the schema
 
 3. **Testing**:
-   - [ ] Test `get_params()` includes new param
-   - [ ] Test parameter affects estimator behavior
+   - [ ] Smoke test asserts the field exists and has the right type
+   - [ ] Behavioral test asserts the field affects downstream behavior
    - [ ] Test with non-default value
 
 4. **Downstream tracing**:
-   - [ ] Before implementing: `grep -rn "self\.<param>" diff_diff/<module>.py` to find ALL downstream paths
-   - [ ] Parameter handled in ALL aggregation methods (simple, event_study, group)
-   - [ ] Parameter handled in bootstrap inference paths
+   - [ ] Before implementing: `grep -rn "<field_name>" harness/ graders/ analysis/` to find ALL downstream paths
+   - [ ] Field handled in all per-arm code paths (diff-diff arm AND statsmodels arm if relevant)
 
 5. **Documentation**:
-   - [ ] Update docstring in all affected classes
    - [ ] Update CLAUDE.md if it's a key design pattern
+   - [ ] Update `harness/COLD_START_VERIFICATION.md` if it touches the cold-start contract
 
-## Implementing Methodology-Critical Code
+## Touching Eval-Validity Code
 
-When implementing or modifying code that affects statistical methodology (estimators, SE calculation, inference, edge case handling):
+When implementing or modifying code that affects eval validity (cold-start integrity, telemetry completeness, prompt/rubric versioning, comparator fairness, reproducibility):
 
-1. **Before coding - consult the Methodology Registry**:
-   - [ ] Read the relevant estimator section in `docs/methodology/REGISTRY.md`
-   - [ ] Identify the reference implementation(s) listed
-   - [ ] Note the edge case handling requirements
+1. **Before coding - consult the locked decisions**:
+   - [ ] Read the latest plan in `~/.claude/plans/` (the active wave's plan)
+   - [ ] Read `harness/COLD_START_VERIFICATION.md` for the cold-start contract
+   - [ ] Read `pre-merge-check.md` Sections 2.1-2.5 for the canonical patterns the AI reviewer applies
 
 2. **During implementation**:
-   - [ ] Follow the documented equations and formulas
-   - [ ] Match reference implementation behavior for standard cases
-   - [ ] For edge cases: either match reference OR document deviation
+   - [ ] Cold-start spawn includes ALL locked flags: `--bare`, `--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir <tmpdir>`
+   - [ ] Subprocess hygiene: `cwd=<tmpdir>`, `env=clean_env` (allowlist), no operator-state inheritance
+   - [ ] Three-layer telemetry maintained when adding a new tracked surface (stream-JSON + in-process shim + stderr)
+   - [ ] In-process shim instrumentation symmetrical across both arms (or one-sided change documented with rationale)
+   - [ ] Sentinel semantics enforced via `__post_init__` (arm-specific tri-state for `opened_llms_*` etc.)
+   - [ ] Reproducibility metadata pinned per run (RunMetadata fields)
 
-3. **When deviating from reference implementations**:
-   - [ ] Add entry in `docs/methodology/REGISTRY.md` using a reviewer-recognized label:
-         `**Note:**`, `**Deviation from R:**`, or `**Note (deviation from R):**`
-         (see CLAUDE.md "Documenting Deviations" for full format reference)
-   - [ ] Include rationale (e.g., "defensive enhancement", "R errors here")
-   - [ ] Ensure the deviation is an improvement, not a bug
-   - [ ] If deferring P2/P3 work: add row to `TODO.md` table under "Tech Debt from Code
-         Reviews" with columns `Issue | Location | PR | Priority`
+3. **When deviating from the locked plan**:
+   - [ ] Add a `**Note:**` or `**Deviation from plan:**` label in the code section, PR description, or plan file (see CLAUDE.md "Documenting Deviations")
+   - [ ] Include rationale (why the locked decision doesn't fit this case)
+   - [ ] If deferring related P2/P3 work: add a row to `TODO.md` table under "Tech Debt from Code Reviews"
 
-4. **Testing methodology-aligned behavior**:
-   - [ ] Test that edge cases produce documented behavior (NaN, warning, etc.)
-   - [ ] Assert warnings are raised (not just captured)
-   - [ ] Assert the warned-about behavior actually occurred
-   - [ ] For NaN results: assert `np.isnan()`, don't just check "no exception"
-   - [ ] All inference fields computed via `safe_inference()` (not inline)
+4. **Testing eval-validity**:
+   - [ ] Cold-start probe assertion (when runner is implemented): agent reports no inheritance
+   - [ ] Per-run record schema check: required fields present, types correct
+   - [ ] Sentinel violations rejected at construction (test both arms with invalid combos)
+   - [ ] Stderr/in-process warning capture verified end-to-end
 
 ## Adding Warning/Error/Fallback Handling
 
-When adding code that emits warnings or handles errors:
+When adding code that emits warnings or handles errors in the harness/grader/analysis paths:
 
-1. **Consult Methodology Registry first**:
-   - [ ] Check if behavior is documented in edge cases section
-   - [ ] If not documented, add it before implementing
+1. **Fail closed by default**:
+   - [ ] Telemetry write failures raise (don't silently no-op); the runner catches and marks the run failed
+   - [ ] Cold-start probe failures abort the run before agent execution
+   - [ ] Per-run schema violations reject at construction time, not at consumption
 
 2. **Verify behavior matches message**:
    - [ ] Manually trace the code path after warning/error
@@ -75,100 +76,104 @@ When adding code that emits warnings or handles errors:
 
 3. **Write behavioral tests**:
    - [ ] Don't just test "no exception raised"
-   - [ ] Assert the expected outcome occurred
-   - [ ] For fallbacks: verify fallback behavior was applied
-   - [ ] Example: If warning says "setting NaN", assert `np.any(np.isnan(result))`
+   - [ ] Assert the expected outcome occurred (run marked failed, exception type, error message substring)
+   - [ ] For fallback paths: verify fallback was applied AND that the fallback didn't silently corrupt the per-run record
 
-4. **Protect arithmetic operations**:
-   - [ ] Wrap ALL related operations in `np.errstate()`, not just the final one
-   - [ ] Include division, matrix multiplication, and any operation that can overflow/underflow
+4. **Cross-layer warning capture**:
+   - [ ] If a Python warning is emitted, both layer 2 (in-process shim) AND layer 3 (subprocess stderr) should observe it
+   - [ ] If they disagree, that's a telemetry bug worth flagging
 
 ## Reviewing New Features or Code Paths
 
-When reviewing PRs that add new features, modes, or code paths (learned from PR #97 analysis):
+When reviewing PRs that add new harness/grader/analysis features or new tracked telemetry surfaces:
 
 1. **Edge Case Coverage**:
-   - [ ] Empty result sets (no matching data for a filter condition)
-   - [ ] NaN/Inf propagation through ALL inference fields (SE, t-stat, p-value, CI)
-   - [ ] Parameter interactions (e.g., new param x existing aggregation methods)
-   - [ ] Control/comparison group composition for all code paths
+   - [ ] Empty/missing per-run records (no transcript, no in-process events, malformed JSON)
+   - [ ] Sentinel violations across both arms (arm 1 with None guide field, arm 2 with bool guide field)
+   - [ ] Concurrent run interleaving (when scheduler is implemented; per-run venv isolation must hold)
+   - [ ] Comparator fairness: any new instrumentation symmetrical across arms or documented one-sided
 
 2. **Documentation Completeness**:
-   - [ ] All new parameters have docstrings with type, default, and description
-   - [ ] Methodology docs match implementation behavior (equations, edge cases)
-   - [ ] Edge cases documented in `docs/methodology/REGISTRY.md`
+   - [ ] All new fields/parameters have docstrings with type, default, contract description
+   - [ ] If touching the cold-start contract: `harness/COLD_START_VERIFICATION.md` updated
+   - [ ] If touching telemetry layers: TelemetryRecord docstring updated
+   - [ ] If touching prompts/rubrics: registry version bumped (no in-place edit of recorded prompts)
 
 3. **Logic Audit for New Code Paths**:
-   - [ ] When adding new modes (like `base_period="varying"`), trace ALL downstream effects
-   - [ ] Check aggregation methods handle the new mode correctly
-   - [ ] Check bootstrap/inference methods handle the new mode correctly
-   - [ ] Explicitly test control group composition in new code paths
+   - [ ] When adding new arms or new surfaces, trace ALL downstream effects (runner -> telemetry -> extractor -> judge -> analysis)
+   - [ ] Check the in-process shim is updated for the new surface (NOT just stream-JSON layer)
+   - [ ] Explicitly test arm-1 vs arm-2 behavior in new code paths
 
 4. **Pattern Consistency**:
-   - [ ] Search for similar patterns in codebase (e.g., `t_stat = x / se if se > 0 else ...`)
+   - [ ] Search for similar patterns in codebase (e.g., subprocess spawn sites, telemetry merge call sites)
    - [ ] Ensure new code follows established patterns or updates ALL instances
    - [ ] If fixing a pattern, grep for ALL occurrences first:
      ```bash
-     grep -n "if.*se.*> 0.*else" diff_diff/*.py
+     grep -rn '<pattern>' harness/ graders/ analysis/ tests/
      ```
 
 ## Fixing Bugs Across Multiple Locations
 
-When a bug fix involves a pattern that appears in multiple places (learned from PR #97 analysis):
+When a bug fix involves a pattern that appears in multiple places:
 
 1. **Find All Instances First**:
    - [ ] Use grep/search to find ALL occurrences of the pattern before fixing
    - [ ] Document the locations found (file:line)
-   - [ ] Example: `t_stat = effect / se if se > 0 else 0.0` appeared in 7 locations
+   - [ ] Example: a missing cold-start flag in a subprocess spawn might appear in runner + scheduler + venv_pool
 
 2. **Fix Comprehensively in One Round**:
    - [ ] Fix ALL instances in the same PR/commit
-   - [ ] Create a test that covers all locations
+   - [ ] Add a regression test that covers the pattern (parametrized over locations if helpful)
    - [ ] Don't fix incrementally across multiple review rounds
 
 3. **Regression Test the Fix**:
    - [ ] Verify fix doesn't break other code paths
-   - [ ] For early-return fixes: ensure downstream code still runs when needed
-   - [ ] Example: Bootstrap early return must still compute per-effect SEs
+   - [ ] For sentinel-violation fixes: ensure both armed-positive and armed-negative cases tested
 
 4. **Common Patterns to Watch For**:
-   - `if se > 0 else 0.0` -> should be `else np.nan` for undefined statistics
-   - `if len(data) > 0 else return` -> check what downstream code expects
-   - `mask = (condition)` -> verify mask logic for all parameter combinations
+   - Subprocess spawn missing one of the locked cold-start flags -> cold-start leak
+   - In-process shim added a hook for arm 1 but not arm 2 -> comparator-fairness asymmetry
+   - New telemetry field added to TelemetryRecord but not to merge_layers or post_init -> silent contract drift
+   - Prompt edited in place rather than versioned -> reproducibility break
 
 ## Pre-Merge Review Checklist
 
 Final checklist before approving a PR:
 
 1. **Behavioral Completeness**:
-   - [ ] Happy path tested
-   - [ ] Edge cases tested (empty data, NaN inputs, boundary conditions)
+   - [ ] Happy path tested (when implementation lands)
+   - [ ] Edge cases tested (missing telemetry, sentinel violations, malformed transcripts)
    - [ ] Error/warning paths tested with behavioral assertions
 
-2. **Inference Field Consistency**:
-   - [ ] If one inference field (SE, t-stat, p-value) can be NaN, all related fields handle it
-   - [ ] Aggregation methods propagate NaN correctly
-   - [ ] Bootstrap methods handle NaN in base estimates
+2. **Cold-Start + Telemetry Consistency**:
+   - [ ] Any new subprocess spawn includes all locked cold-start flags
+   - [ ] Any new tracked surface has in-process shim parity across arms (or documented one-sided)
+   - [ ] Per-run record schema unchanged OR schema validator + reproducibility check updated together
 
 3. **Documentation Sync**:
    - [ ] Docstrings updated for all changed signatures
-   - [ ] `diff_diff/guides/llms.txt` updated if a new estimator/feature appears in the public API (this is the AI-agent contract; it cascades to RTD)
-   - [ ] `docs/api/*.rst` updated for new modules / signatures
-   - [ ] `docs/references.rst` updated if a new scholarly source is cited
-   - [ ] `README.md` updated ONLY if (a) new estimator catalog one-liner, (b) hero/badges/tagline change, or (c) top-level capability paragraph (Diagnostics & Sensitivity, Survey Support). Do NOT add usage examples, parameter tables, or per-estimator sections.
-   - [ ] `REGISTRY.md` updated if methodology edge cases change
+   - [ ] CLAUDE.md updated if conventions changed
+   - [ ] `prompts/` registry bumped if a recorded prompt changed (vN+1.txt, never in-place edit)
+   - [ ] `rubrics/` registry bumped if a recorded rubric changed
+   - [ ] `harness/COLD_START_VERIFICATION.md` updated if the cold-start contract changed
+   - [ ] `README.md` updated ONLY for landing-page-relevant changes (status, hero/tagline, top-level capability summary)
+   - [ ] `TODO.md` updated if new tech debt is introduced or addressed
+   - [ ] `ROADMAP.md` updated if a planned-feature item is shipped or rescoped
 
 ## Quick Reference: Common Patterns to Check
 
-Before submitting methodology changes, verify these patterns:
+Before submitting harness/telemetry changes, verify these patterns:
 
 ```bash
-# Find potential NaN handling issues (should use np.nan, not 0.0)
-grep -n "if.*se.*>.*0.*else 0" diff_diff/*.py
+# Subprocess spawn sites (must include --bare and other locked flags)
+grep -rn 'subprocess\.\(run\|Popen\|check_call\|check_output\)' harness/ graders/ tests/
 
-# Find all t_stat calculations to ensure consistency
-grep -n "t_stat.*=" diff_diff/*.py
+# Telemetry record construction sites (must pass arm explicitly)
+grep -rn 'TelemetryRecord(' harness/ graders/ analysis/
 
-# Find all inference field assignments
-grep -n "\(se\|t_stat\|p_value\|ci_lower\|ci_upper\).*=" diff_diff/*.py | head -30
+# Prompt registry version refs (catch in-place edits to recorded prompts)
+git log --oneline -- prompts/ rubrics/
+
+# Cold-start verification doc references
+grep -rn 'COLD_START_VERIFICATION' harness/ graders/ tests/ docs/ 2>/dev/null
 ```

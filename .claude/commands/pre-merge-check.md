@@ -35,13 +35,194 @@ If any harness files changed:
 
 The locked subprocess invocation is multiline (a Python list literal split across lines), so single-line `grep` will miss it. Use multiline-aware tooling: `rg -U` (or a small Python AST scanner) to inspect the full subprocess call block, not just one line at a time.
 
-**Check A - Subprocess `claude` spawn missing required cold-start flags**:
+**Check A - Subprocess `claude` spawn missing required cold-start flags or hygiene**:
 ```bash
-# Multiline rg: find each subprocess.run/Popen call that mentions "claude"
-# and verify it contains all four locked flags.
+# Multiline AST scan: find each subprocess.run/Popen call that mentions "claude"
+# and verify it contains ALL seven locked flags AND the cwd/env hygiene keywords.
+# This is the canonical cold-start surface check; it must match the full locked
+# invocation in CLAUDE.md "Cold-start agent runner" and harness/COLD_START_VERIFICATION.md
+# "The locked invocation" + "Subprocess hygiene".
+#
+# Argv resolution: handles three call shapes:
+#   subprocess.run(["claude", ...], cwd=..., env=...)              # inline positional
+#   subprocess.run(args=["claude", ...], cwd=..., env=...)         # inline kwarg
+#   cmd = ["claude", ...]; subprocess.run(cmd, cwd=..., env=...)   # simple variable
+# For dynamic argv (function call result, conditional, list comprehension, etc.)
+# the scanner FAILS CLOSED with a "manual review required" warning rather than
+# silently passing. This prevents future spawn sites from bypassing the check
+# by hiding the argv behind a non-resolvable expression.
 python3 - <<'PY'
 import ast, pathlib, sys
-required = {"--bare", "--setting-sources", "--strict-mcp-config", "--disable-slash-commands"}
+
+# All seven locked CLI flags (per CLAUDE.md "Cold-start agent runner" + COLD_START_VERIFICATION.md).
+required_flags = {
+    "--bare",
+    "--setting-sources",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--print",
+    "--output-format",
+    "--add-dir",
+}
+# Required subprocess kwargs (per COLD_START_VERIFICATION.md "Subprocess hygiene").
+required_kwargs = {"cwd", "env"}
+SUBPROC_FUNCS = ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output")
+
+
+def find_argv_node(call, scope_body):
+    """Resolve a subprocess.* call's argv to an ast.List node, or return a sentinel.
+
+    Returns (list_node, kind):
+      (ast.List, "inline-positional") - subprocess.run([...])
+      (ast.List, "inline-kwarg")      - subprocess.run(args=[...])
+      (ast.List, "resolved-variable") - cmd = [...]; subprocess.run(cmd) (or args=cmd)
+      (None,     "dynamic")           - argv is a non-list expression we can't resolve; FAIL CLOSED
+      (None,     "no-argv")           - call has neither a positional argv nor an args= keyword
+    """
+    # Check positional argv first.
+    if call.args:
+        if isinstance(call.args[0], (ast.List, ast.Name)):
+            candidate = call.args[0]
+            kind_inline = "inline-positional"
+        else:
+            # Positional 0 exists but isn't List/Name (function call, tuple,
+            # comprehension, etc.). Fail closed.
+            return (None, "dynamic")
+    else:
+        # No positional - look for args= keyword
+        args_kw = next((kw for kw in call.keywords if kw.arg == "args"), None)
+        if args_kw is None:
+            return (None, "no-argv")
+        if not isinstance(args_kw.value, (ast.List, ast.Name)):
+            # args= present but value is non-list/non-name (e.g.,
+            # subprocess.run(args=make_cmd("claude"))). Fail closed.
+            return (None, "dynamic")
+        candidate = args_kw.value
+        kind_inline = "inline-kwarg"
+
+    if isinstance(candidate, ast.List):
+        return (candidate, kind_inline)
+
+    # ast.Name: walk the surrounding scope_body for the most recent simple
+    # `<name> = [...]` assignment that precedes the call.
+    name = candidate.id
+    resolved = None
+    for stmt in ast.walk(scope_body):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if getattr(stmt, "lineno", 1 << 30) >= call.lineno:
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name) and target.id == name and isinstance(stmt.value, ast.List):
+                # Keep the latest one before the call site
+                if resolved is None or stmt.lineno > resolved.lineno:
+                    resolved = stmt
+    if resolved is not None:
+        return (resolved.value, "resolved-variable")
+    # Variable can't be resolved to a simple List literal - fail closed
+    return (None, "dynamic")
+
+
+def check_env_cwd_values(call, scope_body):
+    """Verify cwd= and env= aren't obviously inheriting operator state.
+
+    Returns a list of warning strings (empty if clean).
+
+    Hard-fails on direct use:
+      env=os.environ                    # inherits operator env
+      env=os.environ.copy()             # inherits
+      env={**os.environ, ...}           # inherits
+      cwd=os.getcwd()                   # inherits operator cwd
+      cwd=Path.cwd() / pathlib.Path.cwd()
+      cwd="." or cwd=None               # default-cwd inheritance
+
+    Resolves simple variable assignments one level deep:
+      clean_env = os.environ.copy()       # walks back to assignment, fails closed
+      clean_env = {**os.environ, ...}     # walks back, fails closed
+      tmpdir = os.getcwd()                # walks back, fails closed
+
+    For non-obvious expressions that don't resolve to a simple assignment
+    (function call results, deeper nesting, dict comprehensions),
+    emits a "manual review required" soft warning rather than silently
+    passing.
+    """
+    warnings = []
+
+    def value_source(value_node):
+        """Return source string for a value, including a one-hop variable resolution."""
+        try:
+            direct = ast.unparse(value_node)
+        except Exception:
+            direct = ""
+        if isinstance(value_node, ast.Name):
+            # One-hop resolution: find the most recent simple assignment to this name
+            name = value_node.id
+            for stmt in ast.walk(scope_body):
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                if getattr(stmt, "lineno", 1 << 30) >= call.lineno:
+                    continue
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        try:
+                            resolved_src = ast.unparse(stmt.value)
+                        except Exception:
+                            resolved_src = ""
+                        return direct, resolved_src, "resolved"
+            # Variable couldn't be resolved
+            return direct, None, "unresolved-name"
+        return direct, None, "literal"
+
+    for kw in call.keywords:
+        if kw.arg not in ("env", "cwd"):
+            continue
+        direct_src, resolved_src, status = value_source(kw.value)
+        # Combine direct + resolved into one string for pattern matching
+        full_src = direct_src + ("\n" + resolved_src if resolved_src else "")
+
+        if kw.arg == "env":
+            if "os.environ" in full_src or "environ.copy" in full_src:
+                warnings.append(
+                    f"env= inherits operator state (os.environ reference{' via ' + kw.value.id if status == 'resolved' else ''}); use a clean allowlist instead"
+                )
+            elif status == "unresolved-name":
+                warnings.append(
+                    f"env={kw.value.id} could not be statically resolved - manual review required to confirm clean allowlist (no os.environ inheritance)"
+                )
+        elif kw.arg == "cwd":
+            if "os.getcwd" in full_src or "Path.cwd" in full_src or "Path('.').resolve" in full_src:
+                warnings.append(
+                    f"cwd= references operator working directory{' via ' + kw.value.id if status == 'resolved' else ''}; pass the per-run tmpdir explicitly"
+                )
+            elif isinstance(kw.value, ast.Constant) and kw.value.value in (".", None, ""):
+                warnings.append(
+                    "cwd= is the operator default; pass the per-run tmpdir explicitly"
+                )
+            elif status == "unresolved-name" and kw.value.id not in {"tmpdir", "run_dir", "run_tmpdir"}:
+                # Common per-run tmpdir variable names pass without comment.
+                warnings.append(
+                    f"cwd={kw.value.id} could not be statically resolved - confirm it points at the per-run tmpdir"
+                )
+    return warnings
+
+
+def list_contains_claude(list_node):
+    for el in list_node.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str) and el.value == "claude":
+            return True
+    return False
+
+
+def list_to_string(list_node):
+    parts = []
+    for el in list_node.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str):
+            parts.append(el.value)
+        else:
+            parts.append("<dynamic>")
+    return " ".join(parts)
+
+
 problems = []
 for path in pathlib.Path(".").rglob("*.py"):
     if any(part in {".venv", ".venv-pool", "__pycache__"} for part in path.parts):
@@ -56,58 +237,116 @@ for path in pathlib.Path(".").rglob("*.py"):
         if not isinstance(node, ast.Call):
             continue
         func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
-        if not any(name in func_str for name in ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output")):
+        if not any(fn in func_str for fn in SUBPROC_FUNCS):
             continue
-        # Look for the literal "claude" in any positional or keyword arg
-        try:
-            args_str = " ".join(ast.unparse(a) for a in node.args)
-        except Exception:
+
+        # Resolve argv. If the call is in an obvious enclosing function, use that
+        # scope; else use the whole module.
+        scope_body = tree
+        for parent in ast.walk(tree):
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(child is node for child in ast.walk(parent)):
+                    scope_body = parent
+                    break
+
+        argv_node, kind = find_argv_node(node, scope_body)
+
+        if kind == "no-argv":
+            continue  # not a relevant subprocess call
+
+        if kind == "dynamic":
+            # Fail closed: we can't statically verify a non-list argv. Because
+            # the call source may not contain a literal "claude" string (e.g.,
+            # claude_cmd = build_claude_cmd(...); subprocess.run(claude_cmd)),
+            # we conservatively flag ALL unresolved argv in harness/graders/
+            # tests for manual review. Trade-off: false positives on legitimate
+            # non-Claude subprocess calls in those paths; acceptable because
+            # subprocess use in those paths should be infrequent and reviewed.
+            problems.append((path, node.lineno, [], [], ["argv is dynamic - manual cold-start review required (cannot statically verify locked invocation)"]))
             continue
-        if '"claude"' not in args_str and "'claude'" not in args_str:
+
+        if not list_contains_claude(argv_node):
             continue
-        missing = sorted(f for f in required if f not in args_str)
-        if missing:
-            problems.append((path, node.lineno, missing))
-for p, ln, missing in problems:
-    print(f"{p}:{ln}: missing cold-start flags: {missing}")
+
+        args_str = list_to_string(argv_node)
+        missing_flags = sorted(f for f in required_flags if f not in args_str)
+        provided_kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
+        missing_kwargs = sorted(required_kwargs - provided_kwargs)
+
+        # Verify locked value pairings via pairwise scan of the resolved argv list.
+        bad_pairings = []
+        elements = argv_node.elts
+        for i, el in enumerate(elements):
+            if not isinstance(el, ast.Constant) or not isinstance(el.value, str):
+                continue
+            next_el = elements[i + 1] if i + 1 < len(elements) else None
+            next_val = next_el.value if isinstance(next_el, ast.Constant) and isinstance(next_el.value, str) else None
+            if el.value == "--setting-sources" and next_val != "":
+                bad_pairings.append("--setting-sources must be paired with empty string \"\"")
+            if el.value == "--output-format" and next_val != "stream-json":
+                bad_pairings.append("--output-format must be paired with \"stream-json\"")
+            if el.value == "--add-dir" and next_val is None:
+                bad_pairings.append("--add-dir requires a tmpdir value as next list element")
+
+        # Value-level check on cwd= and env= (operator-state inheritance)
+        env_cwd_warnings = check_env_cwd_values(node, scope_body)
+
+        if missing_flags or missing_kwargs or bad_pairings or env_cwd_warnings:
+            problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings + env_cwd_warnings))
+
+for p, ln, mf, mk, bp in problems:
+    parts = []
+    if mf:
+        parts.append(f"missing flags: {mf}")
+    if mk:
+        parts.append(f"missing kwargs: {mk}")
+    parts.extend(bp)
+    print(f"{p}:{ln}: " + "; ".join(parts))
 sys.exit(1 if problems else 0)
 PY
 ```
-Flag: "Cold-start spawn must include `--bare`, `--setting-sources \"\"`, `--strict-mcp-config`, `--disable-slash-commands` (locked architectural decision). Missing flags in <file:line>."
+Flag: "Cold-start spawn must include all seven locked flags (`--bare`, `--setting-sources`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir`) AND the `cwd=` and `env=` keyword arguments (per `harness/COLD_START_VERIFICATION.md` 'Subprocess hygiene' section). Missing items in <file:line>."
 
 The Python AST scan is robust to multiline subprocess calls; the previous single-line grep heuristic missed them. If `python3` is unavailable, fall back to:
 ```bash
 rg -U --multiline -n 'subprocess\.(run|Popen|check_call|check_output)\(\s*\[.*?"claude".*?\]' harness/ graders/ tests/ 2>/dev/null
 ```
-and manually verify each match contains all four flags.
+and manually verify each match contains all seven flags plus `cwd=` and `env=`.
 
-**Check C - In-process telemetry shim parity**:
+**Check B - In-process telemetry shim parity**:
 For changes touching the diff-diff arm shim, check the statsmodels arm shim was updated:
 ```bash
 git diff --name-only HEAD -- harness/sitecustomize_template.py harness/sitecustomize_*.py | head
 ```
 Flag if only one arm's shim changed without documented rationale.
 
-#### 2.2 Prompt Versioning Patterns (for prompt changes)
+#### 2.2 Prompt / Rubric Versioning Patterns (for prompt or rubric changes)
 
-If `prompts/**/*.txt` changed:
+If `prompts/**/*.txt` OR `rubrics/**/*.yaml` changed:
 ```bash
-git diff --name-only HEAD -- prompts/
+git diff --name-only HEAD -- prompts/ rubrics/
 ```
 
-**Check D - Prompt edited in place vs new version**:
-Versioned prompts (e.g., `prompts/case_study/v1.txt`) should NOT be edited after first run. New prompt = new version file.
+**Check C - Versioned artifact edited in place vs new version**:
+Versioned prompts (e.g., `prompts/case_study/v1.txt`) and rubrics (e.g., `rubrics/case_study_v1.yaml`) should NOT be edited after first use in a recorded run. New artifact = new version file (`v2.txt`, `case_study_v2.yaml`).
 ```bash
-# Flag in-place edits to existing versioned prompts
-git diff --name-only HEAD -- prompts/ | xargs -I {} sh -c 'echo "Edited: {}"; git log --oneline {} | head -3'
+# Flag in-place edits to existing versioned prompts/rubrics
+git diff --name-only HEAD -- prompts/ rubrics/ | xargs -I {} sh -c 'echo "Edited: {}"; git log --oneline {} | head -3'
 ```
-Flag: "If this prompt has been used in a recorded run, create `vN+1.txt` instead of editing `vN.txt` in place."
+Flag: "If this prompt/rubric has been used in a recorded run, create `vN+1` instead of editing `vN` in place. Per-run records reference the version string; mutating a recorded artifact breaks reproducibility."
 
-**Check E - Prompt contamination patterns**:
+**Check D - Prompt contamination patterns**:
 ```bash
 grep -rn -E '(get_llm_guide|llms\.txt|llms-practitioner|practitioner workflow|CallawaySantAnna|SunAbraham|dCDH|de Chaisemartin|HonestDiD|BaconDecomposition|pre-trends|sensitivity analysis|placebo)' prompts/case_study/ 2>/dev/null
 ```
 Flag: "Case-study prompts must NOT contain guidance hints (estimator names, methodology terms, library-specific surfaces). See pr_review.md anti-pattern #3."
+
+**Check E - Rubric schema sanity** (rubric files only):
+```bash
+# Verify YAML parses
+python3 -c "import yaml; yaml.safe_load(open('rubrics/<changed-file>.yaml'))"
+```
+Flag: "Rubric YAML must parse cleanly; downstream judge code consumes the structured fields."
 
 #### 2.3 Test Existence Check
 
@@ -178,7 +417,8 @@ Based on your changes to: <list of changed files>
 #### If Harness Files Changed
 ```
 ### Cold-Start Integrity
-- [ ] Subprocess spawn includes `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands`
+- [ ] Subprocess spawn includes ALL seven locked flags: `--bare`, `--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir <tmpdir>`
+- [ ] Subprocess hygiene present: `cwd=<run tmpdir>` and `env=clean_env` (allowlist) keyword arguments on the subprocess.* call
 - [ ] `make smoke` still passes the inheritance probe (agent reports no skills/memory/CLAUDE.md)
 - [ ] No new code path reads from operator's env (`$HOME/.claude`, keychain) and passes into the spawned agent
 
@@ -198,6 +438,15 @@ Based on your changes to: <list of changed files>
 - [ ] In-place edit of recorded prompts caught and corrected to vN+1.txt naming
 - [ ] No guidance hints leaked (estimator names, methodology terms, library-specific surfaces)
 - [ ] Arm 1 and arm 2 prompts identical word-for-word except library name (or amendment documented)
+```
+
+#### If Rubrics Changed
+```
+### Rubric Versioning
+- [ ] In-place edit of recorded rubrics caught and corrected to vN+1.yaml naming (per-run records pin the rubric version; mutating a recorded rubric breaks reproducibility)
+- [ ] YAML parses cleanly (downstream judge code consumes the structured fields)
+- [ ] If a new dimension was added: extractor and judge updated to populate it; analysis code updated to consume it
+- [ ] If a dimension was renamed: spot-check old recorded grades for backward-compat or document the schema break
 ```
 
 #### If Documentation Files Changed

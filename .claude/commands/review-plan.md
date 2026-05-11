@@ -76,14 +76,14 @@ If no prior review is available from either source (conversation context or revi
 ### Step 2: Read CLAUDE.md for Project Context
 
 Read the project's `CLAUDE.md` file to understand:
-- Key design patterns (sklearn-like API, formula interface, results objects, etc.)
-- Estimator inheritance map
+- Key design patterns (cold-start agent runner, three-layer telemetry, per-arm venvs, sentinel semantics, reproducibility schema)
+- Locked architectural decisions
 - Testing conventions
-- Key reference file pointers (methodology registry, development checklists, etc.)
+- Key reference file pointers (latest plan, COLD_START_VERIFICATION.md, dev-checklists, etc.)
 
 Also read `.claude/commands/dev-checklists.md` for development checklists.
 
-If the plan modifies estimator math, standard error formulas, inference logic, or edge-case handling, also read `docs/methodology/REGISTRY.md` to understand the academic foundations and reference implementations for the affected estimator(s).
+If the plan modifies harness contracts (cold-start invocation, telemetry layers, prompt or rubric registry, reproducibility schema, comparator-fairness instrumentation), also re-read the relevant section of the latest plan in `~/.claude/plans/` and `harness/COLD_START_VERIFICATION.md` to understand the locked decisions and the env/CLI contract.
 
 ### Step 2b: Parse Comment URL and Verify Branch (if `--pr`)
 
@@ -222,10 +222,10 @@ Use your findings from Step 3. Flag:
 Is the scope right — not too much, not too little?
 
 Check for **missing related changes**:
-- Tests for new/changed functionality
-- `__init__.py` export updates
-- `get_params()` / `set_params()` updates for new parameters
-- Documentation updates (`diff_diff/guides/llms.txt` for new public-API surfaces, `docs/api/*.rst`, `docs/references.rst` for new citations, tutorials, CONTRIBUTING.md, CLAUDE.md if design patterns change). README updates only if the change affects the landing page (new estimator catalog one-liner, hero/badges/tagline, top-level capability paragraph) - per CONTRIBUTING.md, README is not the place for usage examples or per-estimator sections.
+- Tests for new/changed functionality (smoke tests for new module surfaces; behavioral tests for new contracts)
+- `__init__.py` export updates if a new public surface was added
+- `RunConfig` / `RunMetadata` / `TelemetryRecord` field additions if a new per-run dimension was introduced (with `__post_init__` validation if arm-specific)
+- Documentation updates: CLAUDE.md if conventions changed; `prompts/` and `rubrics/` registry version bumps if recorded prompts/rubrics changed (no in-place edits); `harness/COLD_START_VERIFICATION.md` if the cold-start contract changed; `TODO.md` for new tracked tech debt; `ROADMAP.md` if a planned-feature item is shipped or rescoped. README updates only for landing-page-relevant changes (status, hero/tagline, top-level capability summary).
 - For bug fixes: did the plan grep for ALL occurrences of the pattern, or just the one reported?
 
 Check for **unnecessary additions**:
@@ -235,17 +235,19 @@ Check for **unnecessary additions**:
 
 #### Dimension 4: Edge Cases & Failure Modes
 
-For methodology-critical code:
-- NaN propagation through ALL inference fields (SE, t-stat, p-value, CI)
-- Empty inputs / empty result sets
-- Boundary conditions (single observation, single group, etc.)
-- **Registry cross-check** (for plans modifying estimator math/SE/inference):
-  - Read the relevant estimator section in `docs/methodology/REGISTRY.md`
-  - For each equation the plan implements: verify it matches the Registry, or the plan documents the deviation
-  - For each edge case in the Registry's "Edge cases" section: verify the plan handles it or explicitly defers it
-  - CRITICAL if plan contradicts a Registry equation without documented deviation
-  - MEDIUM if plan doesn't handle a documented Registry edge case
-  - LOW if plan adds new edge case handling not yet in Registry (suggest updating it)
+For eval-validity-critical code (cold-start, telemetry, prompts, rubric, reproducibility):
+- Cold-start leakage: any new spawn site missing the seven locked flags (`--bare`, `--setting-sources ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--print`, `--output-format stream-json`, `--add-dir <tmpdir>`) or the `cwd=<tmpdir>` + `env=clean_env` hygiene
+- Telemetry gaps: any new tracked surface that lacks the in-process layer (stream-JSON alone misses Python-internal access)
+- Prompt contamination: any case-study prompt mentioning `llms.txt`, `get_llm_guide`, estimator names, or methodology hints
+- Comparator-fairness asymmetry: any one-arm instrumentation change without documented rationale
+- Sentinel violations: arm-specific contracts on `opened_llms_*` and `called_get_llm_guide` (None for statsmodels, bool for diff-diff)
+- **Locked-decisions cross-check** (for plans modifying harness/telemetry/prompt/rubric):
+  - Read the relevant section of the latest plan in `~/.claude/plans/`
+  - For each contract the plan implements: verify it matches the locked architectural decisions, or the plan documents the deviation with `**Note:**` or `**Deviation from plan:**` label
+  - For each known edge case (cold-start probe failure, missing event-log, malformed transcript): verify the plan handles it or explicitly defers it
+  - CRITICAL if plan contradicts a locked decision without documented deviation
+  - MEDIUM if plan doesn't handle a known edge case
+  - LOW if plan adds new edge case handling not yet documented (suggest updating CLAUDE.md or COLD_START_VERIFICATION.md)
 
 For all code:
 - Error handling paths — are they tested with behavioral assertions (not just "runs without exception")?
@@ -254,9 +256,12 @@ For all code:
 #### Dimension 5: Architecture & Patterns
 
 Check against CLAUDE.md conventions:
-- Does it respect the estimator inheritance map? (Adding a param to `DifferenceInDifferences` auto-propagates to `TwoWayFixedEffects` and `MultiPeriodDiD`; standalone estimators need individual updates)
-- Does it use `linalg.py` for OLS/variance instead of reimplementing?
-- Does it follow the sklearn-like `fit()` / results-object pattern?
+- Does it respect the cold-start agent runner contract? (Locked `claude --bare ...` invocation, `cwd=<tmpdir>` + `env=clean_env` hygiene, no operator-state inheritance)
+- Does it preserve three-layer telemetry capture? (Stream-JSON + in-process shim + stderr; new tracked surfaces get the in-process layer, not just stream-JSON)
+- Does it use the per-arm venv pool abstraction (`build_arm_template` + `clone_for_run`) instead of ad-hoc venv creation?
+- Does it use the immutable prompts/ and rubrics/ registries (versioned, no in-place edit) rather than embedding prompts/rubrics inline?
+- Does it use the two-stage extraction pattern (deterministic from in-process events + AI judge from transcript) rather than a single-stage approach?
+- Does it pin all RunMetadata reproducibility fields (harness/library/Claude/model versions, dataset/prompt/rubric refs, random_seed, run_id, arm)?
 - Is there a simpler alternative that avoids new abstraction?
 - Does it match existing code patterns in the codebase?
 
@@ -357,12 +362,12 @@ Present the review in the following format. Number each issue sequentially withi
 
 Cross-reference against the relevant development checklists in `.claude/commands/dev-checklists.md`. List which checklist items are not addressed by the plan.
 
-[Identify which checklist applies (e.g., "Adding a New Parameter to Estimators", "Implementing Methodology-Critical Code", "Fixing Bugs Across Multiple Locations") and list any items from that checklist that the plan doesn't cover.]
+[Identify which checklist applies (e.g., "Adding a New Configuration Parameter", "Touching Eval-Validity Code", "Adding Warning/Error/Fallback Handling", "Reviewing New Features or Code Paths", "Fixing Bugs Across Multiple Locations") and list any items from that checklist that the plan doesn't cover.]
 
-**Registry Alignment** (if methodology files changed):
-- [ ] Plan equations match REGISTRY.md (or deviations documented)
-- [ ] All Registry edge cases handled or explicitly out-of-scope
-- [ ] REGISTRY.md updated if new edge cases discovered
+**Locked-Decisions Alignment** (if plan touches harness contracts):
+- [ ] Plan-described behavior matches locked architectural decisions in the latest plan + CLAUDE.md (or deviations documented with `**Note:**` / `**Deviation from plan:**`)
+- [ ] All known edge cases (cold-start probe failure, missing event-log, malformed transcript, sentinel violations) handled or explicitly out-of-scope
+- [ ] CLAUDE.md or COLD_START_VERIFICATION.md updated if new contract conditions discovered
 
 ---
 

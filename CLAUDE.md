@@ -93,7 +93,7 @@ The AI PR reviewer recognizes deviations as documented (and downgrades them to P
 | File | Contains |
 |------|----------|
 | The latest plan file in `~/.claude/plans/` | Phase scope, locked architectural decisions, treatment design, telemetry layers, reproducibility schema. **Consult before harness changes.** |
-| `.claude/commands/dev-checklists.md` | Checklists for params, methodology, warnings, reviews, bugs (run `/dev-checklists`) |
+| `.claude/commands/dev-checklists.md` | Checklists for configuration parameters, eval-validity code, warnings, reviews, bug fixes (run `/dev-checklists`) |
 | `harness/COLD_START_VERIFICATION.md` | How to verify the cold-start probe works end-to-end |
 | `prompts/case_study/v1.txt` | The Phase 1 case-study prompt (versioned, immutable once recorded) |
 | `rubrics/case_study_v1.yaml` | The Phase 1 grading rubric (versioned, pre-defined before runs) |
