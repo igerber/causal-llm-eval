@@ -123,12 +123,12 @@ def find_argv_node(call, scope_body):
     return (None, "dynamic")
 
 
-def check_env_cwd_values(call):
+def check_env_cwd_values(call, scope_body):
     """Verify cwd= and env= aren't obviously inheriting operator state.
 
     Returns a list of warning strings (empty if clean).
 
-    Hard-fails on:
+    Hard-fails on direct use:
       env=os.environ                    # inherits operator env
       env=os.environ.copy()             # inherits
       env={**os.environ, ...}           # inherits
@@ -136,33 +136,72 @@ def check_env_cwd_values(call):
       cwd=Path.cwd() / pathlib.Path.cwd()
       cwd="." or cwd=None               # default-cwd inheritance
 
-    Other patterns (env=clean_env variable, env={...} dict literal,
-    cwd=<Name>, cwd=<str literal>) pass without comment - the deep "is
-    this env actually clean?" check is left to manual review with a soft
-    note when the value is a non-obvious expression.
+    Resolves simple variable assignments one level deep:
+      clean_env = os.environ.copy()       # walks back to assignment, fails closed
+      clean_env = {**os.environ, ...}     # walks back, fails closed
+      tmpdir = os.getcwd()                # walks back, fails closed
+
+    For non-obvious expressions that don't resolve to a simple assignment
+    (function call results, deeper nesting, dict comprehensions),
+    emits a "manual review required" soft warning rather than silently
+    passing.
     """
     warnings = []
+
+    def value_source(value_node):
+        """Return source string for a value, including a one-hop variable resolution."""
+        try:
+            direct = ast.unparse(value_node)
+        except Exception:
+            direct = ""
+        if isinstance(value_node, ast.Name):
+            # One-hop resolution: find the most recent simple assignment to this name
+            name = value_node.id
+            for stmt in ast.walk(scope_body):
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                if getattr(stmt, "lineno", 1 << 30) >= call.lineno:
+                    continue
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        try:
+                            resolved_src = ast.unparse(stmt.value)
+                        except Exception:
+                            resolved_src = ""
+                        return direct, resolved_src, "resolved"
+            # Variable couldn't be resolved
+            return direct, None, "unresolved-name"
+        return direct, None, "literal"
+
     for kw in call.keywords:
         if kw.arg not in ("env", "cwd"):
             continue
-        try:
-            src = ast.unparse(kw.value)
-        except Exception:
-            src = ""
-        # Hard-fails: explicit operator-state inheritance
+        direct_src, resolved_src, status = value_source(kw.value)
+        # Combine direct + resolved into one string for pattern matching
+        full_src = direct_src + ("\n" + resolved_src if resolved_src else "")
+
         if kw.arg == "env":
-            if "os.environ" in src or "environ.copy" in src:
+            if "os.environ" in full_src or "environ.copy" in full_src:
                 warnings.append(
-                    "env= inherits operator state (os.environ reference); use a clean allowlist instead"
+                    f"env= inherits operator state (os.environ reference{' via ' + kw.value.id if status == 'resolved' else ''}); use a clean allowlist instead"
+                )
+            elif status == "unresolved-name":
+                warnings.append(
+                    f"env={kw.value.id} could not be statically resolved - manual review required to confirm clean allowlist (no os.environ inheritance)"
                 )
         elif kw.arg == "cwd":
-            if "os.getcwd" in src or "Path.cwd" in src or "Path('.').resolve" in src:
+            if "os.getcwd" in full_src or "Path.cwd" in full_src or "Path('.').resolve" in full_src:
                 warnings.append(
-                    "cwd= references operator working directory; pass the per-run tmpdir explicitly"
+                    f"cwd= references operator working directory{' via ' + kw.value.id if status == 'resolved' else ''}; pass the per-run tmpdir explicitly"
                 )
-            if isinstance(kw.value, ast.Constant) and kw.value.value in (".", None, ""):
+            elif isinstance(kw.value, ast.Constant) and kw.value.value in (".", None, ""):
                 warnings.append(
                     "cwd= is the operator default; pass the per-run tmpdir explicitly"
+                )
+            elif status == "unresolved-name" and kw.value.id not in {"tmpdir", "run_dir", "run_tmpdir"}:
+                # Common per-run tmpdir variable names pass without comment.
+                warnings.append(
+                    f"cwd={kw.value.id} could not be statically resolved - confirm it points at the per-run tmpdir"
                 )
     return warnings
 
@@ -216,15 +255,14 @@ for path in pathlib.Path(".").rglob("*.py"):
             continue  # not a relevant subprocess call
 
         if kind == "dynamic":
-            # Fail closed: we can't statically verify a non-list argv. If the
-            # call doesn't reference "claude" anywhere in its source, skip; else
-            # warn for manual review.
-            try:
-                src = ast.unparse(node)
-            except Exception:
-                src = ""
-            if '"claude"' in src or "'claude'" in src:
-                problems.append((path, node.lineno, [], [], ["argv is dynamic - manual cold-start review required"]))
+            # Fail closed: we can't statically verify a non-list argv. Because
+            # the call source may not contain a literal "claude" string (e.g.,
+            # claude_cmd = build_claude_cmd(...); subprocess.run(claude_cmd)),
+            # we conservatively flag ALL unresolved argv in harness/graders/
+            # tests for manual review. Trade-off: false positives on legitimate
+            # non-Claude subprocess calls in those paths; acceptable because
+            # subprocess use in those paths should be infrequent and reviewed.
+            problems.append((path, node.lineno, [], [], ["argv is dynamic - manual cold-start review required (cannot statically verify locked invocation)"]))
             continue
 
         if not list_contains_claude(argv_node):
@@ -251,7 +289,7 @@ for path in pathlib.Path(".").rglob("*.py"):
                 bad_pairings.append("--add-dir requires a tmpdir value as next list element")
 
         # Value-level check on cwd= and env= (operator-state inheritance)
-        env_cwd_warnings = check_env_cwd_values(node)
+        env_cwd_warnings = check_env_cwd_values(node, scope_body)
 
         if missing_flags or missing_kwargs or bad_pairings or env_cwd_warnings:
             problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings + env_cwd_warnings))
