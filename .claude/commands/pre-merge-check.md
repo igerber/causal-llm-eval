@@ -42,10 +42,19 @@ The locked subprocess invocation is multiline (a Python list literal split acros
 # This is the canonical cold-start surface check; it must match the full locked
 # invocation in CLAUDE.md "Cold-start agent runner" and harness/COLD_START_VERIFICATION.md
 # "The locked invocation" + "Subprocess hygiene".
+#
+# Argv resolution: handles three call shapes:
+#   subprocess.run(["claude", ...], cwd=..., env=...)              # inline positional
+#   subprocess.run(args=["claude", ...], cwd=..., env=...)         # inline kwarg
+#   cmd = ["claude", ...]; subprocess.run(cmd, cwd=..., env=...)   # simple variable
+# For dynamic argv (function call result, conditional, list comprehension, etc.)
+# the scanner FAILS CLOSED with a "manual review required" warning rather than
+# silently passing. This prevents future spawn sites from bypassing the check
+# by hiding the argv behind a non-resolvable expression.
 python3 - <<'PY'
 import ast, pathlib, sys
 
-# All seven locked CLI flags (per CLAUDE.md L59 and COLD_START_VERIFICATION.md L7-L20).
+# All seven locked CLI flags (per CLAUDE.md "Cold-start agent runner" + COLD_START_VERIFICATION.md).
 required_flags = {
     "--bare",
     "--setting-sources",
@@ -55,10 +64,76 @@ required_flags = {
     "--output-format",
     "--add-dir",
 }
-# Required subprocess kwargs (per COLD_START_VERIFICATION.md "Subprocess hygiene"
-# section). cwd= forces the spawn into the per-run tmpdir; env= constructs a
-# clean allowlist instead of inheriting the operator's environment.
+# Required subprocess kwargs (per COLD_START_VERIFICATION.md "Subprocess hygiene").
 required_kwargs = {"cwd", "env"}
+SUBPROC_FUNCS = ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output")
+
+
+def find_argv_node(call, scope_body):
+    """Resolve a subprocess.* call's argv to an ast.List node, or return a sentinel.
+
+    Returns (list_node, kind):
+      (ast.List, "inline-positional") - subprocess.run([...])
+      (ast.List, "inline-kwarg")      - subprocess.run(args=[...])
+      (ast.List, "resolved-variable") - cmd = [...]; subprocess.run(cmd) (or args=cmd)
+      (None,     "dynamic")           - argv is a non-list expression we can't resolve; FAIL CLOSED
+      (None,     "no-argv")           - call has no positional and no args= keyword
+    """
+    candidate = None  # the ast.Name or ast.List we'll try to resolve
+    if call.args and isinstance(call.args[0], (ast.List, ast.Name)):
+        candidate = call.args[0]
+        kind_inline = "inline-positional"
+    else:
+        for kw in call.keywords:
+            if kw.arg == "args" and isinstance(kw.value, (ast.List, ast.Name)):
+                candidate = kw.value
+                kind_inline = "inline-kwarg"
+                break
+        else:
+            # Positional 0 exists but isn't a List/Name (e.g., tuple, function call, comprehension)
+            if call.args:
+                return (None, "dynamic")
+            return (None, "no-argv")
+
+    if isinstance(candidate, ast.List):
+        return (candidate, kind_inline)
+
+    # ast.Name: walk the surrounding scope_body for the most recent simple
+    # `<name> = [...]` assignment that precedes the call.
+    name = candidate.id
+    resolved = None
+    for stmt in ast.walk(scope_body):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if getattr(stmt, "lineno", 1 << 30) >= call.lineno:
+            continue
+        for target in stmt.targets:
+            if isinstance(target, ast.Name) and target.id == name and isinstance(stmt.value, ast.List):
+                # Keep the latest one before the call site
+                if resolved is None or stmt.lineno > resolved.lineno:
+                    resolved = stmt
+    if resolved is not None:
+        return (resolved.value, "resolved-variable")
+    # Variable can't be resolved to a simple List literal - fail closed
+    return (None, "dynamic")
+
+
+def list_contains_claude(list_node):
+    for el in list_node.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str) and el.value == "claude":
+            return True
+    return False
+
+
+def list_to_string(list_node):
+    parts = []
+    for el in list_node.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str):
+            parts.append(el.value)
+        else:
+            parts.append("<dynamic>")
+    return " ".join(parts)
+
 
 problems = []
 for path in pathlib.Path(".").rglob("*.py"):
@@ -74,41 +149,61 @@ for path in pathlib.Path(".").rglob("*.py"):
         if not isinstance(node, ast.Call):
             continue
         func_str = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
-        if not any(name in func_str for name in ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output")):
+        if not any(fn in func_str for fn in SUBPROC_FUNCS):
             continue
-        # Look for the literal "claude" in any positional or keyword arg
-        try:
-            args_str = " ".join(ast.unparse(a) for a in node.args)
-        except Exception:
+
+        # Resolve argv. If the call is in an obvious enclosing function, use that
+        # scope; else use the whole module.
+        scope_body = tree
+        for parent in ast.walk(tree):
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(child is node for child in ast.walk(parent)):
+                    scope_body = parent
+                    break
+
+        argv_node, kind = find_argv_node(node, scope_body)
+
+        if kind == "no-argv":
+            continue  # not a relevant subprocess call
+
+        if kind == "dynamic":
+            # Fail closed: we can't statically verify a non-list argv. If the
+            # call doesn't reference "claude" anywhere in its source, skip; else
+            # warn for manual review.
+            try:
+                src = ast.unparse(node)
+            except Exception:
+                src = ""
+            if '"claude"' in src or "'claude'" in src:
+                problems.append((path, node.lineno, [], [], ["argv is dynamic - manual cold-start review required"]))
             continue
-        if '"claude"' not in args_str and "'claude'" not in args_str:
+
+        if not list_contains_claude(argv_node):
             continue
+
+        args_str = list_to_string(argv_node)
         missing_flags = sorted(f for f in required_flags if f not in args_str)
-        # Check for required keyword arguments on the subprocess.* call
         provided_kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
         missing_kwargs = sorted(required_kwargs - provided_kwargs)
-        # Verify locked value pairings via pairwise scan of the args list.
-        # Walks the first positional arg if it's a list, looking for flag-value
-        # pairs. Flags whose locked value is empty string ("") or "stream-json"
-        # are checked here; --add-dir just needs SOME value (tmpdir-dependent).
+
+        # Verify locked value pairings via pairwise scan of the resolved argv list.
         bad_pairings = []
-        for arg in node.args:
-            if not isinstance(arg, ast.List):
+        elements = argv_node.elts
+        for i, el in enumerate(elements):
+            if not isinstance(el, ast.Constant) or not isinstance(el.value, str):
                 continue
-            elements = arg.elts
-            for i, el in enumerate(elements):
-                if not isinstance(el, ast.Constant) or not isinstance(el.value, str):
-                    continue
-                next_el = elements[i + 1] if i + 1 < len(elements) else None
-                next_val = next_el.value if isinstance(next_el, ast.Constant) and isinstance(next_el.value, str) else None
-                if el.value == "--setting-sources" and next_val != "":
-                    bad_pairings.append("--setting-sources must be paired with empty string \"\"")
-                if el.value == "--output-format" and next_val != "stream-json":
-                    bad_pairings.append("--output-format must be paired with \"stream-json\"")
-                if el.value == "--add-dir" and next_val is None:
-                    bad_pairings.append("--add-dir requires a tmpdir value as next list element")
+            next_el = elements[i + 1] if i + 1 < len(elements) else None
+            next_val = next_el.value if isinstance(next_el, ast.Constant) and isinstance(next_el.value, str) else None
+            if el.value == "--setting-sources" and next_val != "":
+                bad_pairings.append("--setting-sources must be paired with empty string \"\"")
+            if el.value == "--output-format" and next_val != "stream-json":
+                bad_pairings.append("--output-format must be paired with \"stream-json\"")
+            if el.value == "--add-dir" and next_val is None:
+                bad_pairings.append("--add-dir requires a tmpdir value as next list element")
+
         if missing_flags or missing_kwargs or bad_pairings:
             problems.append((path, node.lineno, missing_flags, missing_kwargs, bad_pairings))
+
 for p, ln, mf, mk, bp in problems:
     parts = []
     if mf:
