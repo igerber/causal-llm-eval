@@ -62,6 +62,7 @@ Thumbs.db
 # Eval run outputs (large; reproducible from harness)
 runs/case_study_v*/
 runs/preflight/
+runs/probe/
 runs/scratch/
 *.parquet.partial
 

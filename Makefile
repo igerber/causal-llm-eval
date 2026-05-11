@@ -47,6 +47,7 @@ clean:
 	rm -rf .venv-pool/
 	rm -rf runs/case_study_v*/
 	rm -rf runs/preflight/
+	rm -rf runs/probe/
 	rm -rf runs/scratch/
 	rm -rf .pytest_cache/
 	find . -name "__pycache__" -type d -exec rm -rf {} +

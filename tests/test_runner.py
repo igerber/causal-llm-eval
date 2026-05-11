@@ -104,7 +104,7 @@ def test_clean_env_lc_keys_explicit_no_wildcard(tmp_path, monkeypatch):
 
 def test_build_command_includes_all_seven_locked_flags(tmp_path):
     """The seven required cold-start flags are all present, with exact tokens."""
-    cmd = _build_command("test prompt", tmp_path)
+    cmd = _build_command("test prompt", tmp_path, "claude-opus-4-7")
     assert "--bare" in cmd
     assert "--setting-sources" in cmd
     idx = cmd.index("--setting-sources")
@@ -124,9 +124,24 @@ def test_build_command_includes_all_seven_locked_flags(tmp_path):
 
 def test_build_command_uses_bare_first(tmp_path):
     """--bare must precede other flags (CLI semantics)."""
-    cmd = _build_command("p", tmp_path)
+    cmd = _build_command("p", tmp_path, "claude-opus-4-7")
     assert cmd[0] == "claude"
     assert cmd[1] == "--bare"
+
+
+def test_build_command_includes_model_flag(tmp_path):
+    """--model pins the model so CLI defaults can't drift across runs."""
+    cmd = _build_command("p", tmp_path, "claude-opus-4-7")
+    assert "--model" in cmd
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "claude-opus-4-7"
+
+
+def test_build_command_passes_through_arbitrary_model_string(tmp_path):
+    """The model string is whatever RunConfig.model holds, not hardcoded."""
+    cmd = _build_command("p", tmp_path, "claude-sonnet-4-6")
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "claude-sonnet-4-6"
 
 
 # -- run_one tests ------------------------------------------------------------
@@ -156,9 +171,47 @@ def test_run_one_creates_output_dir_and_in_process_events_stub(tmp_path):
     assert output_dir.exists()
     assert (output_dir / "in_process_events.jsonl").exists()
     assert (output_dir / "transcript.jsonl").exists()
+    assert (output_dir / "cli_stderr.log").exists()
+    # All paths exposed on RunResult so downstream telemetry merging doesn't
+    # need to rely on filename convention.
+    assert result.transcript_jsonl_path == (output_dir / "transcript.jsonl").resolve()
+    assert result.in_process_events_path == (output_dir / "in_process_events.jsonl").resolve()
+    assert result.cli_stderr_log_path == (output_dir / "cli_stderr.log").resolve()
     assert result.exit_code == 0
     assert result.arm == "diff_diff"
     assert len(result.run_id) == 16
+
+
+def test_run_one_uses_absolute_event_log_path_with_relative_output_dir(tmp_path, monkeypatch):
+    """P0-1 regression: relative output_dir resolves to absolute before spawn.
+
+    Without this, the in-process shim (running with cwd=run-tmpdir) would
+    resolve _PYRUNTIME_EVENT_LOG against the spawned process's cwd, writing
+    to a different file than the runner pre-touched.
+    """
+    monkeypatch.chdir(tmp_path)
+    relative_output_dir = Path("rel_run_out")  # NOT absolute
+
+    captured_env: dict = {}
+
+    def fake_popen(*_args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        return proc
+
+    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen):
+        result = run_one(_config(), "prompt", relative_output_dir)
+
+    assert "_PYRUNTIME_EVENT_LOG" in captured_env
+    event_log_path = captured_env["_PYRUNTIME_EVENT_LOG"]
+    assert Path(event_log_path).is_absolute(), (
+        f"_PYRUNTIME_EVENT_LOG must be absolute (got {event_log_path!r}) so the "
+        f"shim cannot misinterpret it against the spawned subprocess's cwd."
+    )
+    # And the file the runner touched is the same file the shim will see.
+    assert Path(event_log_path) == result.in_process_events_path
+    assert result.in_process_events_path.exists()
 
 
 def test_run_one_pre_spawn_check_raises_on_unwritable_event_log(tmp_path):

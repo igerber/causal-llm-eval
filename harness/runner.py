@@ -19,6 +19,14 @@ auto-memory, plugin sync, attribution, and keychain reads. Without it the
 spawned agent inherits operator state and the eval is invalid.
 
 Verified by `make smoke` running the inheritance probe.
+
+**Note:** PR #3 runs the spawned agent in whichever venv is active for the
+harness process (no per-arm venv pool yet). The per-arm venv pool — fresh
+venv per run with one library installed (diff-diff XOR statsmodels), with
+PATH prepended to the venv bin — lands in PR #5 (`harness.venv_pool`).
+Until then, `clean_env()` passes operator `PATH` verbatim. The cold-start
+isolation contract for tmpdir, HOME, env allowlist, and CLI flags is
+fully enforced in this PR; only the per-arm venv tier is deferred.
 """
 
 from __future__ import annotations
@@ -72,6 +80,7 @@ class RunResult:
     tmpdir: Path
     transcript_jsonl_path: Path
     in_process_events_path: Path
+    cli_stderr_log_path: Path
     record_parquet_path: Path | None
     final_code_path: Path | None
     wall_clock_seconds: float
@@ -136,13 +145,16 @@ def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
     return env
 
 
-def _build_command(prompt: str, tmpdir: Path) -> list[str]:
+def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
     """Construct the exact locked argv for `claude --bare ...`.
 
-    The seven required flags are: --bare, --setting-sources "",
+    The seven cold-start isolation flags are: --bare, --setting-sources "",
     --strict-mcp-config, --disable-slash-commands, --print, --output-format
-    stream-json, --add-dir <tmpdir>. COLD_START_VERIFICATION.md specifies the
-    contract; the pre-merge-check skill verifies it via AST scan.
+    stream-json, --add-dir <tmpdir>. COLD_START_VERIFICATION.md specifies
+    the contract; the pre-merge-check skill verifies it via AST scan.
+
+    `--model <id>` is additional: it pins the model so CLI defaults can't
+    drift across runs. The value is `RunConfig.model`.
     """
     return [
         "claude",
@@ -154,6 +166,8 @@ def _build_command(prompt: str, tmpdir: Path) -> list[str]:
         "--print",
         "--output-format",
         "stream-json",
+        "--model",
+        model,
         "--add-dir",
         str(tmpdir),
         prompt,
@@ -185,7 +199,11 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     contract.
     """
     run_id = uuid.uuid4().hex[:16]
-    output_dir = Path(output_dir)
+    # Resolve to an absolute path so the subprocess (running with cwd=tmpdir)
+    # cannot misinterpret a relative `output_dir` against its own cwd. Without
+    # this, the shim's `_PYRUNTIME_EVENT_LOG` lookup would resolve against
+    # the per-run tmpdir, writing to a different file than the one we touched.
+    output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_jsonl_path = output_dir / "transcript.jsonl"
@@ -205,7 +223,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     event_log_path.touch()
 
     env = clean_env(tmpdir, event_log_path)
-    cmd = _build_command(prompt, tmpdir)
+    cmd = _build_command(prompt, tmpdir, config.model)
 
     start = time.monotonic()
     timed_out = False
@@ -240,6 +258,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         tmpdir=tmpdir,
         transcript_jsonl_path=transcript_jsonl_path,
         in_process_events_path=event_log_path,
+        cli_stderr_log_path=cli_stderr_log_path,
         record_parquet_path=None,
         final_code_path=None,
         wall_clock_seconds=wall_clock_seconds,

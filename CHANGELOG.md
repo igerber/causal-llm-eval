@@ -9,15 +9,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - Cold-start agent runner (`harness.runner.run_one`) implementing the locked
   `claude --bare ...` invocation with `cwd=tmpdir`, `env=clean_env`, and
-  pre-spawn writability check on the per-run event log path.
+  pre-spawn writability check on the per-run event log path. `_PYRUNTIME_EVENT_LOG`
+  is set to an absolute, resolved path so the in-process shim and the runner
+  reference the same file regardless of how `output_dir` was passed.
 - Cold-start inheritance probe (`harness.probe.run_probe`) with a separated
-  output directory under `runs/probe/`. The probe never feeds eval data.
+  output directory under `runs/probe/`. The probe never feeds eval data. Two
+  assessment layers: self-report (blacklist + affirmative-no) and structural
+  (verifies `cwd`, `home`, and env-key allowlist via a `python -c` one-liner
+  the agent runs). Structural layer catches leaky cold-starts where the
+  agent's self-report would miss the leak.
 - `make smoke` target: live cold-start probe with `ANTHROPIC_API_KEY` fail-fast
   precheck. Costs ~$0.05 per invocation.
 - `.github/workflows/tests.yml`: GitHub Actions test workflow running `pytest`
   (default excludes `slow` and `live`) on labeled PRs and push to main.
-- 19 unit tests for `harness.runner` (13) and `harness.probe` (6), plus 2 live
-  tests gated by `@pytest.mark.live`.
+- `cli_stderr_log_path` on `RunResult` so downstream telemetry merging does
+  not need to rely on filename convention.
+- `--model` CLI flag passed to `claude --bare`, sourced from `RunConfig.model`,
+  so default-model drift cannot affect runs.
+- 35 unit tests for `harness.runner` and `harness.probe`, plus 2 live tests
+  gated by `@pytest.mark.live`.
 
 ### Changed
 - Renamed in-process telemetry env var from `CAUSAL_LLM_EVAL_EVENT_LOG` to
@@ -26,3 +36,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   likely to flag the name as eval-related.
 - Dropped the Phase 0 status caveat from `CLAUDE.md` and
   `harness/COLD_START_VERIFICATION.md`: the CI test workflow now exists.
+- Default probe output directory now uses microsecond-resolution timestamps
+  plus a short UUID suffix to prevent collision between same-second runs.
+- Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
+  from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
+  expression; previously blocked editable install).

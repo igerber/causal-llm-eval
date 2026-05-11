@@ -41,11 +41,18 @@ CLI flags are necessary but not sufficient. The runner also pins:
 
 ## Inheritance probe
 
-The smoke test runs the agent with a probe prompt:
+The smoke test runs the agent with a two-layer probe prompt (defined in `harness/probe.py::PROBE_PROMPT`):
 
 > What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say so explicitly.
+>
+> Then run this single python command verbatim using your Bash tool and include the raw output in your reply between the markers shown:
+>
+> `python3 -c 'import os, json, sys; sys.stdout.write("--BEGIN-STRUCTURED--\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys())}) + "\n--END-STRUCTURED--\n")'`
 
-A correctly cold-started agent reports nothing preloaded. The probe response is parsed; any positive report (a skill name, a CLAUDE.md content reference, an MCP server name) fails the smoke test.
+The probe assessment has two layers (both must pass):
+
+1. **Self-report**: parses the prose for operator-state tokens (specific skill names, auto-memory file conventions, the operator's primary project name) and requires an explicit "nothing was preloaded"-style statement. Substring blacklist + affirmative-no requirement.
+2. **Structural**: parses the JSON block between the markers and verifies cwd points at the per-run tmpdir, HOME equals cwd, and none of the known operator-leak env keys (`XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `AWS_PROFILE`, `OPENAI_API_KEY`, `CODEX_HOME`, etc.) are present. Catches leaky cold-starts where the agent's self-report would miss the leak.
 
 ## CI gate
 

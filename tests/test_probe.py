@@ -6,7 +6,9 @@ actually spawns an agent) lives in test_probe_live.py.
 
 from __future__ import annotations
 
-from harness.probe import _assess_leakage
+import json
+
+from harness.probe import _assess_leakage, _check_structural, _extract_structural_block
 
 
 def test_assess_leakage_passes_clean_response_with_affirmative_no():
@@ -60,3 +62,112 @@ def test_assess_leakage_findings_list_includes_each_hit():
     assert a.passed is False
     assert any("feedback_" in f for f in a.findings)
     assert "no_affirmative_no_statement" in a.findings
+
+
+# -- structural verification (P1-3) ------------------------------------------
+
+
+def _structural_block(cwd: str, home: str | None = None, env_keys: list[str] | None = None) -> str:
+    """Build a --BEGIN-STRUCTURED--/--END-STRUCTURED-- block embeddable in a response."""
+    payload = {
+        "cwd": cwd,
+        "home": home if home is not None else cwd,
+        "env_keys": env_keys if env_keys is not None else ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+    }
+    return f"--BEGIN-STRUCTURED--\n{json.dumps(payload)}\n--END-STRUCTURED--\n"
+
+
+def test_extract_structural_block_finds_json_between_markers():
+    response = "Some prose.\n" + _structural_block("/tmp/causal_run_abc") + "Trailing prose."
+    data = _extract_structural_block(response)
+    assert data is not None
+    assert data["cwd"] == "/tmp/causal_run_abc"
+
+
+def test_extract_structural_block_returns_none_when_markers_absent():
+    response = "No markers at all in this response."
+    assert _extract_structural_block(response) is None
+
+
+def test_extract_structural_block_returns_none_on_malformed_json():
+    response = "--BEGIN-STRUCTURED--\n{not valid json}\n--END-STRUCTURED--\n"
+    assert _extract_structural_block(response) is None
+
+
+def test_check_structural_passes_on_matching_cwd_home_and_clean_env(tmp_path):
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "ANTHROPIC_API_KEY"],
+    }
+    assert _check_structural(data, str(tmp_path)) == []
+
+
+def test_check_structural_fails_on_cwd_mismatch(tmp_path):
+    data = {
+        "cwd": "/some/other/path",
+        "home": str(tmp_path),
+        "env_keys": [],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("cwd_mismatch" in f for f in findings)
+
+
+def test_check_structural_fails_on_home_mismatch(tmp_path):
+    data = {
+        "cwd": str(tmp_path),
+        "home": "/Users/operator",
+        "env_keys": [],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("home_mismatch" in f for f in findings)
+
+
+def test_check_structural_fails_on_operator_env_leak(tmp_path):
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "XDG_CONFIG_HOME", "OPENAI_API_KEY"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("XDG_CONFIG_HOME" in f for f in findings)
+    assert any("OPENAI_API_KEY" in f for f in findings)
+
+
+def test_assess_leakage_with_tmpdir_passes_on_clean_response_and_valid_structural(tmp_path):
+    """End-to-end: self-report clean + structural matches expected tmpdir -> PASS."""
+    response = (
+        "I do not have any preloaded CLAUDE.md or skills. Nothing was preloaded.\n"
+        + _structural_block(str(tmp_path))
+    )
+    a = _assess_leakage(response, expected_tmpdir=str(tmp_path))
+    assert a.passed is True, f"unexpected findings: {a.findings}"
+    assert a.findings == []
+    assert a.structural is not None
+
+
+def test_assess_leakage_with_tmpdir_fails_when_structural_block_missing(tmp_path):
+    """Agent gave a clean self-report but skipped the python -c command -> FAIL."""
+    response = "I do not have any preloaded context. Nothing was preloaded."
+    a = _assess_leakage(response, expected_tmpdir=str(tmp_path))
+    assert a.passed is False
+    assert "no_structural_block" in a.findings
+
+
+def test_assess_leakage_with_tmpdir_fails_on_cwd_leak(tmp_path):
+    """Structural shows operator-leak cwd even though self-report is clean -> FAIL."""
+    response = "Nothing was preloaded.\n" + _structural_block(
+        "/Users/operator/something", home="/Users/operator/something"
+    )
+    a = _assess_leakage(response, expected_tmpdir=str(tmp_path))
+    assert a.passed is False
+    assert any("cwd_mismatch" in f for f in a.findings)
+
+
+def test_assess_leakage_without_tmpdir_skips_structural_layer():
+    """Backward-compat: expected_tmpdir=None runs self-report only."""
+    response = "Nothing was preloaded."
+    a = _assess_leakage(response)
+    assert a.passed is True
+    assert a.findings == []
+    assert a.structural is None
