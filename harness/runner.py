@@ -31,6 +31,7 @@ fully enforced in this PR; only the per-arm venv tier is deferred.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -57,6 +58,13 @@ _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
 )
 
 _TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
+_TELEMETRY_MISSING_MARKER = (
+    "=== TELEMETRY MISSING: agent_event_log_path did not exist post-exec ==="
+)
+# Exit-code sentinels for fatal harness conditions. Distinct from any real
+# CLI exit code so downstream extractors can branch on them.
+EXIT_CODE_TIMEOUT = -1
+EXIT_CODE_TELEMETRY_MISSING = -2
 
 
 @dataclass
@@ -279,7 +287,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
                 # Process already exited between timeout and killpg; harmless.
                 pass
             proc.wait()
-            exit_code = -1
+            exit_code = EXIT_CODE_TIMEOUT
             timed_out = True
     wall_clock_seconds = time.monotonic() - start
 
@@ -287,13 +295,30 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         with open(cli_stderr_log_path, "a") as f:
             f.write(_TIMEOUT_MARKER_FMT.format(timeout=config.timeout_seconds) + "\n")
 
-    # Promote the in-tmpdir event log into output_dir for forensics. If the
-    # subprocess deleted it (unexpected), create an empty file so downstream
-    # telemetry merging always finds the path RunResult promises.
+    # Promote the in-tmpdir event log into output_dir for forensics. A
+    # missing file post-exec is fail-closed (R5 P0): the runner touched it
+    # pre-spawn, so absence implies either the agent removed it or the
+    # tmpdir was disturbed. Treat as fatal telemetry loss: write a sentinel
+    # event + stderr marker + downgrade exit_code if the CLI itself was
+    # clean. Downstream extractors can branch on the sentinel rather than
+    # mistaking an empty file for "agent discovered nothing".
     if agent_event_log_path.exists():
         shutil.move(str(agent_event_log_path), str(final_event_log_path))
     else:
-        final_event_log_path.touch()
+        with open(final_event_log_path, "w") as f:
+            json.dump(
+                {
+                    "event": "telemetry_missing",
+                    "fatal": True,
+                    "note": "agent_event_log_path did not exist post-exec",
+                },
+                f,
+            )
+            f.write("\n")
+        with open(cli_stderr_log_path, "a") as f:
+            f.write(_TELEMETRY_MISSING_MARKER + "\n")
+        if exit_code == 0:
+            exit_code = EXIT_CODE_TELEMETRY_MISSING
 
     return RunResult(
         run_id=run_id,

@@ -327,6 +327,64 @@ def test_run_one_starts_subprocess_in_new_session(tmp_path):
     )
 
 
+def test_run_one_writes_telemetry_missing_sentinel_when_event_log_disappears(tmp_path):
+    """R5 P0 fix: missing layer-2 telemetry post-exec is fatal, not silently masked.
+
+    If the agent (or anything else) removes tmpdir/.pyruntime/events.jsonl
+    during execution, the runner writes a telemetry_missing sentinel event
+    to the final log, marks cli_stderr.log, and downgrades exit_code so a
+    downstream extractor cannot mistake an empty log for "no discovery".
+    """
+    output_dir = tmp_path / "run_out"
+
+    def fake_popen_deletes_event_log(*_args, **kwargs):
+        env = kwargs.get("env") or {}
+        agent_event_log = Path(env["_PYRUNTIME_EVENT_LOG"])
+        # Simulate the agent removing the telemetry sink during execution.
+        if agent_event_log.exists():
+            agent_event_log.unlink()
+        proc = MagicMock()
+        proc.wait.return_value = 0  # CLI itself exits clean
+        return proc
+
+    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen_deletes_event_log):
+        result = run_one(_config(), "prompt", output_dir)
+
+    # Final event log exists with a fail-closed sentinel event, not empty.
+    final_log_text = result.in_process_events_path.read_text()
+    assert "telemetry_missing" in final_log_text
+    assert '"fatal": true' in final_log_text
+    # Stderr marker captures the condition for human review.
+    stderr_content = result.cli_stderr_log_path.read_text()
+    assert "TELEMETRY MISSING" in stderr_content
+    # CLI exit was 0 but downstream must see this as fatal.
+    assert (
+        result.exit_code == -2
+    ), f"telemetry_missing must downgrade exit_code to -2 sentinel; got {result.exit_code}"
+
+
+def test_run_one_does_not_overwrite_real_telemetry_with_sentinel(tmp_path):
+    """When the agent log DOES exist post-exec, it's preserved (no sentinel)."""
+    output_dir = tmp_path / "run_out"
+
+    def fake_popen_writes_real_event(*_args, **kwargs):
+        env = kwargs.get("env") or {}
+        agent_event_log = Path(env["_PYRUNTIME_EVENT_LOG"])
+        # Simulate a real telemetry event written by the shim.
+        agent_event_log.write_text('{"event": "import_diff_diff", "ts": 1.0}\n')
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        return proc
+
+    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen_writes_real_event):
+        result = run_one(_config(), "prompt", output_dir)
+
+    final_log_text = result.in_process_events_path.read_text()
+    assert "import_diff_diff" in final_log_text
+    assert "telemetry_missing" not in final_log_text
+    assert result.exit_code == 0
+
+
 def test_run_one_on_timeout_handles_already_dead_process_group(tmp_path):
     """killpg can race the OS reaping the parent; ProcessLookupError must be swallowed."""
     output_dir = tmp_path / "run_out"

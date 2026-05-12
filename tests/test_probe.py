@@ -68,12 +68,33 @@ def test_assess_leakage_findings_list_includes_each_hit():
 # -- structural verification (P1-3) ------------------------------------------
 
 
-def _structural_block(cwd: str, home: str | None = None, env_keys: list[str] | None = None) -> str:
-    """Build a --BEGIN-STRUCTURED--/--END-STRUCTURED-- block embeddable in a response."""
+def _structural_block(
+    cwd: str,
+    home: str | None = None,
+    env_keys: list[str] | None = None,
+    env_path_values: dict[str, str] | None = None,
+) -> str:
+    """Build a --BEGIN-STRUCTURED--/--END-STRUCTURED-- block embeddable in a response.
+
+    env_path_values defaults to a tmpdir-resolving entry for _PYRUNTIME_EVENT_LOG
+    when that key appears in env_keys, plus one for PWD pointing at cwd. This
+    matches the fail-closed contract: tests that report a path key in env_keys
+    must also supply its value in env_path_values.
+    """
+    keys = env_keys if env_keys is not None else ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"]
+    if env_path_values is None:
+        env_path_values = {}
+        if "_PYRUNTIME_EVENT_LOG" in keys:
+            env_path_values["_PYRUNTIME_EVENT_LOG"] = f"{cwd}/.pyruntime/events.jsonl"
+        if "PWD" in keys:
+            env_path_values["PWD"] = cwd
+        if "CLAUDE_PROJECT_DIR" in keys:
+            env_path_values["CLAUDE_PROJECT_DIR"] = cwd
     payload = {
         "cwd": cwd,
         "home": home if home is not None else cwd,
-        "env_keys": env_keys if env_keys is not None else ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        "env_keys": keys,
+        "env_path_values": env_path_values,
     }
     return f"--BEGIN-STRUCTURED--\n{json.dumps(payload)}\n--END-STRUCTURED--\n"
 
@@ -100,6 +121,7 @@ def test_check_structural_passes_on_matching_cwd_home_and_clean_env(tmp_path):
         "cwd": str(tmp_path),
         "home": str(tmp_path),
         "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "ANTHROPIC_API_KEY"],
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": f"{tmp_path}/.pyruntime/events.jsonl"},
     }
     assert _check_structural(data, str(tmp_path)) == []
 
@@ -173,6 +195,7 @@ def test_check_structural_allowlist_passes_known_claude_cli_prefixed_keys(tmp_pa
             "CLAUDECODE_TOOL_NAME",
             "ANTHROPIC_API_KEY",
         ],
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": f"{tmp_path}/.pyruntime/events.jsonl"},
     }
     findings = _check_structural(data, str(tmp_path))
     assert findings == []
@@ -395,8 +418,8 @@ def test_check_structural_env_path_values_fails_when_outside_tmpdir(tmp_path):
     assert any("env_path_outside_tmpdir: _PYRUNTIME_EVENT_LOG" in f for f in findings)
 
 
-def test_check_structural_env_path_values_missing_is_skipped(tmp_path):
-    """env_path_values absent -> no path findings (back-compat for older payloads)."""
+def test_check_structural_env_path_values_missing_field_is_fatal(tmp_path):
+    """R5 P1 fix: env_path_values absent -> finding (was silently skipped)."""
     data = {
         "cwd": str(tmp_path),
         "home": str(tmp_path),
@@ -404,17 +427,55 @@ def test_check_structural_env_path_values_missing_is_skipped(tmp_path):
         # no env_path_values field
     }
     findings = _check_structural(data, str(tmp_path))
-    # No env_path_* findings produced.
-    assert not any("env_path_" in f for f in findings)
+    assert "missing_env_path_values" in findings
 
 
-def test_check_structural_env_path_values_skips_empty_string(tmp_path):
-    """An empty string env_path_values entry is treated as not-reported (no finding)."""
+def test_check_structural_env_path_values_malformed_is_fatal(tmp_path):
+    """env_path_values present but not a dict -> finding."""
     data = {
         "cwd": str(tmp_path),
         "home": str(tmp_path),
         "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
-        "env_path_values": {"CLAUDE_PROJECT_DIR": ""},
+        "env_path_values": "not a dict",
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("malformed_env_path_values" in f for f in findings)
+
+
+def test_check_structural_env_path_value_missing_for_required_key_is_fatal(tmp_path):
+    """R5 P1: if a verified path key is in env_keys, its value must be reported."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PWD"],
+        # env_path_values does NOT include _PYRUNTIME_EVENT_LOG even though
+        # the agent reported it in env_keys
+        "env_path_values": {"PWD": str(tmp_path)},
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert "missing_env_path_value: _PYRUNTIME_EVENT_LOG" in findings
+
+
+def test_check_structural_env_path_value_empty_string_for_required_key_is_fatal(tmp_path):
+    """An empty string for a required path key is a finding (not silently skipped)."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": ""},
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert "empty_env_path_value: _PYRUNTIME_EVENT_LOG" in findings
+
+
+def test_check_structural_env_path_value_optional_for_unreported_key(tmp_path):
+    """Path keys not in env_keys don't need to appear in env_path_values."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        # CLAUDE_PROJECT_DIR not in env_keys, so not requiring its value
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": f"{tmp_path}/.pyruntime/events.jsonl"},
     }
     findings = _check_structural(data, str(tmp_path))
     assert not any("env_path_" in f for f in findings)

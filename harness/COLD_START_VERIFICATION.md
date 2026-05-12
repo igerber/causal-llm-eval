@@ -47,7 +47,7 @@ The smoke test runs the agent with a two-layer probe prompt (defined in `harness
 >
 > Then run this single python command verbatim using your Bash tool and include the raw output in your reply between the markers shown:
 >
-> `python3 -c 'import os, json, sys; sys.stdout.write("--BEGIN-STRUCTURED--\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys())}) + "\n--END-STRUCTURED--\n")'`
+> `python3 -c 'import os, json, sys; _P=("_PYRUNTIME_EVENT_LOG","PWD","CLAUDE_PROJECT_DIR"); sys.stdout.write("--BEGIN-STRUCTURED--\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys()), "env_path_values": {k: os.environ.get(k, "") for k in _P if k in os.environ}}) + "\n--END-STRUCTURED--\n")'`
 
 The probe assessment has two layers (both must pass):
 

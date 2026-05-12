@@ -221,6 +221,17 @@ _PROBE_ENV_ALLOWED_PREFIXES: tuple[str, ...] = (
 )
 
 
+# Path-valued env keys whose values must be verified to resolve under the
+# per-run tmpdir. If any of these appear in the agent's reported env_keys,
+# the agent MUST also report its value in env_path_values; the absence is
+# a fail-closed finding (R5 P1).
+_PROBE_ENV_PATH_KEYS_VERIFIED: tuple[str, ...] = (
+    "_PYRUNTIME_EVENT_LOG",
+    "PWD",
+    "CLAUDE_PROJECT_DIR",
+)
+
+
 def _env_key_matches_deny_pattern(key: str) -> bool:
     """True if key matches a deny substring or deny prefix.
 
@@ -348,28 +359,56 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
             continue
         findings.append(f"unrecognized_env_key: {key}")
 
-    # R4 P1: verify path-valued env vars resolve INSIDE the tmpdir. Catches
-    # cold-start contract violations where _PYRUNTIME_EVENT_LOG / PWD /
-    # CLAUDE_PROJECT_DIR point at harness or operator-host locations.
-    env_path_values = data.get("env_path_values") or {}
-    if isinstance(env_path_values, dict):
+    # R4 P1 / R5 P1: verify path-valued env vars resolve INSIDE the tmpdir.
+    # Fail-closed: env_path_values must be a dict; if any path-key from
+    # _PROBE_ENV_PATH_KEYS_VERIFIED appears in env_keys, its value MUST be
+    # reported in env_path_values. Missing dict, missing entries, or empty
+    # values are findings — not silently skipped.
+    env_path_values_raw = data.get("env_path_values")
+    if env_path_values_raw is None:
+        findings.append("missing_env_path_values")
+    elif not isinstance(env_path_values_raw, dict):
+        findings.append("malformed_env_path_values: not a dict")
+    else:
+        env_path_values: dict = env_path_values_raw
+        # Required entries: if a verified-path key is in env_keys, it MUST be
+        # in env_path_values with a non-empty value, and that value must
+        # resolve inside the tmpdir.
+        for path_key in _PROBE_ENV_PATH_KEYS_VERIFIED:
+            if path_key not in env_keys:
+                continue  # key not present at all; nothing to verify
+            value = env_path_values.get(path_key)
+            if value is None:
+                findings.append(f"missing_env_path_value: {path_key}")
+                continue
+            if not isinstance(value, str) or not value:
+                findings.append(f"empty_env_path_value: {path_key}")
+                continue
+            findings.extend(_check_path_inside_tmpdir(path_key, value, expected_resolved))
+        # Any additional entries the agent reported also get the resolution
+        # check (additive coverage without requiring those keys).
         for key, value in env_path_values.items():
+            if key in _PROBE_ENV_PATH_KEYS_VERIFIED:
+                continue  # already handled above
             if not isinstance(value, str) or not value:
                 continue
-            try:
-                resolved = str(Path(value).resolve())
-            except (OSError, ValueError):
-                findings.append(f"env_path_unresolvable: {key}={value!r}")
-                continue
-            if not (
-                resolved == expected_resolved or resolved.startswith(expected_resolved + os.sep)
-            ):
-                findings.append(
-                    f"env_path_outside_tmpdir: {key}={resolved!r} "
-                    f"(expected to start with {expected_resolved!r})"
-                )
+            findings.extend(_check_path_inside_tmpdir(key, value, expected_resolved))
 
     return findings
+
+
+def _check_path_inside_tmpdir(key: str, value: str, expected_resolved: str) -> list[str]:
+    """Return findings if `value` does not resolve under `expected_resolved`."""
+    try:
+        resolved = str(Path(value).resolve())
+    except (OSError, ValueError):
+        return [f"env_path_unresolvable: {key}={value!r}"]
+    if resolved == expected_resolved or resolved.startswith(expected_resolved + os.sep):
+        return []
+    return [
+        f"env_path_outside_tmpdir: {key}={resolved!r} "
+        f"(expected to start with {expected_resolved!r})"
+    ]
 
 
 def _assess_leakage(response: str, expected_tmpdir: str | None = None) -> ProbeAssessment:

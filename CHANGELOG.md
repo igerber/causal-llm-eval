@@ -82,6 +82,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Probe per-key check now applies denylist BEFORE allowlist exact-match
   so a future overlap cannot silently suppress a denylist hit. The two
   sets remain disjoint (asserted via test).
+- Missing layer-2 telemetry post-exec is now fail-closed. If
+  `tmpdir/.pyruntime/events.jsonl` does not exist after the subprocess
+  exits, the runner writes a `{"event":"telemetry_missing","fatal":true}`
+  sentinel to `output_dir/in_process_events.jsonl`, marks
+  `cli_stderr.log`, and downgrades a clean `exit_code=0` to a new
+  `EXIT_CODE_TELEMETRY_MISSING=-2` sentinel. Downstream extractors can
+  branch on the sentinel rather than mistaking an empty log for "agent
+  discovered nothing".
+- Probe path-value verification is now fail-closed. `env_path_values`
+  must be a dict; if `_PYRUNTIME_EVENT_LOG`, `PWD`, or `CLAUDE_PROJECT_DIR`
+  appear in `env_keys`, their values must be present and non-empty in
+  `env_path_values`. Missing values produce `missing_env_path_value`,
+  `empty_env_path_value`, or `missing_env_path_values` findings.
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).
