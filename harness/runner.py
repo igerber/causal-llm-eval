@@ -32,6 +32,7 @@ fully enforced in this PR; only the per-arm venv tier is deferred.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -248,6 +249,11 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         open(transcript_jsonl_path, "w") as stdout_file,
         open(cli_stderr_log_path, "w") as stderr_file,
     ):
+        # start_new_session=True puts the spawned process (and any children
+        # it spawns) in a new session/process group. On timeout we kill the
+        # whole group via os.killpg(proc.pid, SIGKILL), preventing leftover
+        # Bash/Python children from continuing to run or mutate per-run
+        # files after RunResult is returned.
         proc = subprocess.Popen(
             cmd,
             cwd=str(tmpdir),
@@ -255,11 +261,16 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             stdout=stdout_file,
             stderr=stderr_file,
             text=True,
+            start_new_session=True,
         )
         try:
             exit_code = proc.wait(timeout=config.timeout_seconds)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                # Process already exited between timeout and killpg; harmless.
+                pass
             proc.wait()
             exit_code = -1
             timed_out = True

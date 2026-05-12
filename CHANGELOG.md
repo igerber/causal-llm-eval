@@ -38,13 +38,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `harness/COLD_START_VERIFICATION.md`: the CI test workflow now exists.
 - Default probe output directory now uses microsecond-resolution timestamps
   plus a short UUID suffix to prevent collision between same-second runs.
-- Probe structural env check upgraded from a small denylist to a hybrid
-  denylist + allowlist. Denylist covers known auth/config leaks
-  (`XDG_CONFIG_HOME`, `AWS_*`, `OPENAI_API_KEY`, `CODEX_HOME`,
-  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROJECT_ID`, `GITHUB_TOKEN`, `GH_TOKEN`,
-  `CLAUDE_CONFIG_DIR`). Allowlist recognizes expected keys + `CLAUDE_*` /
-  `CLAUDECODE_*` / `ANTHROPIC_*` / `PYTHON*` prefixes; everything else is
-  flagged for review.
+- Probe structural env check upgraded from a small denylist to a fail-
+  closed schema + required-keys + denylist (explicit + substring + prefix)
+  + narrow allowlist:
+  - Schema: env_keys must be a non-empty list of strings; missing, empty,
+    or malformed entries are findings.
+  - Required: PATH, HOME, and `_PYRUNTIME_EVENT_LOG` must be present.
+  - Explicit denylist: `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `AWS_*`,
+    `OPENAI_API_KEY`, `CODEX_HOME`, `ANTHROPIC_PROJECT_*`,
+    `ANTHROPIC_AUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`.
+  - Deny substrings: `KEY`, `TOKEN`, `SECRET`, `OAUTH`, `PASSWORD`,
+    `PASSWD` (overridden only by exact allowlist entries like
+    `ANTHROPIC_API_KEY`).
+  - Deny prefixes: `AWS_`, `CODEX_`, `MCP_`/`MCP`, `ANTHROPIC_PROJECT_`,
+    `ANTHROPIC_OAUTH`, `CLAUDE_OAUTH`, `CLAUDE_MCP`, `CLAUDE_CONFIG`,
+    `GITHUB_`, `GH_`.
+  - Narrowed allow prefixes: `CLAUDE_CODE_`, `CLAUDECODE_`, `PYTHON*`
+    (the prior broad `CLAUDE_*` / `ANTHROPIC_*` allowance let
+    `CLAUDE_OAUTH_TOKEN`, `ANTHROPIC_PROJECT_NAME`, etc. pass).
+- Runner timeout now kills the full subprocess tree via
+  `start_new_session=True` + `os.killpg(proc.pid, SIGKILL)` instead of only
+  the parent. Stray Bash/Python children no longer linger after
+  `RunResult(exit_code=-1)` is returned.
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).

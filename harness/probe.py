@@ -125,6 +125,7 @@ _PROBE_ENV_DENYLIST: tuple[str, ...] = (
     "OPENAI_API_KEY",
     "CODEX_HOME",
     "ANTHROPIC_PROJECT_ID",
+    "ANTHROPIC_PROJECT_NAME",
     "ANTHROPIC_AUTH_TOKEN",
     "GITHUB_TOKEN",
     "GH_TOKEN",
@@ -133,7 +134,10 @@ _PROBE_ENV_DENYLIST: tuple[str, ...] = (
 
 # Allowlist: keys we EXPECT to see in a cold-started agent's environment.
 # Sources: clean_env() in runner.py, plus shell/OS-level vars commonly set
-# by the agent's Bash subprocess when it spawns python.
+# by the agent's Bash subprocess when it spawns python, plus a small set
+# of known Claude Code CLI-injected exact names. Entries here override the
+# deny substring/prefix rules below — so `ANTHROPIC_API_KEY` (contains
+# "KEY") is allowed because it appears here.
 _PROBE_ENV_ALLOWED_EXACT: tuple[str, ...] = (
     # From clean_env()
     "PATH",
@@ -158,26 +162,75 @@ _PROBE_ENV_ALLOWED_EXACT: tuple[str, ...] = (
     "TERMINFO",
     "TMPDIR",
     "_",
+    # Known Claude Code CLI-injected exact names (narrow allowlist; expand
+    # only if real probe runs reveal additional benign vars).
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDECODE",
 )
 
 
-# Allowed prefixes: keys CLI tools may inject into their subprocesses
-# (Claude Code, Anthropic SDK, Python). Catching common families without
-# enumerating every variant. ANTHROPIC_AUTH_TOKEN is denylist-only and
-# stays a finding regardless of the prefix rule.
+# Required keys: clean_env() always sets these, so their absence in the
+# agent's env is evidence the clean_env step didn't apply or the agent
+# omitted them from the structural report. Either case fails the probe.
+_PROBE_ENV_REQUIRED: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "_PYRUNTIME_EVENT_LOG",
+)
+
+
+# Sensitive substrings: any key containing one of these substrings is
+# flagged UNLESS the key is in _PROBE_ENV_ALLOWED_EXACT (e.g.,
+# ANTHROPIC_API_KEY contains "KEY" but is explicitly allowed).
+_PROBE_ENV_DENY_SUBSTRINGS: tuple[str, ...] = (
+    "TOKEN",
+    "SECRET",
+    "KEY",
+    "OAUTH",
+    "PASSWORD",
+    "PASSWD",
+)
+
+
+# Sensitive prefixes: any key starting with one of these prefixes is
+# flagged UNLESS the key is in _PROBE_ENV_ALLOWED_EXACT. These catch
+# auth/config/project state shapes regardless of the broader allowlist.
+_PROBE_ENV_DENY_PREFIXES: tuple[str, ...] = (
+    "AWS_",
+    "CODEX_",
+    "MCP_",
+    "MCP",  # bare prefix for MCPClient, MCPHOST, MCPServers, etc.
+    "ANTHROPIC_PROJECT_",
+    "ANTHROPIC_OAUTH",
+    "CLAUDE_OAUTH",
+    "CLAUDE_MCP",
+    "CLAUDE_CONFIG",  # CLAUDE_CONFIG_DIR + any other CLAUDE_CONFIG_* operator state
+    "GITHUB_",
+    "GH_",
+)
+
+
+# Allowed prefixes: keys the Claude Code CLI may inject for tool calls.
+# DELIBERATELY narrow (CLAUDE_CODE_*, CLAUDECODE_*, PYTHON*). The blanket
+# CLAUDE_* / ANTHROPIC_* prefixes were too permissive — they let operator
+# vars like ANTHROPIC_PROJECT_NAME and CLAUDE_OAUTH_TOKEN through.
 _PROBE_ENV_ALLOWED_PREFIXES: tuple[str, ...] = (
-    "CLAUDE_",
+    "CLAUDE_CODE_",
     "CLAUDECODE_",
-    "ANTHROPIC_",
     "PYTHON",
 )
 
 
-def _env_key_is_recognized(key: str) -> bool:
-    """Allowlist check: key is in the explicit list or matches an allowed prefix."""
-    if key in _PROBE_ENV_ALLOWED_EXACT:
+def _env_key_matches_deny_pattern(key: str) -> bool:
+    """True if key matches a deny substring or deny prefix.
+
+    Allowlist exact matches do NOT short-circuit this function; the caller
+    must check _PROBE_ENV_ALLOWED_EXACT first.
+    """
+    upper = key.upper()
+    if any(substr in upper for substr in _PROBE_ENV_DENY_SUBSTRINGS):
         return True
-    return any(key.startswith(p) for p in _PROBE_ENV_ALLOWED_PREFIXES)
+    return any(key.startswith(p) for p in _PROBE_ENV_DENY_PREFIXES)
 
 
 @dataclass
@@ -229,6 +282,12 @@ def _extract_structural_block(response: str) -> dict | None:
 def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
     """Verify pwd/HOME/env-keys match the cold-start contract.
 
+    Fail-closed env-key contract: missing/empty/malformed env_keys is a
+    finding. Required runner-set keys (HOME, PATH, _PYRUNTIME_EVENT_LOG)
+    must be present. Per-key check order: exact allowlist (overrides deny)
+    -> explicit denylist -> deny patterns (substring + prefix) ->
+    narrow allow prefixes -> default to unrecognized.
+
     On macOS, tempfile.mkdtemp() returns paths like /var/folders/... while
     os.getcwd() inside the subprocess returns /private/var/folders/...
     (the resolved /private prefix). Path.resolve() handles both.
@@ -238,7 +297,6 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
 
     cwd = data.get("cwd", "")
     home = data.get("home", "")
-    env_keys = data.get("env_keys") or []
 
     cwd_resolved = str(Path(cwd).resolve()) if cwd else ""
     home_resolved = str(Path(home).resolve()) if home else ""
@@ -248,24 +306,42 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
     if home_resolved != expected_resolved:
         findings.append(f"home_mismatch: got {home_resolved!r}, expected {expected_resolved!r}")
 
-    # Two-pass env check:
-    # 1. Denylist: unambiguous operator-state leaks (auth tokens, AWS, etc.).
-    #    Definite findings; we never want these in the spawned environment.
-    # 2. Allowlist: any key not in the expected set + not matching a Claude/
-    #    Python-prefix rule is flagged as "unrecognized". May be benign (a
-    #    CLI-injected var we haven't enumerated yet) or genuinely leaky;
-    #    review the finding and decide whether to extend the allowlist or
-    #    treat as a real leak.
-    denylist_hits: set[str] = set()
+    # Env-key schema check: fail-closed on missing/empty/malformed.
+    env_keys_raw = data.get("env_keys")
+    if env_keys_raw is None:
+        findings.append("missing_env_keys")
+        return findings
+    if not isinstance(env_keys_raw, list):
+        findings.append("malformed_env_keys: not a list")
+        return findings
+    if not env_keys_raw:
+        findings.append("empty_env_keys")
+        return findings
+    if not all(isinstance(k, str) for k in env_keys_raw):
+        findings.append("malformed_env_keys: entries are not all strings")
+        return findings
+    env_keys: list[str] = env_keys_raw
+
+    # Required runner-set keys: clean_env() always sets these. Absence proves
+    # either clean_env didn't apply or the agent omitted them from the report.
+    for required in _PROBE_ENV_REQUIRED:
+        if required not in env_keys:
+            findings.append(f"missing_required_env_key: {required}")
+
+    # Per-key check: ordered so exact allowlist overrides deny rules
+    # (ANTHROPIC_API_KEY contains "KEY" but is allowed exactly).
     for key in env_keys:
+        if key in _PROBE_ENV_ALLOWED_EXACT:
+            continue
         if key in _PROBE_ENV_DENYLIST:
             findings.append(f"operator_env_leak: {key}")
-            denylist_hits.add(key)
-    for key in env_keys:
-        if key in denylist_hits:
             continue
-        if not _env_key_is_recognized(key):
-            findings.append(f"unrecognized_env_key: {key}")
+        if _env_key_matches_deny_pattern(key):
+            findings.append(f"sensitive_env_key: {key}")
+            continue
+        if any(key.startswith(p) for p in _PROBE_ENV_ALLOWED_PREFIXES):
+            continue
+        findings.append(f"unrecognized_env_key: {key}")
 
     return findings
 

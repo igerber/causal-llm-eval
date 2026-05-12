@@ -252,12 +252,16 @@ def test_run_one_raises_on_preexisting_in_process_events(tmp_path):
 
 
 def test_run_one_on_timeout_returns_negative_exit_code_with_stderr_marker(tmp_path):
-    """TimeoutExpired -> kill, marker line in stderr log, exit_code=-1, no raise."""
+    """TimeoutExpired -> killpg, marker line in stderr log, exit_code=-1, no raise."""
     output_dir = tmp_path / "run_out"
     config = _config(timeout=1)
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with (
+        patch("harness.runner.subprocess.Popen") as mock_popen,
+        patch("harness.runner.os.killpg") as mock_killpg,
+    ):
         proc = MagicMock()
+        proc.pid = 99999
         proc.wait.side_effect = [
             subprocess.TimeoutExpired(cmd="claude", timeout=1),
             0,
@@ -266,7 +270,51 @@ def test_run_one_on_timeout_returns_negative_exit_code_with_stderr_marker(tmp_pa
         result = run_one(config, "prompt", output_dir)
 
     assert result.exit_code == -1
-    proc.kill.assert_called_once()
+    # P2 R2 fix: killpg kills the whole process group, not just the parent.
+    mock_killpg.assert_called_once()
+    args = mock_killpg.call_args[0]
+    assert args[0] == 99999, "killpg must be called with proc.pid (the session leader)"
     stderr_content = (output_dir / "cli_stderr.log").read_text()
     assert "TIMEOUT" in stderr_content
     assert "killed" in stderr_content
+
+
+def test_run_one_starts_subprocess_in_new_session(tmp_path):
+    """R2 P2 fix: Popen called with start_new_session=True so killpg targets the whole tree."""
+    output_dir = tmp_path / "run_out"
+
+    with patch("harness.runner.subprocess.Popen") as mock_popen:
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        mock_popen.return_value = proc
+        run_one(_config(), "prompt", output_dir)
+
+    _, kwargs = mock_popen.call_args
+    assert kwargs.get("start_new_session") is True, (
+        "Popen must use start_new_session=True so the spawned process becomes "
+        "the session leader; otherwise killpg on timeout cannot reach children."
+    )
+
+
+def test_run_one_on_timeout_handles_already_dead_process_group(tmp_path):
+    """killpg can race the OS reaping the parent; ProcessLookupError must be swallowed."""
+    output_dir = tmp_path / "run_out"
+    config = _config(timeout=1)
+
+    with (
+        patch("harness.runner.subprocess.Popen") as mock_popen,
+        patch("harness.runner.os.killpg", side_effect=ProcessLookupError),
+    ):
+        proc = MagicMock()
+        proc.pid = 99999
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="claude", timeout=1),
+            0,
+        ]
+        mock_popen.return_value = proc
+        result = run_one(config, "prompt", output_dir)
+
+    # Race is harmless: we still record exit_code=-1 and the timeout marker.
+    assert result.exit_code == -1
+    stderr_content = (output_dir / "cli_stderr.log").read_text()
+    assert "TIMEOUT" in stderr_content

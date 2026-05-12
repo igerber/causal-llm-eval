@@ -160,13 +160,14 @@ def test_check_structural_fails_on_anthropic_auth_token_leak(tmp_path):
 
 
 def test_check_structural_allowlist_passes_known_claude_cli_prefixed_keys(tmp_path):
-    """CLI-injected CLAUDE_*/CLAUDECODE_*/ANTHROPIC_* keys are recognized."""
+    """CLI-injected CLAUDE_CODE_*/CLAUDECODE_* keys are recognized."""
     data = {
         "cwd": str(tmp_path),
         "home": str(tmp_path),
         "env_keys": [
             "PATH",
             "HOME",
+            "_PYRUNTIME_EVENT_LOG",
             "CLAUDE_CODE_SESSION_ID",
             "CLAUDECODE_TOOL_NAME",
             "ANTHROPIC_API_KEY",
@@ -174,6 +175,128 @@ def test_check_structural_allowlist_passes_known_claude_cli_prefixed_keys(tmp_pa
     }
     findings = _check_structural(data, str(tmp_path))
     assert findings == []
+
+
+# -- Fail-closed schema + required-keys + tightened deny rules (R2 fix) -------
+
+
+def test_check_structural_fails_when_env_keys_missing(tmp_path):
+    """Schema check: missing env_keys field -> finding (was a fail-open gap)."""
+    data = {"cwd": str(tmp_path), "home": str(tmp_path)}
+    findings = _check_structural(data, str(tmp_path))
+    assert "missing_env_keys" in findings
+
+
+def test_check_structural_fails_when_env_keys_is_empty_list(tmp_path):
+    """Schema check: empty env_keys -> finding."""
+    data = {"cwd": str(tmp_path), "home": str(tmp_path), "env_keys": []}
+    findings = _check_structural(data, str(tmp_path))
+    assert "empty_env_keys" in findings
+
+
+def test_check_structural_fails_when_env_keys_is_not_a_list(tmp_path):
+    """Schema check: env_keys must be a list, not a dict/string/etc."""
+    data = {"cwd": str(tmp_path), "home": str(tmp_path), "env_keys": "PATH,HOME"}
+    findings = _check_structural(data, str(tmp_path))
+    assert any("malformed_env_keys" in f for f in findings)
+
+
+def test_check_structural_fails_on_missing_required_keys(tmp_path):
+    """Required keys (HOME, PATH, _PYRUNTIME_EVENT_LOG) absent -> findings."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["LANG"],  # all required keys absent
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("missing_required_env_key: PATH" in f for f in findings)
+    assert any("missing_required_env_key: HOME" in f for f in findings)
+    assert any("missing_required_env_key: _PYRUNTIME_EVENT_LOG" in f for f in findings)
+
+
+def test_check_structural_fails_on_claude_oauth_token_via_prefix(tmp_path):
+    """CLAUDE_OAUTH_TOKEN is caught by CLAUDE_OAUTH deny prefix (not allowed by CLAUDE_CODE_)."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "CLAUDE_OAUTH_TOKEN"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("sensitive_env_key: CLAUDE_OAUTH_TOKEN" in f for f in findings)
+
+
+def test_check_structural_fails_on_claude_mcp_servers_via_prefix(tmp_path):
+    """CLAUDE_MCP_SERVERS is caught by CLAUDE_MCP deny prefix."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "CLAUDE_MCP_SERVERS"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("sensitive_env_key: CLAUDE_MCP_SERVERS" in f for f in findings)
+
+
+def test_check_structural_fails_on_anthropic_project_name_via_prefix(tmp_path):
+    """ANTHROPIC_PROJECT_NAME is caught by ANTHROPIC_PROJECT_ deny prefix."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "ANTHROPIC_PROJECT_NAME"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # ANTHROPIC_PROJECT_NAME is in the explicit denylist; either label is acceptable.
+    assert any(
+        "operator_env_leak: ANTHROPIC_PROJECT_NAME" in f
+        or "sensitive_env_key: ANTHROPIC_PROJECT_NAME" in f
+        for f in findings
+    )
+
+
+def test_check_structural_fails_on_key_substring_unless_explicitly_allowed(tmp_path):
+    """SOMETHING_API_KEY contains 'KEY' substring -> sensitive_env_key.
+
+    ANTHROPIC_API_KEY also contains 'KEY' but is in the exact allowlist.
+    """
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": [
+            "PATH",
+            "HOME",
+            "_PYRUNTIME_EVENT_LOG",
+            "ANTHROPIC_API_KEY",
+            "SOMETHING_API_KEY",
+        ],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # Allowlist override: ANTHROPIC_API_KEY does NOT trigger a finding.
+    assert not any("ANTHROPIC_API_KEY" in f for f in findings)
+    # Substring deny: SOMETHING_API_KEY DOES.
+    assert any("sensitive_env_key: SOMETHING_API_KEY" in f for f in findings)
+
+
+def test_check_structural_fails_on_oauth_substring(tmp_path):
+    """OAUTH substring catches arbitrary OAUTH-named keys."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "MY_VENDOR_OAUTH_TOKEN"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("sensitive_env_key: MY_VENDOR_OAUTH_TOKEN" in f for f in findings)
+
+
+def test_check_structural_drops_broad_claude_prefix(tmp_path):
+    """Operator-set CLAUDE_FOO (not CLAUDE_CODE_) is no longer auto-allowed."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "CLAUDE_FOO_BAR"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # CLAUDE_FOO_BAR doesn't match CLAUDE_CODE_ allow prefix, doesn't hit any
+    # deny pattern -> unrecognized.
+    assert any("unrecognized_env_key: CLAUDE_FOO_BAR" in f for f in findings)
 
 
 def test_check_structural_allowlist_flags_unrecognized_keys(tmp_path):

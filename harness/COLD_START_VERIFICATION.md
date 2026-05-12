@@ -52,9 +52,14 @@ The smoke test runs the agent with a two-layer probe prompt (defined in `harness
 The probe assessment has two layers (both must pass):
 
 1. **Self-report**: parses the prose for operator-state tokens (specific skill names, auto-memory file conventions, the operator's primary project name) and requires an explicit "nothing was preloaded"-style statement. Substring blacklist + affirmative-no requirement.
-2. **Structural**: parses the JSON block between the markers and verifies cwd points at the per-run tmpdir, HOME equals cwd, and env keys split into two sub-layers:
-   - **Denylist** — auth/config keys (`XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `AWS_*`, `OPENAI_API_KEY`, `CODEX_HOME`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROJECT_ID`, `GITHUB_TOKEN`, `GH_TOKEN`). Any of these in the env is an unambiguous operator-state leak.
-   - **Allowlist** — keys matching the expected set (PATH, HOME, LANG, LC_*, ANTHROPIC_API_KEY, _PYRUNTIME_EVENT_LOG, common shell vars) or known CLI-injected prefixes (`CLAUDE_*`, `CLAUDECODE_*`, `ANTHROPIC_*`, `PYTHON*`). Anything else is flagged as `unrecognized_env_key` for review. Catches both unanticipated CLI-injected vars and genuine leaks we didn't predict.
+2. **Structural**: parses the JSON block between the markers and verifies cwd points at the per-run tmpdir, HOME equals cwd, and runs a fail-closed env-key check:
+   - **Schema**: `env_keys` must be a non-empty list of strings. Missing, empty, malformed → finding.
+   - **Required keys**: `PATH`, `HOME`, and `_PYRUNTIME_EVENT_LOG` must be present (proves `clean_env()` applied at spawn).
+   - **Explicit denylist**: `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `AWS_*`, `OPENAI_API_KEY`, `CODEX_HOME`, `ANTHROPIC_PROJECT_*`, `ANTHROPIC_AUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`. Any of these → unambiguous operator-state leak.
+   - **Deny substrings**: `KEY`, `TOKEN`, `SECRET`, `OAUTH`, `PASSWORD`, `PASSWD` (overridden only by exact-allowlist entries — e.g., `ANTHROPIC_API_KEY` contains "KEY" but is explicitly allowed).
+   - **Deny prefixes**: `AWS_`, `CODEX_`, `MCP_`/`MCP`, `ANTHROPIC_PROJECT_`, `ANTHROPIC_OAUTH`, `CLAUDE_OAUTH`, `CLAUDE_MCP`, `CLAUDE_CONFIG`, `GITHUB_`, `GH_`.
+   - **Narrow allow prefixes**: `CLAUDE_CODE_`, `CLAUDECODE_`, `PYTHON*` (CLI-injected vars only — the prior broad `CLAUDE_*` / `ANTHROPIC_*` allowance let `CLAUDE_OAUTH_TOKEN`, `ANTHROPIC_PROJECT_NAME`, etc. pass).
+   - Anything not in the exact allowlist and not matching an allow prefix and not in the deny rules → flagged as `unrecognized_env_key` for review.
 
    Black-box self-report alone could pass a leaky cold-start where the agent doesn't notice; the structural layer catches what self-report would miss.
 
