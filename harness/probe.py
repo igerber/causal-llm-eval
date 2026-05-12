@@ -295,8 +295,9 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
 
     Fail-closed env-key contract: missing/empty/malformed env_keys is a
     finding. Required runner-set keys (HOME, PATH, _PYRUNTIME_EVENT_LOG)
-    must be present. Per-key check order: exact allowlist (overrides deny)
-    -> explicit denylist -> deny patterns (substring + prefix) ->
+    must be present. Per-key check order: explicit denylist FIRST (cannot
+    be overridden by allowlist) -> exact allowlist (overrides substring/
+    prefix deny rules only) -> deny patterns (substring + prefix) ->
     narrow allow prefixes -> default to unrecognized.
 
     On macOS, tempfile.mkdtemp() returns paths like /var/folders/... while
