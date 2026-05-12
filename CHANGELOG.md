@@ -38,6 +38,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `harness/COLD_START_VERIFICATION.md`: the CI test workflow now exists.
 - Default probe output directory now uses microsecond-resolution timestamps
   plus a short UUID suffix to prevent collision between same-second runs.
+- Probe structural env check upgraded from a small denylist to a hybrid
+  denylist + allowlist. Denylist covers known auth/config leaks
+  (`XDG_CONFIG_HOME`, `AWS_*`, `OPENAI_API_KEY`, `CODEX_HOME`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROJECT_ID`, `GITHUB_TOKEN`, `GH_TOKEN`,
+  `CLAUDE_CONFIG_DIR`). Allowlist recognizes expected keys + `CLAUDE_*` /
+  `CLAUDECODE_*` / `ANTHROPIC_*` / `PYTHON*` prefixes; everything else is
+  flagged for review.
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).

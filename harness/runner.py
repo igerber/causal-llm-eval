@@ -59,7 +59,17 @@ _TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
 
 @dataclass
 class RunConfig:
-    """Configuration for a single agent run."""
+    """Configuration for a single agent run.
+
+    **Note:** `dataset_path` is plumbed through for metadata tracking but the
+    runner does NOT yet copy the dataset into the per-run tmpdir. Dataset
+    copy + symlink guard + reject-non-file-paths logic land in PR #6+
+    alongside the synthetic DGP generator (`harness/dgp.py`). Until then,
+    probe/test runs pass `Path("/dev/null")` as a placeholder. Real eval
+    runs that reach `run_one()` before PR #6 lands would not exercise the
+    isolation guarantee documented in `COLD_START_VERIFICATION.md`; PR #3's
+    runner is intended for the probe + smoke tests only.
+    """
 
     arm: str  # "diff_diff" or "statsmodels"
     library_version: str  # PyPI version pinned for the arm
@@ -90,6 +100,13 @@ class RunResult:
 @dataclass
 class RunMetadata:
     """Reproducibility metadata pinned per run.
+
+    **Note:** PR #3 locks this schema but `run_one()` does NOT yet emit a
+    populated `RunMetadata` sidecar. Population + `metadata.json` emission
+    land in PR #6+ alongside the case-study runner, which knows the dataset
+    SHA, prompt registry id, rubric registry id, and other fields PR #3
+    cannot wire (no DGP, no prompt registry, no rubric registry yet).
+    The schema is locked HERE so subsequent PRs cannot quietly omit fields.
 
     Every per-run record MUST carry these fields. Missing any one of them
     invalidates the reproducibility schema check in `make case-study-v1`

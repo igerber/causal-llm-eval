@@ -130,8 +130,73 @@ def test_check_structural_fails_on_operator_env_leak(tmp_path):
         "env_keys": ["PATH", "HOME", "XDG_CONFIG_HOME", "OPENAI_API_KEY"],
     }
     findings = _check_structural(data, str(tmp_path))
-    assert any("XDG_CONFIG_HOME" in f for f in findings)
-    assert any("OPENAI_API_KEY" in f for f in findings)
+    assert any("operator_env_leak: XDG_CONFIG_HOME" in f for f in findings)
+    assert any("operator_env_leak: OPENAI_API_KEY" in f for f in findings)
+
+
+def test_check_structural_fails_on_github_token_leak(tmp_path):
+    """GITHUB_TOKEN / GH_TOKEN are unambiguous auth leaks (R1 P1 fix)."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "GITHUB_TOKEN"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: GITHUB_TOKEN" in f for f in findings)
+
+
+def test_check_structural_fails_on_anthropic_auth_token_leak(tmp_path):
+    """ANTHROPIC_AUTH_TOKEN is denylist-only even though ANTHROPIC_ prefix is allowed."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # ANTHROPIC_API_KEY is in the exact allowlist; ANTHROPIC_AUTH_TOKEN is in
+    # the denylist and must take precedence over the ANTHROPIC_ prefix rule.
+    assert any("operator_env_leak: ANTHROPIC_AUTH_TOKEN" in f for f in findings)
+    assert not any("ANTHROPIC_API_KEY" in f for f in findings)
+
+
+def test_check_structural_allowlist_passes_known_claude_cli_prefixed_keys(tmp_path):
+    """CLI-injected CLAUDE_*/CLAUDECODE_*/ANTHROPIC_* keys are recognized."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": [
+            "PATH",
+            "HOME",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDECODE_TOOL_NAME",
+            "ANTHROPIC_API_KEY",
+        ],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert findings == []
+
+
+def test_check_structural_allowlist_flags_unrecognized_keys(tmp_path):
+    """A key not in the exact allowlist and not matching a prefix rule -> finding."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "SOME_UNKNOWN_TOOL_VAR"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("unrecognized_env_key: SOME_UNKNOWN_TOOL_VAR" in f for f in findings)
+
+
+def test_check_structural_denylist_does_not_double_flag_via_allowlist(tmp_path):
+    """A denylist hit is reported as operator_env_leak, NOT also as unrecognized."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["XDG_CONFIG_HOME"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: XDG_CONFIG_HOME" in f for f in findings)
+    assert not any("unrecognized_env_key: XDG_CONFIG_HOME" in f for f in findings)
 
 
 def test_assess_leakage_with_tmpdir_passes_on_clean_response_and_valid_structural(tmp_path):

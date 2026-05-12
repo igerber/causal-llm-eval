@@ -13,13 +13,22 @@ The probe runs two layers of verification:
    file conventions, the operator's primary project name) and requires an
    explicit "nothing was preloaded"-style statement.
 
-2. **Structural (pwd / HOME / env-key allowlist)**: asks the agent to run a
-   `python -c` one-liner that emits `{cwd, home, env_keys}` between
-   `--BEGIN-STRUCTURED--` / `--END-STRUCTURED--` markers. The assessment
-   verifies cwd points at the per-run tmpdir, HOME equals cwd, and none of
-   the known operator-leak env keys are present. Black-box self-report alone
-   could pass a leaky cold-start where the agent doesn't notice the leak;
-   the structural layer catches what self-report would miss.
+2. **Structural (pwd / HOME / env-key allowlist + denylist)**: asks the
+   agent to run a `python -c` one-liner that emits `{cwd, home, env_keys}`
+   between `--BEGIN-STRUCTURED--` / `--END-STRUCTURED--` markers. The
+   assessment verifies cwd points at the per-run tmpdir, HOME equals cwd,
+   and env keys split into two layers:
+
+       (a) Denylist: known operator-state leak keys (auth tokens, AWS, etc.)
+           — definite findings, the spawned environment must never have them.
+       (b) Allowlist: keys not in the expected set + not matching a
+           Claude/Python prefix rule are flagged as "unrecognized" for
+           review. Catches CLI-injected vars we haven't enumerated as well
+           as genuine leaks we didn't predict.
+
+   Black-box self-report alone could pass a leaky cold-start where the agent
+   doesn't notice the leak; the structural layer catches what self-report
+   would miss.
 
 The blacklist deliberately EXCLUDES tokens recited in the probe prompt itself
 (CLAUDE.md, MCP servers, slash commands, skills, memory). A correctly-cold-
@@ -104,21 +113,71 @@ _AFFIRMATIVE_NO_PATTERNS: tuple[str, ...] = (
 )
 
 
-# Env keys whose presence indicates operator state leakage. These are
-# operator-specific and have no reason to appear in a correctly-cold-started
-# agent's subprocess environment. The list is intentionally narrow (not the
-# inverse of clean_env's allowlist): the Claude CLI may inject its own env
-# vars into agent subprocesses (CLAUDE_CODE-*, ANTHROPIC_*, etc.), and those
-# are out of scope for the probe.
-_OPERATOR_LEAK_KEYS: tuple[str, ...] = (
+# Env keys whose presence is an UNAMBIGUOUS operator-state leak. Definite
+# findings regardless of any allowlist hit; we never want these in the
+# spawned process even if they happen to match a Claude-injected prefix.
+_PROBE_ENV_DENYLIST: tuple[str, ...] = (
     "XDG_CONFIG_HOME",
     "CLAUDE_CONFIG_DIR",
     "AWS_PROFILE",
     "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
     "OPENAI_API_KEY",
     "CODEX_HOME",
     "ANTHROPIC_PROJECT_ID",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 )
+
+
+# Allowlist: keys we EXPECT to see in a cold-started agent's environment.
+# Sources: clean_env() in runner.py, plus shell/OS-level vars commonly set
+# by the agent's Bash subprocess when it spawns python.
+_PROBE_ENV_ALLOWED_EXACT: tuple[str, ...] = (
+    # From clean_env()
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "ANTHROPIC_API_KEY",
+    "_PYRUNTIME_EVENT_LOG",
+    # Set by shells / Python startup when the agent spawns python via Bash.
+    "PWD",
+    "OLDPWD",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "TERMINFO",
+    "TMPDIR",
+    "_",
+)
+
+
+# Allowed prefixes: keys CLI tools may inject into their subprocesses
+# (Claude Code, Anthropic SDK, Python). Catching common families without
+# enumerating every variant. ANTHROPIC_AUTH_TOKEN is denylist-only and
+# stays a finding regardless of the prefix rule.
+_PROBE_ENV_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "CLAUDE_",
+    "CLAUDECODE_",
+    "ANTHROPIC_",
+    "PYTHON",
+)
+
+
+def _env_key_is_recognized(key: str) -> bool:
+    """Allowlist check: key is in the explicit list or matches an allowed prefix."""
+    if key in _PROBE_ENV_ALLOWED_EXACT:
+        return True
+    return any(key.startswith(p) for p in _PROBE_ENV_ALLOWED_PREFIXES)
 
 
 @dataclass
@@ -133,8 +192,14 @@ class ProbeAssessment:
     assessed_against_affirmative_no: tuple[str, ...] = field(
         default_factory=lambda: _AFFIRMATIVE_NO_PATTERNS
     )
-    assessed_against_operator_leak_keys: tuple[str, ...] = field(
-        default_factory=lambda: _OPERATOR_LEAK_KEYS
+    assessed_against_env_denylist: tuple[str, ...] = field(
+        default_factory=lambda: _PROBE_ENV_DENYLIST
+    )
+    assessed_against_env_allowed_exact: tuple[str, ...] = field(
+        default_factory=lambda: _PROBE_ENV_ALLOWED_EXACT
+    )
+    assessed_against_env_allowed_prefixes: tuple[str, ...] = field(
+        default_factory=lambda: _PROBE_ENV_ALLOWED_PREFIXES
     )
 
 
@@ -182,9 +247,26 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
         findings.append(f"cwd_mismatch: got {cwd_resolved!r}, expected {expected_resolved!r}")
     if home_resolved != expected_resolved:
         findings.append(f"home_mismatch: got {home_resolved!r}, expected {expected_resolved!r}")
-    for leaked in _OPERATOR_LEAK_KEYS:
-        if leaked in env_keys:
-            findings.append(f"operator_env_leak: {leaked}")
+
+    # Two-pass env check:
+    # 1. Denylist: unambiguous operator-state leaks (auth tokens, AWS, etc.).
+    #    Definite findings; we never want these in the spawned environment.
+    # 2. Allowlist: any key not in the expected set + not matching a Claude/
+    #    Python-prefix rule is flagged as "unrecognized". May be benign (a
+    #    CLI-injected var we haven't enumerated yet) or genuinely leaky;
+    #    review the finding and decide whether to extend the allowlist or
+    #    treat as a real leak.
+    denylist_hits: set[str] = set()
+    for key in env_keys:
+        if key in _PROBE_ENV_DENYLIST:
+            findings.append(f"operator_env_leak: {key}")
+            denylist_hits.add(key)
+    for key in env_keys:
+        if key in denylist_hits:
+            continue
+        if not _env_key_is_recognized(key):
+            findings.append(f"unrecognized_env_key: {key}")
+
     return findings
 
 

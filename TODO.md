@@ -18,6 +18,8 @@ For planned features and deliverables, see [ROADMAP.md](ROADMAP.md).
 |-------|----------|----|----------|
 | Sitecustomize instrumentation hooks not yet wired (only env-var contract + empty event-log file as integration point). Layer 2 of the three-layer telemetry contract is unfilled until the hooks land. | `harness/sitecustomize_template.py` | #3 | Medium |
 | Probe leakage assessment uses substring blacklist with hardcoded operator-token list; could miss novel leakage forms or false-fire on unanticipated negation contexts. Revisit with negation-aware matching or AI-judge if real-world probe runs reveal heuristic gaps. | `harness/probe.py` | #3 | Low |
+| `RunConfig.dataset_path` is plumbed through but the runner does NOT copy the dataset into the per-run tmpdir. Dataset copy + symlink guard + reject-non-file-paths land in PR #6+ alongside the synthetic DGP generator. PR #3's runner is intended for the probe + smoke tests only; real eval runs require this step. | `harness/runner.py:run_one` | #3 | High |
+| `RunMetadata` schema is locked but `run_one()` does NOT emit a populated `metadata.json` sidecar. Population (harness git SHA, claude binary version, dataset SHA, library version, prompt/rubric registry ids, seed, run_id, arm, model) lands in PR #6+ alongside the case-study runner. The schema is pinned HERE so subsequent PRs cannot quietly omit fields. | `harness/runner.py:run_one` | #3 | High |
 
 ### Performance
 
