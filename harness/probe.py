@@ -129,6 +129,13 @@ _PROBE_ENV_DENYLIST: tuple[str, ...] = (
     "ANTHROPIC_AUTH_TOKEN",
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    # Python interpreter env vars that alter import resolution or run
+    # operator-controlled code at startup. None of these are part of
+    # clean_env() so their presence is unambiguous operator leakage.
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
 )
 
 
@@ -211,13 +218,14 @@ _PROBE_ENV_DENY_PREFIXES: tuple[str, ...] = (
 
 
 # Allowed prefixes: keys the Claude Code CLI may inject for tool calls.
-# DELIBERATELY narrow (CLAUDE_CODE_*, CLAUDECODE_*, PYTHON*). The blanket
-# CLAUDE_* / ANTHROPIC_* prefixes were too permissive — they let operator
-# vars like ANTHROPIC_PROJECT_NAME and CLAUDE_OAUTH_TOKEN through.
+# DELIBERATELY narrow. The earlier `CLAUDE_*` / `ANTHROPIC_*` blanket
+# prefixes let operator state through (`CLAUDE_OAUTH_TOKEN`,
+# `ANTHROPIC_PROJECT_NAME`); the earlier `PYTHON` blanket let
+# `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP` through (those alter import
+# resolution or execute code on startup and are now in the denylist).
 _PROBE_ENV_ALLOWED_PREFIXES: tuple[str, ...] = (
     "CLAUDE_CODE_",
     "CLAUDECODE_",
-    "PYTHON",
 )
 
 
@@ -457,6 +465,20 @@ def run_probe(output_dir: Path | None = None, timeout_seconds: int = 300) -> Pro
     run_result = run_one(config, PROBE_PROMPT, output_dir)
     response = _extract_final_assistant_text(run_result.transcript_jsonl_path)
     assessment = _assess_leakage(response, expected_tmpdir=str(run_result.tmpdir))
+
+    # R3 P2 fix: a nonzero CLI exit invalidates the assessment regardless of
+    # what the parseable final message contained. Rebuild the assessment as
+    # failed with the exit code prepended to findings.
+    if run_result.exit_code != 0:
+        assessment = ProbeAssessment(
+            passed=False,
+            findings=[
+                f"cli_nonzero_exit: {run_result.exit_code}",
+                *assessment.findings,
+            ],
+            agent_response=assessment.agent_response,
+            structural=assessment.structural,
+        )
 
     assessment_path = output_dir / "probe_assessment.json"
     with open(assessment_path, "w") as f:

@@ -228,7 +228,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     event_log_path = output_dir / "in_process_events.jsonl"
     cli_stderr_log_path = output_dir / "cli_stderr.log"
 
-    for preexisting in (transcript_jsonl_path, event_log_path):
+    for preexisting in (transcript_jsonl_path, event_log_path, cli_stderr_log_path):
         if preexisting.exists():
             raise FileExistsError(
                 f"{preexisting} already exists. The runner refuses to overwrite "

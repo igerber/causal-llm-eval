@@ -53,9 +53,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Deny prefixes: `AWS_`, `CODEX_`, `MCP_`/`MCP`, `ANTHROPIC_PROJECT_`,
     `ANTHROPIC_OAUTH`, `CLAUDE_OAUTH`, `CLAUDE_MCP`, `CLAUDE_CONFIG`,
     `GITHUB_`, `GH_`.
-  - Narrowed allow prefixes: `CLAUDE_CODE_`, `CLAUDECODE_`, `PYTHON*`
-    (the prior broad `CLAUDE_*` / `ANTHROPIC_*` allowance let
-    `CLAUDE_OAUTH_TOKEN`, `ANTHROPIC_PROJECT_NAME`, etc. pass).
+  - Narrowed allow prefixes: `CLAUDE_CODE_`, `CLAUDECODE_` (the prior
+    broad `CLAUDE_*` / `ANTHROPIC_*` allowance let `CLAUDE_OAUTH_TOKEN`,
+    `ANTHROPIC_PROJECT_NAME`, etc. pass; the prior blanket `PYTHON*`
+    allowance let `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP` pass —
+    those alter import resolution or run startup code and are now in
+    the explicit denylist).
+  - Probe `run_probe()` now marks the assessment as failed and prepends
+    a `cli_nonzero_exit` finding whenever `RunResult.exit_code != 0`,
+    so `make smoke` cannot green-light a probe whose CLI failed.
+  - Runner overwrite guard now refuses to overwrite `cli_stderr.log`
+    in addition to `transcript.jsonl` and `in_process_events.jsonl`.
+    All three layer-1/2/3 telemetry sinks are protected.
 - Runner timeout now kills the full subprocess tree via
   `start_new_session=True` + `os.killpg(proc.pid, SIGKILL)` instead of only
   the parent. Stray Bash/Python children no longer linger after

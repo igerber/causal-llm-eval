@@ -251,6 +251,23 @@ def test_run_one_raises_on_preexisting_in_process_events(tmp_path):
         mock_popen.assert_not_called()
 
 
+def test_run_one_raises_on_preexisting_cli_stderr_log(tmp_path):
+    """Existing cli_stderr.log in output_dir prevents subprocess spawn (R3 P2 fix).
+
+    Without this, a reused output_dir could silently destroy layer-3 stderr
+    telemetry. All three sinks (transcript, in_process_events, cli_stderr)
+    are now in the no-overwrite guard.
+    """
+    output_dir = tmp_path / "run_out"
+    output_dir.mkdir()
+    (output_dir / "cli_stderr.log").write_text("old stderr content\n")
+
+    with patch("harness.runner.subprocess.Popen") as mock_popen:
+        with pytest.raises(FileExistsError):
+            run_one(_config(), "prompt", output_dir)
+        mock_popen.assert_not_called()
+
+
 def test_run_one_on_timeout_returns_negative_exit_code_with_stderr_marker(tmp_path):
     """TimeoutExpired -> killpg, marker line in stderr log, exit_code=-1, no raise."""
     output_dir = tmp_path / "run_out"

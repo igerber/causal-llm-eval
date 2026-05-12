@@ -299,6 +299,120 @@ def test_check_structural_drops_broad_claude_prefix(tmp_path):
     assert any("unrecognized_env_key: CLAUDE_FOO_BAR" in f for f in findings)
 
 
+# -- Python interpreter env vars (R3 P1 fix) ----------------------------------
+
+
+def test_check_structural_fails_on_pythonpath(tmp_path):
+    """PYTHONPATH alters import resolution -> denylist."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PYTHONPATH"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: PYTHONPATH" in f for f in findings)
+
+
+def test_check_structural_fails_on_pythonhome(tmp_path):
+    """PYTHONHOME points to an alternate Python install -> denylist."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PYTHONHOME"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: PYTHONHOME" in f for f in findings)
+
+
+def test_check_structural_fails_on_pythonstartup(tmp_path):
+    """PYTHONSTARTUP names a file Python runs at REPL startup -> denylist."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PYTHONSTARTUP"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: PYTHONSTARTUP" in f for f in findings)
+
+
+def test_check_structural_fails_on_pythonuserbase(tmp_path):
+    """PYTHONUSERBASE redirects user site-packages -> denylist."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PYTHONUSERBASE"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("operator_env_leak: PYTHONUSERBASE" in f for f in findings)
+
+
+def test_check_structural_python_prefix_no_longer_blanket_allowed(tmp_path):
+    """Generic PYTHON-prefixed key not in denylist falls through to unrecognized."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "PYTHONUNBUFFERED"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # PYTHONUNBUFFERED is benign behaviorally but we no longer blanket-allow
+    # PYTHON-prefixed keys; it should now be unrecognized. If real probe runs
+    # show the CLI sets this benignly, add it to the exact allowlist.
+    assert any("unrecognized_env_key: PYTHONUNBUFFERED" in f for f in findings)
+
+
+# -- run_probe CLI exit-code handling (R3 P2 fix) -----------------------------
+
+
+def test_run_probe_marks_assessment_failed_on_cli_nonzero_exit(tmp_path):
+    """A nonzero CLI exit invalidates the probe even with a clean final message."""
+    from unittest.mock import patch
+
+    from harness.probe import run_probe
+    from harness.runner import RunResult
+
+    fake_tmpdir = tmp_path / "tmp"
+    fake_tmpdir.mkdir()
+
+    # Build a "clean" probe response with valid structural data so the
+    # assessment WOULD pass if exit_code were 0.
+    clean_response = (
+        "I do not have any preloaded CLAUDE.md or skills. Nothing was preloaded.\n"
+        + _structural_block(str(fake_tmpdir))
+    )
+    fake_transcript = tmp_path / "transcript.jsonl"
+    fake_transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": clean_response}]},
+            }
+        )
+        + "\n"
+    )
+
+    fake_run_result = RunResult(
+        run_id="abc1234567890def",
+        arm="diff_diff",
+        tmpdir=fake_tmpdir,
+        transcript_jsonl_path=fake_transcript,
+        in_process_events_path=tmp_path / "events.jsonl",
+        cli_stderr_log_path=tmp_path / "cli_stderr.log",
+        record_parquet_path=None,
+        final_code_path=None,
+        wall_clock_seconds=1.0,
+        exit_code=1,  # <-- CLI failed
+    )
+
+    output_dir = tmp_path / "probe_out"
+    output_dir.mkdir()
+
+    with patch("harness.probe.run_one", return_value=fake_run_result):
+        result = run_probe(output_dir=output_dir)
+
+    assert result.assessment.passed is False
+    assert any("cli_nonzero_exit: 1" in f for f in result.assessment.findings)
+
+
 def test_check_structural_allowlist_flags_unrecognized_keys(tmp_path):
     """A key not in the exact allowlist and not matching a prefix rule -> finding."""
     data = {
