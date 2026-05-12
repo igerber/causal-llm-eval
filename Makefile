@@ -13,9 +13,10 @@ help:
 	@echo "  clean           - remove venv pool, run outputs, caches"
 
 smoke:
-	@echo "Smoke test not yet implemented (Phase 0 skeleton)."
-	@echo "Will assert: cold-start invocation includes --bare; inheritance probe returns no leakage."
-	@false
+	@test -n "$$ANTHROPIC_API_KEY" || { echo "ERROR: ANTHROPIC_API_KEY not set; export it and retry."; exit 2; }
+	@echo "Smoke test: spawns one cold-start agent, runs inheritance probe."
+	@echo "Costs ~\$$0.05; one live agent invocation."
+	python -m harness.probe
 
 test:
 	pytest
@@ -46,6 +47,7 @@ clean:
 	rm -rf .venv-pool/
 	rm -rf runs/case_study_v*/
 	rm -rf runs/preflight/
+	rm -rf runs/probe/
 	rm -rf runs/scratch/
 	rm -rf .pytest_cache/
 	find . -name "__pycache__" -type d -exec rm -rf {} +

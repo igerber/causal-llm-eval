@@ -56,11 +56,11 @@ make preflight
 
 ## Key Design Patterns
 
-1. **Cold-start agent runner**: Spawn `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands --print --output-format stream-json --add-dir <tmpdir>` in a fresh tmpdir with a per-run venv. The `--bare` flag is load-bearing; without it the spawned agent inherits operator state (`$HOME/.claude/CLAUDE.md`, auto-memory, plugins, keychain). The runner ALSO pins `cwd=<run tmpdir>` and `env=clean_env` (an explicit allowlist of variables, not a denylist) so operator state cannot leak via `$HOME`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, AWS/MCP/GitHub env, etc. See `harness/COLD_START_VERIFICATION.md` for the full env contract. Verified by `make smoke`'s inheritance probe.
+1. **Cold-start agent runner**: Spawn `claude --bare --setting-sources "" --strict-mcp-config --disable-slash-commands --print --output-format stream-json --add-dir <tmpdir>` in a fresh tmpdir with a per-run venv. The `--bare` flag is load-bearing; without it the spawned agent inherits operator state (`$HOME/.claude/CLAUDE.md`, auto-memory, plugins, keychain). The runner ALSO pins `cwd=<run tmpdir>` and `env=clean_env` (an explicit allowlist of variables, not a denylist) so operator state cannot leak via `$HOME`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, AWS/MCP/GitHub env, etc. The in-process shim's event log path is communicated via `_PYRUNTIME_EVENT_LOG` (underscore prefix + Python-runtime framing — deliberate low-reactivity naming so the agent is less likely to flag the env var as eval-related if they enumerate `os.environ`). See `harness/COLD_START_VERIFICATION.md` for the full env contract. Verified by `make smoke`'s inheritance probe.
 
 2. **Three-layer telemetry**: Every run captures (a) stream-JSON event log from Claude Code (transcript + tool calls + file reads), (b) in-process Python instrumentation via `sitecustomize.py` (logs `import diff_diff`, `get_llm_guide(variant)`, fit-time `warnings.warn`, diagnostic method calls, estimator instantiations), and (c) subprocess stderr capture. Stream-JSON alone misses Python-internal access; the in-process layer is the discoverability ground truth.
 
-3. **Per-run venvs**: Each run gets a fresh venv with one library installed (diff-diff XOR statsmodels for Phase 1). For Phase 2's larger sample sizes, pre-built per-arm venv templates are cloned per run; never mutated post-clone.
+3. **Per-run venvs**: Each run gets a fresh venv with one library installed (diff-diff XOR statsmodels for Phase 1). For Phase 2's larger sample sizes, pre-built per-arm venv templates are cloned per run; never mutated post-clone. **Note:** PR #3 ships the runner using whichever venv is active for the harness process; the per-arm venv pool (`harness.venv_pool`) lands in PR #5. Until then, `clean_env()` passes the operator `PATH` verbatim. The tmpdir, HOME, env allowlist, and cold-start CLI flags are fully enforced; only the per-arm venv tier is deferred.
 
 4. **Versioned prompts**: Once a prompt is recorded against runs, it is immutable. New prompt = new version file (e.g., `v2.txt`), not in-place edit. Captured per run via `prompt_version` metadata field.
 
@@ -100,7 +100,7 @@ The AI PR reviewer recognizes deviations as documented (and downgrades them to P
 
 ## Workflow
 
-- CI tests are gated behind the `ready-for-ci` label. The `CI Gate` required status check enforces this - PRs cannot merge until the label is added. **Phase 0 status**: only the label gate is implemented; the actual test workflow (`pytest`, `make smoke`) lands in a follow-up PR alongside the harness implementation. Until then, the gate enforces the convention but does not run tests.
+- CI tests are gated behind the `ready-for-ci` label. The `CI Gate` required status check enforces this - PRs cannot merge until the label is added. The `.github/workflows/tests.yml` workflow runs `pytest` (default excludes `slow` and `live`) on labeled PRs and on push to main. `make smoke` (the live inheritance probe) is a developer-only command, not a CI hook (it costs ~$0.05 per invocation).
 - For non-trivial tasks, use `EnterPlanMode`. Consult the latest plan in `~/.claude/plans/` for locked decisions.
 - For bug fixes, grep for the pattern across all files before fixing.
 - Follow the relevant development checklists (run `/dev-checklists`).

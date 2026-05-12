@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'harness/**'
+      - 'graders/**'
+      - 'analysis/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/tests.yml'
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    # On PRs, require the ready-for-ci label so labels gate test runs (mirrors
+    # the ci-gate.yml convention). On push to main, run unconditionally for
+    # post-merge regression catch.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'ready-for-ci'))
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest

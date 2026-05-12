@@ -20,19 +20,66 @@ spawned agent inherits operator state and the eval is invalid.
 
 Verified by `make smoke` running the inheritance probe.
 
-Skeleton only. Phase 0 deliverable is the contract; implementation lands in
-subsequent PRs.
+**Note:** PR #3 runs the spawned agent in whichever venv is active for the
+harness process (no per-arm venv pool yet). The per-arm venv pool — fresh
+venv per run with one library installed (diff-diff XOR statsmodels), with
+PATH prepended to the venv bin — lands in PR #5 (`harness.venv_pool`).
+Until then, `clean_env()` passes operator `PATH` verbatim. The cold-start
+isolation contract for tmpdir, HOME, env allowlist, and CLI flags is
+fully enforced in this PR; only the per-arm venv tier is deferred.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+_ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
+    "PATH",
+    "LANG",
+    # Explicit LC_ enumeration (POSIX-defined keys). No `LC_*` wildcard so an
+    # unrelated key like `LC_RPATH` cannot leak through.
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "ANTHROPIC_API_KEY",
+)
+
+_TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
+_TELEMETRY_MISSING_MARKER = (
+    "=== TELEMETRY MISSING: agent_event_log_path did not exist post-exec ==="
+)
+# Exit-code sentinels for fatal harness conditions. Distinct from any real
+# CLI exit code so downstream extractors can branch on them.
+EXIT_CODE_TIMEOUT = -1
+EXIT_CODE_TELEMETRY_MISSING = -2
 
 
 @dataclass
 class RunConfig:
-    """Configuration for a single agent run."""
+    """Configuration for a single agent run.
+
+    **Note:** `dataset_path` is plumbed through for metadata tracking but the
+    runner does NOT yet copy the dataset into the per-run tmpdir. Dataset
+    copy + symlink guard + reject-non-file-paths logic land in PR #6+
+    alongside the synthetic DGP generator (`harness/dgp.py`). Until then,
+    probe/test runs pass `Path("/dev/null")` as a placeholder. Real eval
+    runs that reach `run_one()` before PR #6 lands would not exercise the
+    isolation guarantee documented in `COLD_START_VERIFICATION.md`; PR #3's
+    runner is intended for the probe + smoke tests only.
+    """
 
     arm: str  # "diff_diff" or "statsmodels"
     library_version: str  # PyPI version pinned for the arm
@@ -53,7 +100,8 @@ class RunResult:
     tmpdir: Path
     transcript_jsonl_path: Path
     in_process_events_path: Path
-    record_parquet_path: Path
+    cli_stderr_log_path: Path
+    record_parquet_path: Path | None
     final_code_path: Path | None
     wall_clock_seconds: float
     exit_code: int
@@ -62,6 +110,13 @@ class RunResult:
 @dataclass
 class RunMetadata:
     """Reproducibility metadata pinned per run.
+
+    **Note:** PR #3 locks this schema but `run_one()` does NOT yet emit a
+    populated `RunMetadata` sidecar. Population + `metadata.json` emission
+    land in PR #6+ alongside the case-study runner, which knows the dataset
+    SHA, prompt registry id, rubric registry id, and other fields PR #3
+    cannot wire (no DGP, no prompt registry, no rubric registry yet).
+    The schema is locked HERE so subsequent PRs cannot quietly omit fields.
 
     Every per-run record MUST carry these fields. Missing any one of them
     invalidates the reproducibility schema check in `make case-study-v1`
@@ -86,11 +141,194 @@ class RunMetadata:
     arm: str  # "diff_diff" or "statsmodels"
 
 
-def run_one(config: RunConfig, output_dir: Path) -> RunResult:
+def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
+    """Construct the allowlisted environment for the spawned process.
+
+    Two-tier construction:
+        - Passthrough keys (PATH, LANG, LC_*, ANTHROPIC_API_KEY): copied
+          verbatim from os.environ if present. Dropped if absent.
+        - Runner-set keys (HOME, _PYRUNTIME_EVENT_LOG): ALWAYS set from
+          runner-computed values; any inherited operator value is IGNORED.
+
+    No prefix scan, no wildcard. Anything not in either tier (XDG_CONFIG_HOME,
+    CLAUDE_CONFIG_DIR, AWS/MCP/GitHub env, CODEX_*, etc.) is dropped.
+
+    Args:
+        tmpdir: per-run temporary directory. Becomes the spawned process's $HOME
+            (NOT the operator's homedir) so any `~` lookup lands in the sandbox.
+        event_log_path: path to the per-run in-process event log. Becomes
+            _PYRUNTIME_EVENT_LOG so the in-process shim writes there.
+
+    Returns:
+        Dict suitable for subprocess.Popen's env= argument.
+    """
+    env: dict[str, str] = {}
+    for key in _ALLOWLISTED_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    env["HOME"] = str(tmpdir)
+    env["_PYRUNTIME_EVENT_LOG"] = str(event_log_path)
+    return env
+
+
+def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
+    """Construct the exact locked argv for `claude --bare ...`.
+
+    The seven cold-start isolation flags are: --bare, --setting-sources "",
+    --strict-mcp-config, --disable-slash-commands, --print, --output-format
+    stream-json, --add-dir <tmpdir>. COLD_START_VERIFICATION.md specifies
+    the contract; the pre-merge-check skill verifies it via AST scan.
+
+    `--model <id>` is additional: it pins the model so CLI defaults can't
+    drift across runs. The value is `RunConfig.model`.
+    """
+    return [
+        "claude",
+        "--bare",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--model",
+        model,
+        "--add-dir",
+        str(tmpdir),
+        prompt,
+    ]
+
+
+def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     """Spawn a single cold-start agent and return its run record.
 
-    Implementation pending. See plan section "Cold-start agent runner" for the
-    locked invocation and three-layer telemetry capture.
+    Args:
+        config: RunConfig for the run (arm, library_version, timeout, etc.).
+            The prompt is passed separately; config.prompt_path is metadata
+            for reproducibility tracking, not the source of truth for the
+            actual prompt text.
+        prompt: the prompt string passed as the final argv element to
+            `claude --bare`.
+        output_dir: directory where transcript.jsonl, in_process_events.jsonl,
+            and cli_stderr.log are written. Created if missing. If
+            transcript.jsonl or in_process_events.jsonl already exist there,
+            FileExistsError is raised to preserve prior runs for forensics.
+
+    Returns:
+        RunResult with run_id, paths, wall-clock seconds, and exit code.
+        On TimeoutExpired the runner kills the subprocess, writes a marker
+        line to cli_stderr.log, and returns RunResult(exit_code=-1) without
+        raising.
+
+    See harness/COLD_START_VERIFICATION.md for the cold-start invocation
+    contract.
     """
-    del config, output_dir
-    raise NotImplementedError("runner.run_one is not yet implemented")
+    run_id = uuid.uuid4().hex[:16]
+    # Resolve to an absolute path so the subprocess (running with cwd=tmpdir)
+    # cannot misinterpret a relative `output_dir` against its own cwd. Without
+    # this, the shim's `_PYRUNTIME_EVENT_LOG` lookup would resolve against
+    # the per-run tmpdir, writing to a different file than the one we touched.
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    transcript_jsonl_path = output_dir / "transcript.jsonl"
+    final_event_log_path = output_dir / "in_process_events.jsonl"
+    cli_stderr_log_path = output_dir / "cli_stderr.log"
+
+    for preexisting in (transcript_jsonl_path, final_event_log_path, cli_stderr_log_path):
+        if preexisting.exists():
+            raise FileExistsError(
+                f"{preexisting} already exists. The runner refuses to overwrite "
+                f"to preserve prior runs for forensics. Clear the output_dir "
+                f"or use a fresh path."
+            )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="causal_run_"))
+
+    # R4 P1 fix: the in-process shim writes to a path INSIDE the agent tmpdir
+    # during execution. After the subprocess exits we move the file to
+    # output_dir/in_process_events.jsonl for forensics. The agent's view of
+    # _PYRUNTIME_EVENT_LOG no longer leaks the harness repo path.
+    agent_event_log_path = tmpdir / ".pyruntime" / "events.jsonl"
+    agent_event_log_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_event_log_path.touch()
+
+    env = clean_env(tmpdir, agent_event_log_path)
+    cmd = _build_command(prompt, tmpdir, config.model)
+
+    start = time.monotonic()
+    timed_out = False
+    with (
+        open(transcript_jsonl_path, "w") as stdout_file,
+        open(cli_stderr_log_path, "w") as stderr_file,
+    ):
+        # start_new_session=True puts the spawned process (and any children
+        # it spawns) in a new session/process group. On timeout we kill the
+        # whole group via os.killpg(proc.pid, SIGKILL), preventing leftover
+        # Bash/Python children from continuing to run or mutate per-run
+        # files after RunResult is returned.
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(tmpdir),
+            env=env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            exit_code = proc.wait(timeout=config.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                # Process already exited between timeout and killpg; harmless.
+                pass
+            proc.wait()
+            exit_code = EXIT_CODE_TIMEOUT
+            timed_out = True
+    wall_clock_seconds = time.monotonic() - start
+
+    if timed_out:
+        with open(cli_stderr_log_path, "a") as f:
+            f.write(_TIMEOUT_MARKER_FMT.format(timeout=config.timeout_seconds) + "\n")
+
+    # Promote the in-tmpdir event log into output_dir for forensics. A
+    # missing file post-exec is fail-closed (R5 P0): the runner touched it
+    # pre-spawn, so absence implies either the agent removed it or the
+    # tmpdir was disturbed. Treat as fatal telemetry loss: write a sentinel
+    # event + stderr marker + downgrade exit_code if the CLI itself was
+    # clean. Downstream extractors can branch on the sentinel rather than
+    # mistaking an empty file for "agent discovered nothing".
+    if agent_event_log_path.exists():
+        shutil.move(str(agent_event_log_path), str(final_event_log_path))
+    else:
+        with open(final_event_log_path, "w") as f:
+            json.dump(
+                {
+                    "event": "telemetry_missing",
+                    "fatal": True,
+                    "note": "agent_event_log_path did not exist post-exec",
+                },
+                f,
+            )
+            f.write("\n")
+        with open(cli_stderr_log_path, "a") as f:
+            f.write(_TELEMETRY_MISSING_MARKER + "\n")
+        if exit_code == 0:
+            exit_code = EXIT_CODE_TELEMETRY_MISSING
+
+    return RunResult(
+        run_id=run_id,
+        arm=config.arm,
+        tmpdir=tmpdir,
+        transcript_jsonl_path=transcript_jsonl_path,
+        in_process_events_path=final_event_log_path,
+        cli_stderr_log_path=cli_stderr_log_path,
+        record_parquet_path=None,
+        final_code_path=None,
+        wall_clock_seconds=wall_clock_seconds,
+        exit_code=exit_code,
+    )
