@@ -37,7 +37,7 @@ CLI flags are necessary but not sufficient. The runner also pins:
 
   Anything else (especially `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_PROJECT_*`, `OPENAI_*`, `AWS_*`, MCP-related vars, GitHub auth tokens, `CODEX_*`) is dropped. The runner enforces this via an explicit allowlist in the spawn site, not a denylist.
 
-- **No symlink tricks**: the per-run tmpdir is a real directory containing only the dataset and the prompt; no symlinks back into the operator's homedir.
+- **No symlink tricks**: the per-run tmpdir is a real directory containing the dataset, the prompt, and a hidden runner-owned `.pyruntime/` subdirectory holding the in-process telemetry event log (`.pyruntime/events.jsonl`, kept inside tmpdir so its path does not leak the harness repo location via `_PYRUNTIME_EVENT_LOG`). No symlinks back into the operator's homedir.
 
 ## Inheritance probe
 
