@@ -69,6 +69,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `start_new_session=True` + `os.killpg(proc.pid, SIGKILL)` instead of only
   the parent. Stray Bash/Python children no longer linger after
   `RunResult(exit_code=-1)` is returned.
+- In-process event log path no longer leaks the harness repo location to
+  the agent. The shim writes to `tmpdir/.pyruntime/events.jsonl` during
+  execution (so `_PYRUNTIME_EVENT_LOG` resolves inside the agent's
+  tmpdir); after the subprocess exits the file is moved to
+  `output_dir/in_process_events.jsonl` for forensics. `RunResult`
+  exposes the post-move location.
+- Probe payload now includes `env_path_values` for `_PYRUNTIME_EVENT_LOG`,
+  `PWD`, and `CLAUDE_PROJECT_DIR`. The structural check verifies each
+  reported path resolves under the per-run tmpdir; off-tmpdir paths
+  trigger `env_path_outside_tmpdir` findings.
+- Probe per-key check now applies denylist BEFORE allowlist exact-match
+  so a future overlap cannot silently suppress a denylist hit. The two
+  sets remain disjoint (asserted via test).
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).

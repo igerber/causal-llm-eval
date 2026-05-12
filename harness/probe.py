@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 import sys
 import uuid
@@ -58,22 +59,13 @@ from harness.runner import RunConfig, RunResult, run_one
 _STRUCTURAL_BEGIN = "--BEGIN-STRUCTURED--"
 _STRUCTURAL_END = "--END-STRUCTURED--"
 
-PROBE_PROMPT = (
-    "What skills, memory, CLAUDE.md, MCP servers, slash commands, or other "
-    "context do you have access to in this session? List anything that was "
-    "preloaded into your context. If nothing was preloaded, say so explicitly.\n"
-    "\n"
-    "Then run this single python command verbatim using your Bash tool and "
-    "include the raw output in your reply between the markers shown:\n"
-    "\n"
-    "python3 -c 'import os, json, sys; "
-    'sys.stdout.write("--BEGIN-STRUCTURED--\\n" + '
-    'json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), '
-    '"env_keys": sorted(os.environ.keys())}) + '
-    '"\\n--END-STRUCTURED--\\n")\'\n'
-    "\n"
-    "Include the full output between the markers verbatim. Do not interpret it."
-)
+PROBE_PROMPT = """What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say so explicitly.
+
+Then run this single python command verbatim using your Bash tool and include the raw output in your reply between the markers shown:
+
+python3 -c 'import os, json, sys; _P=("_PYRUNTIME_EVENT_LOG","PWD","CLAUDE_PROJECT_DIR"); sys.stdout.write("--BEGIN-STRUCTURED--\\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys()), "env_path_values": {k: os.environ.get(k, "") for k in _P if k in os.environ}}) + "\\n--END-STRUCTURED--\\n")'
+
+Include the full output between the markers verbatim. Do not interpret it."""
 
 
 _LEAKAGE_BLACKLIST: tuple[str, ...] = (
@@ -336,13 +328,18 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
         if required not in env_keys:
             findings.append(f"missing_required_env_key: {required}")
 
-    # Per-key check: ordered so exact allowlist overrides deny rules
-    # (ANTHROPIC_API_KEY contains "KEY" but is allowed exactly).
+    # Per-key check order (R4 P2: denylist BEFORE exact allowlist):
+    #   1. Explicit denylist -> always flagged, allowlist cannot override.
+    #   2. Exact allowlist -> overrides substring/prefix deny rules only.
+    #   3. Deny substring (KEY/TOKEN/SECRET/...) -> flagged unless allowlisted.
+    #   4. Deny prefix (AWS_/MCP/...) -> flagged unless allowlisted.
+    #   5. Allow prefix (CLAUDE_CODE_/CLAUDECODE_) -> recognized.
+    #   6. Default -> unrecognized.
     for key in env_keys:
-        if key in _PROBE_ENV_ALLOWED_EXACT:
-            continue
         if key in _PROBE_ENV_DENYLIST:
             findings.append(f"operator_env_leak: {key}")
+            continue
+        if key in _PROBE_ENV_ALLOWED_EXACT:
             continue
         if _env_key_matches_deny_pattern(key):
             findings.append(f"sensitive_env_key: {key}")
@@ -350,6 +347,27 @@ def _check_structural(data: dict, expected_tmpdir: str) -> list[str]:
         if any(key.startswith(p) for p in _PROBE_ENV_ALLOWED_PREFIXES):
             continue
         findings.append(f"unrecognized_env_key: {key}")
+
+    # R4 P1: verify path-valued env vars resolve INSIDE the tmpdir. Catches
+    # cold-start contract violations where _PYRUNTIME_EVENT_LOG / PWD /
+    # CLAUDE_PROJECT_DIR point at harness or operator-host locations.
+    env_path_values = data.get("env_path_values") or {}
+    if isinstance(env_path_values, dict):
+        for key, value in env_path_values.items():
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                resolved = str(Path(value).resolve())
+            except (OSError, ValueError):
+                findings.append(f"env_path_unresolvable: {key}={value!r}")
+                continue
+            if not (
+                resolved == expected_resolved or resolved.startswith(expected_resolved + os.sep)
+            ):
+                findings.append(
+                    f"env_path_outside_tmpdir: {key}={resolved!r} "
+                    f"(expected to start with {expected_resolved!r})"
+                )
 
     return findings
 

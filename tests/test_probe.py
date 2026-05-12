@@ -7,6 +7,7 @@ actually spawns an agent) lives in test_probe_live.py.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from harness.probe import _assess_leakage, _check_structural, _extract_structural_block
 
@@ -358,6 +359,99 @@ def test_check_structural_python_prefix_no_longer_blanket_allowed(tmp_path):
     # PYTHON-prefixed keys; it should now be unrecognized. If real probe runs
     # show the CLI sets this benignly, add it to the exact allowlist.
     assert any("unrecognized_env_key: PYTHONUNBUFFERED" in f for f in findings)
+
+
+# -- run_probe CLI exit-code handling (R3 P2 fix) -----------------------------
+
+
+# -- env_path_values verification (R4 P1 fix) ---------------------------------
+
+
+def test_check_structural_env_path_values_passes_when_inside_tmpdir(tmp_path):
+    """Path-valued env vars under tmpdir -> no finding."""
+    inside = str(tmp_path / ".pyruntime" / "events.jsonl")
+    (tmp_path / ".pyruntime").mkdir()
+    Path(inside).touch()
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": inside, "PWD": str(tmp_path)},
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert findings == []
+
+
+def test_check_structural_env_path_values_fails_when_outside_tmpdir(tmp_path):
+    """Path-valued env var pointing OUTSIDE tmpdir -> env_path_outside_tmpdir finding."""
+    leaky_path = "/Users/operator/causal-llm-eval/runs/probe/abc/in_process_events.jsonl"
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        "env_path_values": {"_PYRUNTIME_EVENT_LOG": leaky_path},
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert any("env_path_outside_tmpdir: _PYRUNTIME_EVENT_LOG" in f for f in findings)
+
+
+def test_check_structural_env_path_values_missing_is_skipped(tmp_path):
+    """env_path_values absent -> no path findings (back-compat for older payloads)."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        # no env_path_values field
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # No env_path_* findings produced.
+    assert not any("env_path_" in f for f in findings)
+
+
+def test_check_structural_env_path_values_skips_empty_string(tmp_path):
+    """An empty string env_path_values entry is treated as not-reported (no finding)."""
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG"],
+        "env_path_values": {"CLAUDE_PROJECT_DIR": ""},
+    }
+    findings = _check_structural(data, str(tmp_path))
+    assert not any("env_path_" in f for f in findings)
+
+
+# -- Deny/allow disjointness + ordering (R4 P2 fix) ---------------------------
+
+
+def test_check_structural_denylist_and_allowlist_are_disjoint():
+    """Defense in depth: ensure no key is in both denylist and allowlist.
+
+    If a future allowlist edit accidentally adds a denylist key, the deny-
+    before-allow ordering still flags it, but the contract should explicitly
+    keep the sets disjoint.
+    """
+    from harness.probe import _PROBE_ENV_ALLOWED_EXACT, _PROBE_ENV_DENYLIST
+
+    overlap = set(_PROBE_ENV_DENYLIST) & set(_PROBE_ENV_ALLOWED_EXACT)
+    assert not overlap, f"Denylist and allowlist must be disjoint; overlap: {overlap}"
+
+
+def test_check_structural_denylist_wins_over_allowlist_even_if_both_set(tmp_path, monkeypatch):
+    """If a future edit puts a key in both lists, denylist takes precedence."""
+    # Synthesize an overlap by injecting into the allowlist tuple at runtime.
+    from harness import probe
+
+    monkeypatch.setattr(
+        probe, "_PROBE_ENV_ALLOWED_EXACT", probe._PROBE_ENV_ALLOWED_EXACT + ("XDG_CONFIG_HOME",)
+    )
+    data = {
+        "cwd": str(tmp_path),
+        "home": str(tmp_path),
+        "env_keys": ["PATH", "HOME", "_PYRUNTIME_EVENT_LOG", "XDG_CONFIG_HOME"],
+    }
+    findings = _check_structural(data, str(tmp_path))
+    # Denylist hit must fire even though the key is now also in allowlist.
+    assert any("operator_env_leak: XDG_CONFIG_HOME" in f for f in findings)
 
 
 # -- run_probe CLI exit-code handling (R3 P2 fix) -----------------------------

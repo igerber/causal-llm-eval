@@ -183,11 +183,15 @@ def test_run_one_creates_output_dir_and_in_process_events_stub(tmp_path):
 
 
 def test_run_one_uses_absolute_event_log_path_with_relative_output_dir(tmp_path, monkeypatch):
-    """P0-1 regression: relative output_dir resolves to absolute before spawn.
+    """R0 P0-1 + R4 P1 regression.
 
-    Without this, the in-process shim (running with cwd=run-tmpdir) would
-    resolve _PYRUNTIME_EVENT_LOG against the spawned process's cwd, writing
-    to a different file than the runner pre-touched.
+    R0 P0-1: relative output_dir must resolve to absolute before spawn; the
+    in-process shim (cwd=tmpdir) cannot misinterpret it against subprocess cwd.
+
+    R4 P1: the env value MUST point inside the agent tmpdir (not the harness
+    output_dir under the harness repo), so the agent cannot infer the harness
+    path by reading os.environ['_PYRUNTIME_EVENT_LOG']. The runner moves the
+    event-log file into output_dir after the subprocess exits.
     """
     monkeypatch.chdir(tmp_path)
     relative_output_dir = Path("rel_run_out")  # NOT absolute
@@ -204,14 +208,24 @@ def test_run_one_uses_absolute_event_log_path_with_relative_output_dir(tmp_path,
         result = run_one(_config(), "prompt", relative_output_dir)
 
     assert "_PYRUNTIME_EVENT_LOG" in captured_env
-    event_log_path = captured_env["_PYRUNTIME_EVENT_LOG"]
-    assert Path(event_log_path).is_absolute(), (
-        f"_PYRUNTIME_EVENT_LOG must be absolute (got {event_log_path!r}) so the "
-        f"shim cannot misinterpret it against the spawned subprocess's cwd."
+    env_path = Path(captured_env["_PYRUNTIME_EVENT_LOG"])
+    assert env_path.is_absolute(), f"_PYRUNTIME_EVENT_LOG must be absolute (got {env_path!r})."
+    # R4 P1: agent's view of the env value resolves inside the agent tmpdir,
+    # NOT the harness output_dir.
+    tmpdir_resolved = result.tmpdir.resolve()
+    assert env_path.resolve().is_relative_to(tmpdir_resolved), (
+        f"_PYRUNTIME_EVENT_LOG must be inside the agent tmpdir "
+        f"({tmpdir_resolved}); got {env_path!r}. Otherwise the agent learns "
+        f"the harness path by reading os.environ."
     )
-    # And the file the runner touched is the same file the shim will see.
-    assert Path(event_log_path) == result.in_process_events_path
+    # After the subprocess exits, the runner moves the artifact into output_dir
+    # for forensics. The RunResult exposes the final (post-move) location.
+    output_dir_resolved = Path(tmp_path / "rel_run_out").resolve()
+    assert result.in_process_events_path.is_relative_to(output_dir_resolved)
     assert result.in_process_events_path.exists()
+    # And the agent's view of the file is NOT the same as the post-move
+    # location — they must be distinct paths in distinct directories.
+    assert env_path != result.in_process_events_path
 
 
 def test_run_one_pre_spawn_check_raises_on_unwritable_event_log(tmp_path):

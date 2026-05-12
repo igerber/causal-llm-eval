@@ -59,6 +59,7 @@ The probe assessment has two layers (both must pass):
    - **Deny substrings**: `KEY`, `TOKEN`, `SECRET`, `OAUTH`, `PASSWORD`, `PASSWD` (overridden only by exact-allowlist entries — e.g., `ANTHROPIC_API_KEY` contains "KEY" but is explicitly allowed).
    - **Deny prefixes**: `AWS_`, `CODEX_`, `MCP_`/`MCP`, `ANTHROPIC_PROJECT_`, `ANTHROPIC_OAUTH`, `CLAUDE_OAUTH`, `CLAUDE_MCP`, `CLAUDE_CONFIG`, `GITHUB_`, `GH_`.
    - **Narrow allow prefixes**: `CLAUDE_CODE_`, `CLAUDECODE_` only (CLI-injected vars). The prior broad `CLAUDE_*` / `ANTHROPIC_*` / `PYTHON*` prefixes were dropped because they let operator-state through.
+   - **Path-value check**: the agent additionally reports `env_path_values` for `_PYRUNTIME_EVENT_LOG`, `PWD`, and `CLAUDE_PROJECT_DIR`. Each reported path must resolve under the per-run tmpdir; off-tmpdir paths trigger `env_path_outside_tmpdir` findings. Catches the case where the agent could infer the harness repo path by reading `os.environ['_PYRUNTIME_EVENT_LOG']`.
    - Anything not in the exact allowlist and not matching an allow prefix and not in the deny rules → flagged as `unrecognized_env_key` for review.
 
    Black-box self-report alone could pass a leaky cold-start where the agent doesn't notice; the structural layer catches what self-report would miss.

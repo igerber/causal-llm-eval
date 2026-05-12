@@ -32,6 +32,7 @@ fully enforced in this PR; only the per-arm venv tier is deferred.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -225,10 +226,10 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_jsonl_path = output_dir / "transcript.jsonl"
-    event_log_path = output_dir / "in_process_events.jsonl"
+    final_event_log_path = output_dir / "in_process_events.jsonl"
     cli_stderr_log_path = output_dir / "cli_stderr.log"
 
-    for preexisting in (transcript_jsonl_path, event_log_path, cli_stderr_log_path):
+    for preexisting in (transcript_jsonl_path, final_event_log_path, cli_stderr_log_path):
         if preexisting.exists():
             raise FileExistsError(
                 f"{preexisting} already exists. The runner refuses to overwrite "
@@ -238,9 +239,15 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
 
     tmpdir = Path(tempfile.mkdtemp(prefix="causal_run_"))
 
-    event_log_path.touch()
+    # R4 P1 fix: the in-process shim writes to a path INSIDE the agent tmpdir
+    # during execution. After the subprocess exits we move the file to
+    # output_dir/in_process_events.jsonl for forensics. The agent's view of
+    # _PYRUNTIME_EVENT_LOG no longer leaks the harness repo path.
+    agent_event_log_path = tmpdir / ".pyruntime" / "events.jsonl"
+    agent_event_log_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_event_log_path.touch()
 
-    env = clean_env(tmpdir, event_log_path)
+    env = clean_env(tmpdir, agent_event_log_path)
     cmd = _build_command(prompt, tmpdir, config.model)
 
     start = time.monotonic()
@@ -280,12 +287,20 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         with open(cli_stderr_log_path, "a") as f:
             f.write(_TIMEOUT_MARKER_FMT.format(timeout=config.timeout_seconds) + "\n")
 
+    # Promote the in-tmpdir event log into output_dir for forensics. If the
+    # subprocess deleted it (unexpected), create an empty file so downstream
+    # telemetry merging always finds the path RunResult promises.
+    if agent_event_log_path.exists():
+        shutil.move(str(agent_event_log_path), str(final_event_log_path))
+    else:
+        final_event_log_path.touch()
+
     return RunResult(
         run_id=run_id,
         arm=config.arm,
         tmpdir=tmpdir,
         transcript_jsonl_path=transcript_jsonl_path,
-        in_process_events_path=event_log_path,
+        in_process_events_path=final_event_log_path,
         cli_stderr_log_path=cli_stderr_log_path,
         record_parquet_path=None,
         final_code_path=None,
