@@ -694,6 +694,56 @@ def test_merge_layers_diff_diff_raises_on_standalone_path_then_python_amp(
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_raises_on_source_activate_then_python(tmp_path):
+    """R7 P0: `source X/bin/activate` mutates PATH for the shell;
+    a subsequent `python` runs against the activated env (not the per-arm
+    venv)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["pip --version && source /tmp/no-shim/bin/activate && python script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_dot_activate_then_python(tmp_path):
+    """R7 P0: POSIX `. X/bin/activate && python` form."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        [". /tmp/no-shim/bin/activate && python script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_conda_activate_then_python(tmp_path):
+    """R7 P0: `conda activate envname && python ...`"""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["conda activate other && python script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_heredoc_python_invocation(tmp_path):
+    """R7 P0: `PATH=/usr/bin python3<<EOF\\n...` — heredoc syntax has `<`
+    immediately after `python3`, no whitespace; the previous regex
+    `python3(?:[\\s]|$)` missed it. New regex accepts `<` as a trailing
+    boundary."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["PATH=/usr/bin python3<<'PY'\nimport diff_diff\nPY"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_raises_on_standalone_path_then_python_semicolon(
     tmp_path,
 ):

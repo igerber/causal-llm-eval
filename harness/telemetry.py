@@ -14,8 +14,8 @@ Layer 2 - In-process Python instrumentation (the discoverability ground truth):
 Layer 3 - Subprocess stderr capture:
     Captures CLI-level errors emitted by `claude --bare` and any other stderr
     the agent's process writes. Python-level warnings from the agent's
-    diff_diff calls are captured by layer 2 via the `showwarning` override,
-    not here.
+    diff_diff calls are captured by layer 2 via the `warnings.warn` wrapper
+    (stack-inspecting, stacklevel-safe), not here.
 
 The merger (`merge_layers`) parses layers 1+2 and emits a per-run
 `TelemetryRecord` with arm-aware sentinel semantics.
@@ -150,7 +150,7 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 # (`pip install foo && python script.py`) are caught. The trailing `\s|$`
 # requirement guards against false positives like `/opt/python/` (the `/`
 # after `python` is neither whitespace nor end-of-string).
-_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
+_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:[\s<>]|$)")
 
 
 # Shell patterns that mutate or override the resolved interpreter location.
@@ -158,18 +158,19 @@ _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s
 # resolved interpreter may NOT be the per-arm-venv python — fail-closed.
 #
 # Forms detected:
-# - Inline override: `PATH=/usr/bin python3 ...`
-# - Pre-invocation mutation: `PATH=... && python3 ...`, `PATH=... ; python3 ...`
-# - Exported mutation: `export PATH=... && python3 ...`
+# - Inline / pre-invocation / exported PATH mutation
+# - venv activation: `source X`, `. X`, `conda activate`, `pyenv shell`
 # - env-driven resolution: `env python`, `env -u VAR python`
 # - Local binary: `./python`
 #
-# Detection is conservative: ANY `PATH=` or `export PATH=` assignment in a
-# command that ALSO contains a python invocation triggers fail-closed.
-# This over-catches PATH mutations followed by non-python commands, but the
-# false-positive rate is acceptable; agent shells rarely mutate PATH for
-# unrelated reasons.
+# Detection is conservative: ANY of these patterns in a command that ALSO
+# contains a python invocation triggers fail-closed. This over-catches
+# benign cases (e.g. `echo PATH=/foo && python`), but agents rarely emit
+# such patterns for non-bypass reasons; failing-closed is correct.
 _PATH_ASSIGNMENT_RE = re.compile(r"(?:^|[\s;&|])(?:export\s+)?PATH=\S+")
+_SHELL_ACTIVATION_RE = re.compile(
+    r"(?:^|[\s;&|])(?:source\s+\S+|\.\s+\S+|conda\s+activate|pyenv\s+shell)"
+)
 _ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
 _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
 
@@ -501,16 +502,16 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             command = tool_input.get("command", "")
             if not isinstance(command, str):
                 continue
-            # PATH mutation (inline or before any python invocation in the
-            # same command), `env python` resolution, or `./python` local
-            # binary. PATH mutation is flagged only when the command ALSO
-            # contains a python invocation; this catches `export PATH=...
-            # && python3 ...`, `PATH=... ; python3 ...`, and the inline
-            # `PATH=/usr/bin python3 ...` form.
+            # PATH mutation / activation script / env / ./python — any of
+            # these in a command containing a python invocation triggers
+            # fail-closed because the resolved interpreter may not be the
+            # per-arm-venv python.
             has_python = bool(_PYTHON_INVOCATION_RE.search(command))
             has_path_mutation = bool(_PATH_ASSIGNMENT_RE.search(command))
+            has_activation = bool(_SHELL_ACTIVATION_RE.search(command))
             if (
                 (has_path_mutation and has_python)
+                or (has_activation and has_python)
                 or _ENV_BEFORE_PYTHON_RE.search(command)
                 or _DOT_PYTHON_RE.search(command)
             ):

@@ -66,11 +66,11 @@ The probe assessment has two layers (both must pass):
 
 ## Layer-2 reactivity surfaces (accepted)
 
-The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_diff` API entries, `warnings.showwarning`, and `builtins.open` / `io.open` (for guide-file paths). These patches are detectable by an introspecting agent:
+The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_diff` API entries, `warnings.warn` (call-stack-inspecting, so warnings emitted with `stacklevel=N` are correctly attributed to the diff_diff frame), and `builtins.open` / `io.open` (for guide-file paths). These patches are detectable by an introspecting agent:
 
 - `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper in `sitecustomize.py`; the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
 - `sys.modules['sitecustomize']` is present (Python convention; not eval-specific).
-- `warnings.showwarning is not warnings._showwarning_orig` (or equivalent identity check) reveals a custom handler is installed.
+- `warnings.warn is not <original>` reveals a custom warning handler is installed (the override wraps `warn` rather than `showwarning` so it can inspect the call stack before `stacklevel` rewrites the displayed filename).
 - `builtins.open is not <original>` and `io.open is not <original>` could be detected — both are overridden so pathlib/importlib.resources reads of guide files are recorded.
 - The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading `sitecustomize.py` source can see exactly which estimators and diagnostics are monitored.
 - The package name `"diff_diff"` appears as a string literal in the warning filter and patch targets. Visible to introspecting agents.
