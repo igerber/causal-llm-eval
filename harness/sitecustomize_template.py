@@ -357,33 +357,72 @@ def _install_open_hook() -> None:
     io.open = _pyruntime_open  # type: ignore[assignment]
 
 
-def _install_warning_hook() -> None:
-    """Override `warnings.showwarning` to record warnings emitted from diff_diff.
+def _caller_is_from_diff_diff(start_frame) -> tuple[bool, str, int]:
+    """Walk the call stack looking for a frame whose module is diff_diff.
 
-    Idempotent: re-running the shim does not double-wrap. Filtering by
-    substring on the filename is intentional (installed-package paths
-    reliably contain the package name).
+    Returns (matched, filename, lineno). When matched, the returned filename
+    and lineno point at the actual diff_diff frame in the call stack, not
+    whatever the caller's `stacklevel` argument designated for display.
     """
-    if getattr(warnings.showwarning, "_pyruntime_wrapped", False):
-        return
-    original_showwarning = warnings.showwarning
+    frame = start_frame
+    while frame is not None:
+        mod = frame.f_globals.get("__name__", "") or ""
+        if mod == "diff_diff" or mod.startswith("diff_diff."):
+            return True, frame.f_code.co_filename, frame.f_lineno
+        frame = frame.f_back
+    return False, "", 0
 
-    def _pyruntime_showwarning(message, category, filename, lineno, file=None, line=None):
-        if "diff_diff" in str(filename):
+
+def _install_warning_hook() -> None:
+    """Override `warnings.warn` to record warnings whose call stack passes
+    through diff_diff.
+
+    Wrapping `warn` (not `showwarning`) is necessary because `warn` lets the
+    caller rewrite the displayed filename via `stacklevel=N`. The previous
+    `showwarning` filter, which inspected the displayed filename, would miss
+    any diff_diff warning emitted with `stacklevel >= 2` (a common pattern
+    when libraries want the warning to point at user code).
+
+    By inspecting the actual call stack at warn-time, we attribute the
+    warning correctly regardless of `stacklevel`. Records the diff_diff
+    frame's filename and lineno, not the displayed (post-stacklevel) ones.
+
+    Idempotent: re-running the shim does not double-wrap.
+    """
+    if getattr(warnings.warn, "_pyruntime_wrapped", False):
+        return
+    original_warn = warnings.warn
+
+    @functools.wraps(original_warn)
+    def _pyruntime_warn(message, category=UserWarning, stacklevel=1, source=None, **kwargs):
+        # sys._getframe(1) is the agent's warning emission site (one frame
+        # up from our wrapper). Walk upward; record if a diff_diff frame is
+        # present anywhere in the chain.
+        try:
+            matched, frame_filename, frame_lineno = _caller_is_from_diff_diff(sys._getframe(1))
+        except ValueError:
+            matched, frame_filename, frame_lineno = False, "", 0
+        if matched:
+            try:
+                category_name = category.__name__ if isinstance(category, type) else str(category)
+            except Exception:
+                category_name = "UserWarning"
             _safe_write(
                 {
                     "event": "warning_emitted",
-                    "category": category.__name__,
-                    "filename": str(filename),
-                    "lineno": lineno,
+                    "category": category_name,
+                    "filename": frame_filename,
+                    "lineno": frame_lineno,
                     "message": str(message)[:500],
                     "ts": _utc_iso_now(),
                 }
             )
-        return original_showwarning(message, category, filename, lineno, file, line)
+        # Bump stacklevel by 1 to skip this wrapper frame so the caller's
+        # intended display filename/lineno are preserved for the user.
+        return original_warn(message, category, stacklevel + 1, source, **kwargs)
 
-    _pyruntime_showwarning._pyruntime_wrapped = True  # type: ignore[attr-defined]
-    warnings.showwarning = _pyruntime_showwarning
+    _pyruntime_warn._pyruntime_wrapped = True  # type: ignore[attr-defined]
+    warnings.warn = _pyruntime_warn  # type: ignore[assignment]
 
 
 def _attach_diff_diff_hooks(module) -> None:
@@ -440,7 +479,16 @@ def _attach_diff_diff_hooks(module) -> None:
         original = getattr(module, func_name, None)
         if original is None or not callable(original):
             continue
-        setattr(module, func_name, _wrap_diagnostic(original, func_name))
+        wrapped = _wrap_diagnostic(original, func_name)
+        setattr(module, func_name, wrapped)
+        # Mirror to the defining submodule so
+        # `from diff_diff.<submod> import <func>` paths reach the wrapper
+        # too, matching the `get_llm_guide` dual-binding fix.
+        src_module_name = getattr(original, "__module__", None)
+        if src_module_name and src_module_name != "diff_diff":
+            src_module = sys.modules.get(src_module_name)
+            if src_module is not None and getattr(src_module, func_name, None) is original:
+                setattr(src_module, func_name, wrapped)
 
 
 class _DiffDiffPostImportHook:
@@ -497,7 +545,14 @@ class _DiffDiffPostImportHook:
 # _PYRUNTIME_EVENT_LOG to be set), then install hooks. If the env var is
 # unset, _write_event raises TelemetryConfigError and the agent's Python
 # startup fails — exactly the PR #1 fail-closed contract.
-_write_event({"event": "session_start", "ts": _utc_iso_now()})
+_write_event(
+    {
+        "event": "session_start",
+        "ts": _utc_iso_now(),
+        "sys_executable": sys.executable,
+        "pid": os.getpid(),
+    }
+)
 # Insert at FRONT of meta_path so we win against the default PathFinder for
 # the diff_diff name. Appending would never fire because PathFinder already
 # resolves installed packages.

@@ -153,14 +153,18 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
-# Python interpreter flags that bypass `sitecustomize.py` and therefore the
-# shim's hooks. `-S` disables `site.py` (which imports sitecustomize); `-I`
-# (isolated mode) implies `-S` plus `-E -s`. Lowercase `-s` (skip user site)
-# is unrelated and does NOT bypass sitecustomize, so the regex requires the
-# uppercase forms specifically. Compound short flags (`-IS`, `-SE`, etc.)
-# are matched too. Standalone `-X dev` and similar do not match because
-# their flag character set is `X` (no `S` or `I`).
-_PYTHON_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Z]*[SI][A-Z]*(?:\s|$)")
+# Python interpreter flag that bypasses `sitecustomize.py`: `-S` disables
+# `site.py` (which is what imports sitecustomize). Note `-I` (isolated mode)
+# implies `-E`, `-P`, and `-s` (lowercase) — NOT `-S`. Isolated mode does
+# not skip sitecustomize when the shim is installed in the venv's
+# site-packages, so it is not in the bypass list.
+#
+# Compact short-flag forms are matched too: `python -Sc 'code'` is
+# equivalent to `python -S -c 'code'` (the `-S` is the bypass; `c` is the
+# `-c` short flag for inline code). Lowercase `-s` (skip user site) does
+# NOT bypass sitecustomize and is correctly ignored (regex requires
+# uppercase `S` specifically).
+_PYTHON_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*S[A-Za-z]*(?:[\s=]|$)")
 
 
 def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
@@ -277,7 +281,9 @@ def _read_events(path: Path) -> list[dict]:
     return _parse_jsonl_strict(path, "event log")
 
 
-def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
+def _scan_read_tool_guide_accesses_in_entries(
+    entries: list[dict],
+) -> dict[str, bool]:
     """Return ``{filename: True}`` for each bundled guide file accessed via
     Claude's Read tool in the transcript.
 
@@ -286,18 +292,18 @@ def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
     sees nothing in that path because no `open()` or `get_llm_guide` call
     runs in the agent's subprocess. Without this layer-1 check the merger
     would emit a definitive `opened_llms_txt=False` for what was actually
-    a guide discovery — a silent telemetry-validity bug per the cold-start
-    contract.
+    a guide discovery.
 
-    Existence of the transcript file is the caller's responsibility
-    (`_validate_layer_artifacts` runs first in `merge_layers`). Parsing
-    uses the shared strict JSONL helper.
+    Path-matching uses adjacent path parts (``diff_diff`` / ``guides`` /
+    ``<filename>``) rather than substring match. Substring match would
+    accept paths like ``/tmp/notdiff_diff/guides/llms.txt`` or
+    ``/some/path/diff_diff/guides_extra/llms.txt``; the part-adjacency
+    check requires the read to be in the real bundled location.
 
     Only Read-tool evidence is recognized here. Bash-level guide reads
     (e.g. ``cat llms.txt``) are still part of the broader layer-1 parsing
     deferred to a future PR.
     """
-    entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     opened: dict[str, bool] = {}
     known_filenames = set(_VARIANT_TO_FILENAME.values())
     for entry in entries:
@@ -310,14 +316,13 @@ def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
             file_path = tool_input.get("file_path", "")
             if not isinstance(file_path, str) or not file_path:
                 continue
-            # Exact basename match AND require the path segment
-            # `diff_diff/guides/` to anchor to the bundled package location.
-            # Either condition alone would overmatch: suffix-only catches
-            # `my-llms.txt`, basename-only catches `/tmp/llms.txt`. Both
-            # together require the read to look like a real package guide.
-            basename = Path(file_path).name
-            if basename in known_filenames and "diff_diff/guides/" in file_path:
-                opened[basename] = True
+            p = Path(file_path)
+            if (
+                p.name in known_filenames
+                and p.parent.name == "guides"
+                and p.parent.parent.name == "diff_diff"
+            ):
+                opened[p.name] = True
     return opened
 
 
@@ -338,21 +343,133 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
-def _find_python_bypass_invocations(stream_json_path: Path) -> list[str]:
-    """Return Bash commands that invoke python with a `-S` or `-I` flag.
+def _extract_python_invocations_from_command(command: str) -> list[str]:
+    """Return the interpreter token for each python invocation in `command`.
 
-    `python -S` skips `site.py` and therefore `sitecustomize.py`; `python -I`
-    (isolated mode) implies `-S`. Either form bypasses the in-process shim
-    even when other Python processes in the same transcript fire
-    `session_start` normally — so aggregate `python_count == session_start`
-    parity would silently pass while the bypassed process accessed
-    diff_diff uninstrumented.
+    Each returned token is either:
+    - an absolute path that ends in `python` / `python3` / `python3.X`
+      (e.g. `/usr/bin/python3`, `/opt/venv/bin/python`); or
+    - a relative form (just `python`, `python3`, etc.) when the command
+      doesn't write an absolute path.
+
+    The merger uses these tokens to attribute each visible Python execution
+    to a specific `session_start` event by `sys_executable`.
+    """
+    tokens: list[str] = []
+    for m in _PYTHON_INVOCATION_RE.finditer(command):
+        # match[0] is e.g. " python " or "/python3 ". Recover the bare
+        # interpreter token by walking left from the match start through
+        # any non-separator characters (which captures the leading absolute
+        # path if present) and rstrip'ing the trailing whitespace.
+        match_start = m.start()
+        # Walk left through any path-character prefix (i.e. continuous
+        # non-separator chars before the matched region) to recover the
+        # full absolute interpreter path if present.
+        i = match_start
+        while i > 0 and command[i - 1] not in (" ", "\t", ";", "&", "|", "(", ")"):
+            i -= 1
+        interpreter_with_trailing = command[i : m.end()].rstrip()
+        # Strip any boundary char the match captured at its leading edge.
+        if interpreter_with_trailing and interpreter_with_trailing[0] in "; & | ( )":
+            interpreter_with_trailing = interpreter_with_trailing[1:]
+        tokens.append(interpreter_with_trailing)
+    return tokens
+
+
+def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
+    """Per-invocation cross-check: every visible python invocation must
+    correspond to a session_start whose `sys_executable` matches.
+
+    Raises ``TelemetryMergeError`` when a visible invocation cannot be
+    matched to any unused session_start. Matching rules:
+
+    - An absolute-path invocation (e.g. `/usr/bin/python3 script.py`) MUST
+      match a session_start whose `sys_executable` equals that path. If no
+      such session_start exists, the interpreter ran without sitecustomize
+      (the shim is only installed in the per-arm venv) and the eval is
+      invalid.
+    - A relative-path invocation (`python script.py`) is attributed to any
+      remaining unused session_start (the PATH-resolved interpreter cannot
+      be identified from the transcript alone; the runner's `clean_env`
+      sets PATH to the per-arm venv's bin).
+
+    Aggregate parity (`python_count <= session_start_count`) is no longer
+    sufficient because an unrelated instrumented Python process (e.g. `pip
+    --version`) can supply a session_start that masks an uninstrumented
+    visible invocation. Per-invocation matching catches that masking.
+    """
+    session_executables: list[str | None] = [
+        e.get("sys_executable") for e in events if e.get("event") == "session_start"
+    ]
+
+    # Two-pass attribution: absolute paths must match a session_start with
+    # the same `sys_executable` (exact path match); relative paths claim
+    # whatever session_start remains. Process absolute first so the
+    # specific matches are not stolen by an earlier-in-transcript relative
+    # invocation. Within each pass, order from the transcript is preserved.
+    absolute_invocations: list[tuple[str, str]] = []
+    relative_invocations: list[tuple[str, str]] = []
+    for entry in transcript_entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                continue
+            for interpreter in _extract_python_invocations_from_command(command):
+                if interpreter.startswith("/"):
+                    absolute_invocations.append((command, interpreter))
+                else:
+                    relative_invocations.append((command, interpreter))
+
+    # Pass 1: absolute-path invocations must match a session_start exactly.
+    for command, interpreter in absolute_invocations:
+        if interpreter in session_executables:
+            session_executables.remove(interpreter)
+            continue
+        raise TelemetryMergeError(
+            f"absolute-path python invocation {interpreter!r} has "
+            f"no matching session_start (recorded sys_executables: "
+            f"{[s for s in session_executables if s]!r}). The "
+            f"interpreter ran without sitecustomize and the eval is invalid."
+        )
+
+    # Pass 2: relative-path invocations claim any remaining session_start.
+    # The transcript can't reveal which interpreter `python` resolved to;
+    # we trust the runner's clean_env PATH to point at the per-arm venv.
+    for command, interpreter in relative_invocations:
+        if session_executables:
+            session_executables.pop(0)
+            continue
+        raise TelemetryMergeError(
+            f"python invocation in command {command[:120]!r} has "
+            f"no available session_start to claim; partial "
+            f"instrumentation. Cold-start eval is invalid."
+        )
+
+
+def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
+    """Return Bash commands that invoke python with a `-S` (or compact `-Sc`
+    etc.) flag.
+
+    `python -S` skips `site.py` and therefore `sitecustomize.py`. The flag
+    bypasses the in-process shim even when other Python processes in the
+    same transcript fire `session_start` normally — per-invocation
+    attribution cannot recover from this because the bypassed interpreter
+    never writes `session_start`.
 
     For each detected python invocation in each Bash command, look at the
     flag region between that invocation and the next shell separator
     (``;``, ``&``, ``|``). If a bypass flag is present, record the command.
+
+    Note: `-I` (isolated mode) is NOT in the bypass set. Isolated mode
+    implies `-E`, `-P`, and lowercase `-s` — none of which disable
+    sitecustomize. Earlier revisions of this code over-rejected `-I`; that
+    has been corrected.
     """
-    entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     bypass_commands: list[str] = []
     for entry in entries:
         for block in _iter_tool_use_blocks(entry):
@@ -409,25 +526,25 @@ def _count_python_invocations(stream_json_path: Path) -> int:
     return count
 
 
-def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
+def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) -> None:
     """Cross-layer fail-closed check before building the record.
 
     Cases:
     1. ``telemetry_missing`` sentinel present (written by the runner when
        the event log disappeared post-exec): raise.
-    2. ANY visible python invocation uses ``-S`` or ``-I`` (sitecustomize
-       bypass): raise. Aggregate count parity cannot mask this — an
-       unrelated instrumented Python process can supply the session_start
-       event while the bypassed process runs uninstrumented, so per-command
-       bypass detection is required in addition to the count check below.
-    3. Detected python invocations exceed ``session_start`` events: at
-       least one Python execution ran without sitecustomize firing (e.g.
-       an absolute-path interpreter outside the per-arm venv whose runtime
-       lacks the shim). Partial instrumentation leaves layer-2 silently
-       incomplete; raise.
-    4. Else accept (legitimate states include: shim loaded with N python
-       invocations + N session_starts, shim loaded with no Python at all,
-       and no Python + no session_start).
+    2. ANY visible python invocation uses ``-S`` (sitecustomize bypass) or
+       a compact form like ``-Sc`` / ``-Sm``: raise. Per-invocation
+       attribution cannot help here because the bypassed process WOULD
+       have a sys.executable but never fires `session_start`.
+    3. Per-invocation attribution: every visible python invocation in the
+       transcript MUST claim a `session_start` whose `sys_executable`
+       matches (absolute paths) or any remaining unused `session_start`
+       (relative `python`/`python3` forms). Unmatchable invocations raise.
+       This replaces the previous aggregate count parity, which could be
+       masked by unrelated instrumented Python processes (e.g. `pip
+       --version` supplying a session_start that doesn't actually
+       correspond to the visible interpreter).
+    4. Else accept.
     """
     for event in events:
         if event.get("event") == "telemetry_missing":
@@ -436,32 +553,24 @@ def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
                 "the agent's event log disappeared post-exec and the run "
                 "is invalid for evaluation"
             )
-    bypass_commands = _find_python_bypass_invocations(stream_json_path)
+    bypass_commands = _find_python_bypass_invocations_in_entries(transcript_entries)
     if bypass_commands:
         first = bypass_commands[0]
         if len(first) > 200:
             first = first[:200] + "..."
         raise TelemetryMergeError(
-            f"python interpreter bypass flag (-S or -I) detected in "
-            f"{len(bypass_commands)} transcript command(s); first: "
-            f"{first!r}. These flags skip sitecustomize.py and bypass the "
-            f"in-process shim, leaving layer-2 silently incomplete."
+            f"python interpreter bypass flag (-S, including compact forms "
+            f"like -Sc) detected in {len(bypass_commands)} transcript "
+            f"command(s); first: {first!r}. This flag skips sitecustomize.py "
+            f"and bypasses the in-process shim, leaving layer-2 silently "
+            f"incomplete."
         )
-    session_start_count = sum(1 for e in events if e.get("event") == "session_start")
-    python_count = _count_python_invocations(stream_json_path)
-    if python_count > session_start_count:
-        raise TelemetryMergeError(
-            f"agent transcript shows {python_count} python invocation(s) but "
-            f"the in-process event log only has {session_start_count} "
-            f"session_start event(s); partial instrumentation (e.g. "
-            f"`python -S` bypassing sitecustomize, or an absolute-path "
-            f"interpreter outside the per-arm venv) leaves at least one "
-            f"Python execution un-instrumented. Cold-start eval is invalid."
-        )
+    _attribute_python_invocations(transcript_entries, events)
 
 
 def _build_diff_diff_record(
     events: list[dict],
+    transcript_entries: list[dict],
     stream_json_path: Path,
     in_process_events_path: Path,
     stderr_path: Path,
@@ -499,7 +608,7 @@ def _build_diff_diff_record(
     # without invoking Python. Layer-2 hooks see nothing in that path, so
     # without this OR-merge the merger would silently emit
     # opened_llms_*=False for an actual discovery.
-    read_tool_opens = _scan_read_tool_guide_accesses(stream_json_path)
+    read_tool_opens = _scan_read_tool_guide_accesses_in_entries(transcript_entries)
     for filename, was_opened in read_tool_opens.items():
         if was_opened:
             opened[filename] = True
@@ -575,9 +684,17 @@ def merge_layers(
     Raises ``TelemetryMergeError`` on fail-closed conditions:
     - In-process event log missing or malformed.
     - Runner-written ``telemetry_missing`` sentinel present.
-    - Cross-layer inconsistency (python invoked but shim never loaded).
+    - Empty or non-object transcript.
+    - Shim event-write failure marker in stderr.
+    - Python bypass flag (`-S`) in any transcript command.
+    - Any visible python invocation that cannot be attributed to a
+      session_start by `sys_executable`.
+
+    The transcript is parsed exactly once (per-invocation attribution,
+    guide-read scan, and bypass detection all consume the parsed entries).
     """
     _validate_layer_artifacts(stream_json_path, stderr_path)
+    transcript_entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(
             f"shim event-write failure marker present in {stderr_path}; "
@@ -585,10 +702,14 @@ def merge_layers(
             f"per-run record may be silently incomplete"
         )
     events = _read_events(in_process_events_path)
-    _validate_shim_loaded(events, stream_json_path)
+    _validate_shim_loaded(events, transcript_entries)
     if arm == "diff_diff":
         return _build_diff_diff_record(
-            events, stream_json_path, in_process_events_path, stderr_path
+            events,
+            transcript_entries,
+            stream_json_path,
+            in_process_events_path,
+            stderr_path,
         )
     elif arm == "statsmodels":
         return _build_statsmodels_record(

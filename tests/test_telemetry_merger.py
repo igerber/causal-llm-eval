@@ -67,8 +67,15 @@ def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return events, transcript, stderr_log
 
 
-def _session_start_event() -> dict:
-    return {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
+def _session_start_event(sys_executable: str | None = None) -> dict:
+    """Build a session_start event. `sys_executable` defaults to None which
+    matches relative-form python invocations in the per-invocation
+    attribution check; pass an explicit absolute path to match an
+    absolute-path invocation."""
+    event = {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
+    if sys_executable is not None:
+        event["sys_executable"] = sys_executable
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -554,11 +561,12 @@ def test_merge_layers_diff_diff_raises_on_partial_instrumentation(tmp_path):
 def test_merge_layers_diff_diff_raises_on_absolute_python_without_session_start(
     tmp_path,
 ):
-    """Absolute-path invocation with no session_start must fail closed."""
+    """Absolute-path invocation with no matching session_start sys.executable
+    must fail closed."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])  # no session_start
     _write_transcript(transcript, ["/usr/bin/python3 script.py"])
-    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -607,11 +615,24 @@ def test_merge_layers_diff_diff_raises_on_python_dash_S_flag(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
-def test_merge_layers_diff_diff_raises_on_python_dash_I_flag(tmp_path):
-    """`-I` (isolated mode) implies `-S` and also bypasses sitecustomize."""
+def test_merge_layers_diff_diff_accepts_python_dash_I_flag(tmp_path):
+    """`-I` (isolated mode) does NOT skip sitecustomize when the shim is in
+    the per-arm venv's site-packages. Isolated mode implies `-E`, `-P`,
+    and lowercase `-s` — not `-S`. R4 code-quality correction: do not
+    falsely reject `-I` runs."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
     _write_transcript(transcript, ["python -I script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_raises_on_python_dash_Sc_compact_flag(tmp_path):
+    """R4 P0: compact `-Sc 'code'` form (S combined with -c) also bypasses
+    sitecustomize. The regex must catch it."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["pip --version && python -Sc 'import diff_diff'"])
     with pytest.raises(TelemetryMergeError, match="bypass flag"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
@@ -650,11 +671,18 @@ def test_merge_layers_diff_diff_raises_on_compound_partial_instrumentation(tmp_p
 
 
 def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_path):
-    """3 python invocations + 3 session_starts = fully instrumented; OK."""
+    """3 python invocations + 3 session_starts = fully instrumented. The
+    absolute-path invocation `/usr/bin/python3 b.py` must have a matching
+    session_start whose `sys_executable` equals that path; the relative
+    invocations claim any remaining session_start."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(
         events_path,
-        [_session_start_event(), _session_start_event(), _session_start_event()],
+        [
+            _session_start_event(sys_executable="/usr/bin/python3"),
+            _session_start_event(),
+            _session_start_event(),
+        ],
     )
     _write_transcript(
         transcript,
@@ -662,6 +690,25 @@ def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_p
     )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_raises_on_masked_absolute_python(tmp_path):
+    """R4 P0: `pip --version && /usr/bin/python3 ...` — pip's session_start
+    used to mask the uninstrumented /usr/bin/python3. With per-invocation
+    sys.executable matching, the absolute path must find a matching
+    session_start; an unrelated session_start (from pip's per-arm-venv
+    python, sys.executable = /per-arm-venv/bin/python) cannot supply it."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(sys_executable="/per-arm-venv/bin/python")],
+    )
+    _write_transcript(
+        transcript,
+        ["pip --version && /usr/bin/python3 script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 def test_merge_layers_diff_diff_read_tool_requires_diff_diff_guides_path_segment(

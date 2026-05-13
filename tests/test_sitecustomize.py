@@ -215,35 +215,55 @@ def test_diagnostic_wrapper_records_function_name(event_log):
 
 
 def test_warning_hook_records_diff_diff_warning(event_log):
+    """Verify warning capture via stack inspection: a warning emitted from
+    a frame whose module is `diff_diff.*` is recorded regardless of the
+    `stacklevel` argument used."""
     shim = _import_shim_fresh()
     shim._install_warning_hook()
-    # Simulate a warning whose source is a diff_diff file.
-    warnings.showwarning(
-        message="example warning",
-        category=UserWarning,
-        filename="/path/to/diff_diff/estimators.py",
-        lineno=42,
-    )
+    # Exec the warn() call inside a globals dict whose __name__ is
+    # diff_diff-like; the wrapper's stack walk finds this frame.
+    diff_diff_globals = {
+        "__name__": "diff_diff.estimators",
+        "warnings": warnings,
+    }
+    exec("warnings.warn('example warning')", diff_diff_globals)
     events = _read_events(event_log)
     warn_events = [e for e in events if e.get("event") == "warning_emitted"]
     assert len(warn_events) >= 1
     assert warn_events[-1]["category"] == "UserWarning"
-    assert "diff_diff" in warn_events[-1]["filename"]
 
 
 def test_warning_hook_ignores_non_diff_diff_warning(event_log):
     shim = _import_shim_fresh()
     shim._install_warning_hook()
-    # Snapshot current count of warning events
     pre = len([e for e in _read_events(event_log) if e.get("event") == "warning_emitted"])
-    warnings.showwarning(
-        message="numpy warning",
-        category=UserWarning,
-        filename="/path/to/numpy/core.py",
-        lineno=1,
-    )
+    numpy_globals = {"__name__": "numpy.core", "warnings": warnings}
+    exec("warnings.warn('numpy warning')", numpy_globals)
     post = len([e for e in _read_events(event_log) if e.get("event") == "warning_emitted"])
-    assert post == pre, "warning from non-diff_diff filename should not be recorded"
+    assert post == pre, "warning from non-diff_diff frame should not be recorded"
+
+
+def test_warning_hook_records_diff_diff_warning_with_stacklevel(event_log):
+    """R4 P1 regression: a diff_diff warning emitted with `stacklevel=2`
+    rewrites the displayed filename to point at the user's caller, but the
+    actual call stack still contains a diff_diff frame. The new warn-wrapper
+    must record it via stack inspection."""
+    shim = _import_shim_fresh()
+    shim._install_warning_hook()
+    diff_diff_globals = {
+        "__name__": "diff_diff.estimators",
+        "warnings": warnings,
+    }
+    # stacklevel=2 would point the displayed filename at the user; verify
+    # the wrapper still records the warning.
+    exec(
+        "warnings.warn('warn with stacklevel', stacklevel=2)",
+        diff_diff_globals,
+    )
+    events = _read_events(event_log)
+    warn_events = [e for e in events if e.get("event") == "warning_emitted"]
+    assert len(warn_events) >= 1
+    assert warn_events[-1]["message"].startswith("warn with stacklevel")
 
 
 # ---------------------------------------------------------------------------
@@ -351,13 +371,8 @@ def test_diagnostic_function_names_match_diff_diff_exports(event_log):
 def test_message_capped_at_500_chars(event_log):
     shim = _import_shim_fresh()
     shim._install_warning_hook()
-    long_message = "x" * 10000
-    warnings.showwarning(
-        message=long_message,
-        category=UserWarning,
-        filename="/path/to/diff_diff/estimators.py",
-        lineno=1,
-    )
+    diff_diff_globals = {"__name__": "diff_diff.estimators", "warnings": warnings}
+    exec("warnings.warn('x' * 10000)", diff_diff_globals)
     events = _read_events(event_log)
     warn_events = [e for e in events if e.get("event") == "warning_emitted"]
     assert len(warn_events) >= 1
