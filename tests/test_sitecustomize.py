@@ -107,6 +107,44 @@ def test_session_start_raises_without_env_var(monkeypatch, restore_globals):
     assert "_PYRUNTIME_EVENT_LOG is unset" in str(excinfo.value)
 
 
+def test_event_log_path_captured_at_import_resists_env_mutation(event_log, monkeypatch, tmp_path):
+    """R14 P0: an agent that mutates ``_PYRUNTIME_EVENT_LOG`` after the
+    shim's session_start has fired must NOT be able to redirect later hook
+    events. The shim captures the path at module load and uses that
+    captured value for every subsequent write; agent mutations are
+    ignored.
+
+    Pre-R14 ``_write_event`` re-read ``os.environ`` per call. An agent
+    could point ``_PYRUNTIME_EVENT_LOG`` at a sibling tmp file (or
+    delete it entirely) before invoking a tracked surface; subsequent
+    layer-2 events would land elsewhere or fail silently while the
+    runner-owned log retained only ``session_start``. The merger then
+    emitted a clean-looking record with all-False guide flags.
+
+    This test imports the shim with a known path, mutates the env var to
+    a different (decoy) file, fires a wrapper, and asserts that the
+    event landed in the ORIGINAL captured path, not the decoy.
+    """
+    shim = _import_shim_fresh()
+    decoy = tmp_path / "decoy_events.jsonl"
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(decoy))
+
+    # Fire a wrapper after the env-var mutation. The wrapped builder
+    # exists at module level; calling it should still write to the
+    # captured path, NOT the decoy.
+    wrapped = shim._wrap_get_llm_guide(lambda variant="concise": variant)
+    wrapped("practitioner")
+
+    # Decoy must remain empty / non-existent.
+    assert (
+        not decoy.exists() or decoy.stat().st_size == 0
+    ), f"event landed in decoy {decoy}; env-var mutation hijacked the shim"
+    # Original captured log must contain the guide_file_read event.
+    events = _read_events(event_log)
+    guide_events = [e for e in events if e.get("event") == "guide_file_read"]
+    assert any(e.get("variant") == "practitioner" for e in guide_events), events
+
+
 # ---------------------------------------------------------------------------
 # Meta-path post-import hook
 # ---------------------------------------------------------------------------

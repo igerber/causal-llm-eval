@@ -185,6 +185,18 @@ _SHELL_ACTIVATION_RE = re.compile(
 _PYTHON_WRAPPER_RE = re.compile(r"(?:^|[\s;&|])(?:uv\s+run|poetry\s+run|conda\s+run|pyenv\s+exec)")
 _ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
 _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
+# Shell wrappers that take a quoted code payload (``bash -c``, ``sh -c``,
+# ``zsh -c``, ``bash -lc``, etc. plus ``eval`` and ``exec``). When such a
+# wrapper appears AND the command also contains a ``python``-shaped token
+# anywhere (including inside the quoted payload), the inner python invocation
+# is invisible to the regex-based attribution path; fail-closed.
+_SHELL_WRAPPER_RE = re.compile(r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\s+-[a-zA-Z]*c(?:\s|$)")
+_EVAL_WRAPPER_RE = re.compile(r"(?:^|[\s;&|()])(?:eval|exec)(?:\s|$)")
+# Word-boundary ``python`` match that ignores ``pythonic`` / ``/opt/python_libs/``
+# but DOES find ``python`` inside quoted strings (because string content is
+# inspected raw here, not via shlex). Used together with the wrapper regexes
+# to detect inner-payload bypasses.
+_PYTHON_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_])python(?:3(?:\.\d+)?)?(?![A-Za-z0-9_])")
 
 
 # Python interpreter flag that bypasses `sitecustomize.py`: `-S` disables
@@ -584,8 +596,12 @@ def _strip_heredoc_bodies(command: str) -> str:
 
 def _find_unquoted_separator(s: str) -> int | None:
     """Return the position of the first unquoted shell separator (``;``,
-    ``&``, ``|``) in ``s``, or ``None`` if every such char is inside a
-    single- or double-quoted region.
+    ``&``, ``|``, ``)``) in ``s``, or ``None`` if every such char is inside
+    a single- or double-quoted region.
+
+    Includes ``)`` in the separator set so that ``(python script.py)``
+    truncates correctly: without it, the closing paren would attach to
+    the last argv token (``script.py)``) and break attribution.
 
     Tracks shell quoting state so that the inline ``;`` in
     ``python -c 'import os; print(1)'`` does not falsely terminate the
@@ -601,7 +617,7 @@ def _find_unquoted_separator(s: str) -> int | None:
         if quote_char is None:
             if c in ("'", '"'):
                 quote_char = c
-            elif c in (";", "&", "|"):
+            elif c in (";", "&", "|", ")"):
                 return i
         else:
             if quote_char == '"' and c == "\\" and i + 1 < len(s):
@@ -612,6 +628,54 @@ def _find_unquoted_separator(s: str) -> int | None:
                 quote_char = None
         i += 1
     return None
+
+
+def _is_in_command_position(command: str, interp_start: int) -> bool:
+    """Return True iff the python token at ``command[interp_start:]`` is in
+    shell command position (start of a command segment), not a positional
+    argument to another command.
+
+    Walks left from ``interp_start``, skipping:
+
+    - Whitespace.
+    - Posix env-var assignment prefixes (``KEY=value`` or ``KEY=``); these
+      precede the command in shell syntax (``MPLBACKEND=Agg python ...``)
+      and do not change command position.
+
+    Then checks the previous char: a separator (``;``, ``&``, ``|``,
+    ``(``, ``\\n``) or start-of-command means command position; anything
+    else (e.g. ``p`` of ``grep``, ``o`` of ``echo``) means the token is
+    an argument and should NOT be treated as a python invocation.
+    """
+    i = interp_start - 1
+    while i >= 0 and command[i] in (" ", "\t"):
+        i -= 1
+    if i < 0:
+        return True
+    while i >= 0:
+        # Try to parse a trailing KEY=VALUE (or KEY=) preceding this
+        # position. Walk back to find a `=` whose left side is `[A-Za-z_][A-Za-z0-9_]*`.
+        j = i
+        while j >= 0 and command[j] not in (" ", "\t", ";", "&", "|", "(", "\n"):
+            j -= 1
+        # command[j+1 : i+1] is a single shell word (no whitespace/separators).
+        word = command[j + 1 : i + 1]
+        if "=" in word:
+            key = word.split("=", 1)[0]
+            if (
+                key
+                and (key[0].isalpha() or key[0] == "_")
+                and all(c.isalnum() or c == "_" for c in key)
+            ):
+                # Skip past this assignment and any preceding whitespace.
+                i = j
+                while i >= 0 and command[i] in (" ", "\t"):
+                    i -= 1
+                if i < 0:
+                    return True
+                continue
+        break
+    return command[i] in (";", "&", "|", "(", "\n")
 
 
 def _is_redirection_token(tok: str) -> bool:
@@ -712,6 +776,13 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
             # ``^`` start-of-command boundary (zero-width); m.start() is
             # already the first char of the python token.
             interp_start = match_start
+        # Command-position check: skip ``python`` tokens that are arguments
+        # to another command (``grep python script.py``, ``echo python``).
+        # ``python`` must appear at the start of a shell command segment
+        # (after ``;``, ``&``, ``|``, ``(``, ``\\n``, or start-of-command,
+        # optionally preceded by ``KEY=value`` env-var assignments).
+        if not _is_in_command_position(command, interp_start):
+            continue
         interpreter = command[interp_start:interp_end]
         # Slice the args region: from end of match to next UNQUOTED shell
         # separator. A raw-regex scan would falsely terminate at a
@@ -869,6 +940,17 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             has_python_env_var = bool(_PYTHON_ENV_VAR_RE.search(command))
             has_activation = bool(_SHELL_ACTIVATION_RE.search(command))
             has_wrapper = bool(_PYTHON_WRAPPER_RE.search(command))
+            # Shell-wrapper bypass: `bash -c "python ..."`, `eval 'python ...'`,
+            # etc. The inner python token lives inside a quoted payload that
+            # _PYTHON_INVOCATION_RE does not visit (it scans the outer
+            # command). When the command contains both a shell wrapper AND
+            # any word-bounded `python` token, fail closed.
+            has_shell_wrapper = bool(_SHELL_WRAPPER_RE.search(command))
+            has_eval_wrapper = bool(_EVAL_WRAPPER_RE.search(command))
+            has_python_literal = bool(_PYTHON_LITERAL_RE.search(command))
+            if (has_shell_wrapper or has_eval_wrapper) and has_python_literal:
+                bypass_commands.append(command)
+                continue
             if (
                 (has_path_mutation and has_python)
                 or (has_python_env_var and has_python)

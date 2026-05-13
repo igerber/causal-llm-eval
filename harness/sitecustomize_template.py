@@ -64,33 +64,29 @@ _GUIDE_FILENAMES: tuple[str, ...] = (
 )
 
 
-def _get_event_log_path() -> str:
-    """Return the path the per-run shim writes events to, or raise.
-
-    Fail-closed contract: missing/empty env var raises TelemetryConfigError.
-    """
-    path = os.environ.get("_PYRUNTIME_EVENT_LOG")
-    if not path:
-        raise TelemetryConfigError(
-            "_PYRUNTIME_EVENT_LOG is unset; runtime event log cannot be written."
-        )
-    return path
+# Captured at module load (see top-level code below); ``_write_event`` uses
+# this rather than re-reading ``os.environ`` per call. Capturing once defends
+# against an agent that mutates or deletes ``_PYRUNTIME_EVENT_LOG`` after the
+# shim's session_start has fired: subsequent hook events would otherwise be
+# diverted to an attacker-chosen file (or dropped silently with no marker),
+# leaving the runner-owned log with only ``session_start`` while the merger
+# still emits a clean-looking record.
+_EVENT_LOG_PATH: str = ""
 
 
 def _write_event(event: dict) -> None:
-    """Append a single JSON event to the per-run event log.
+    """Append a single JSON event to the captured per-run event log.
 
-    Raises TelemetryConfigError if the event log env var is unset, or OSError
-    if the path is unwritable. Both are fatal at module load; inside hook
-    calls, callers catch OSError and continue (see module docstring).
+    Raises OSError if the path is unwritable. At module load the OSError is
+    fatal (no events have fired yet); inside hook calls, callers catch
+    OSError and continue (see module docstring).
     """
-    path = _get_event_log_path()
     try:
-        with open(path, "a") as f:
+        with open(_EVENT_LOG_PATH, "a") as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
         print(
-            f"[pyruntime] cannot write event to {path}: {e}",
+            f"[pyruntime] cannot write event to {_EVENT_LOG_PATH}: {e}",
             file=sys.stderr,
         )
         raise
@@ -480,8 +476,19 @@ class _DiffDiffPostImportHook:
         return spec
 
 
-# Module-load top-level: record session_start with full identity (raises
-# TelemetryConfigError if `_PYRUNTIME_EVENT_LOG` is unset).
+# Module-load top-level. Resolve and capture the event log path FIRST so
+# subsequent hook events use this captured value, not whatever
+# ``os.environ`` happens to hold when the hook fires (an agent could mutate
+# or unset the env var mid-run; capturing here pins the file the runner
+# owns).
+_initial_path = os.environ.get("_PYRUNTIME_EVENT_LOG")
+if not _initial_path:
+    raise TelemetryConfigError(
+        "_PYRUNTIME_EVENT_LOG is unset; runtime event log cannot be written."
+    )
+_EVENT_LOG_PATH = _initial_path
+
+# Now record session_start with full identity.
 _write_event(
     {
         "event": "session_start",

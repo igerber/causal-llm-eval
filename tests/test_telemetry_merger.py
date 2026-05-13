@@ -1396,6 +1396,89 @@ def test_merge_layers_diff_diff_inline_env_assignment_attributes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R14 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_raises_on_bash_dash_c_python(tmp_path):
+    """R14 P0: ``bash -c "python -S script.py"`` puts the python token
+    inside a quoted shell payload that the regex extractor does not visit.
+    Pre-R14 the merger could accept this with an empty event log because no
+    visible python invocation was extracted. Post-R14 the bypass detector
+    flags the shell-wrapper + ``python`` literal combination."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ['bash -c "python -S script.py"'])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_bash_dash_lc_python(tmp_path):
+    """R14 P0 variant: ``bash -lc`` (login shell) is a common form."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["bash -lc 'python script.py'"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_eval_python(tmp_path):
+    """R14 P0 variant: ``eval 'python script.py'`` similarly hides the
+    python token from the regex extractor."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["eval 'python script.py'"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_sh_dash_c_python(tmp_path):
+    """R14 P0 variant: ``sh -c`` works the same way."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ['sh -c "PATH=/usr/bin python script.py"'])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_grep_python_not_treated_as_invocation(tmp_path):
+    """R14 P2: ``grep python script.py`` searches for the literal string
+    ``python`` in script.py; ``python`` is an argument to grep, NOT an
+    interpreter invocation. Pre-R14 the regex extractor matched the
+    ``python`` token by leading-space boundary and required a session_start
+    for it. Post-R14 the command-position check rejects matches whose
+    preceding non-whitespace char is not a segment separator."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])  # no python invocations expected
+    _write_transcript(transcript, ["grep python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_echo_python_not_treated_as_invocation(tmp_path):
+    """R14 P2 variant: ``echo python`` should not flag."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["echo python"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_subshell_python_attributes(tmp_path):
+    """R14 P2 variant: ``(python script.py)`` runs python in a subshell.
+    The trailing ``)`` must NOT attach to the script.py argv token, and
+    the python token IS in command position (immediately follows ``(``)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(transcript, ["(python script.py)"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+# ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
 
