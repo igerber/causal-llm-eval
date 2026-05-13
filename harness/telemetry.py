@@ -190,8 +190,29 @@ _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
 # wrapper appears AND the command also contains a ``python``-shaped token
 # anywhere (including inside the quoted payload), the inner python invocation
 # is invisible to the regex-based attribution path; fail-closed.
-_SHELL_WRAPPER_RE = re.compile(r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\s+-[a-zA-Z]*c(?:\s|$)")
+_SHELL_WRAPPER_RE = re.compile(
+    # Shell name, then zero or more option tokens (lazy), then -c (or -lc /
+    # -ic / -Sc etc). The lazy `(?:\s+\S+)*?` allows option-token forms like
+    # `bash --noprofile -c "..."` or `bash -o pipefail -c "..."`.
+    r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\b(?:\s+\S+)*?\s+-[a-zA-Z]*c(?:\s|$)"
+)
 _EVAL_WRAPPER_RE = re.compile(r"(?:^|[\s;&|()])(?:eval|exec)(?:\s|$)")
+# Command modifier prefixes that take a command as their argument:
+# `command python ...`, `time python ...`, `nohup python ...`, `nice python ...`,
+# `timeout 30 python ...`, `xargs python ...`. The python token is not in
+# command position by `_is_in_command_position`, so the extractor skips it.
+# When a command pairs one of these with a python literal AND a `-S`-style
+# bypass flag literal, fail closed.
+_COMMAND_MODIFIER_BEFORE_PYTHON_RE = re.compile(
+    r"(?:^|[\s;&|()])(?:command|time|nohup|nice|timeout|xargs)"
+    r"(?:\s+-?\d+\S*)*"  # optional numeric/short-flag args (e.g. `timeout 30`)
+    r"\s+(?:[A-Z_][A-Za-z0-9_]*=\S+\s+)*"  # optional KEY=value env-prefixes
+    r"python(?:3(?:\.\d+)?)?\b"
+)
+# Word-boundary `-S` short-flag pattern (also catches compact forms like
+# `-Sc`, `-IS`). Used together with the modifier pattern above to detect
+# command-prefix bypass without enumerating every modifier+flag combination.
+_BARE_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*S[A-Za-z]*(?:[\s=]|$)")
 # Word-boundary ``python`` match that ignores ``pythonic`` / ``/opt/python_libs/``
 # but DOES find ``python`` inside quoted strings (because string content is
 # inspected raw here, not via shlex). Used together with the wrapper regexes
@@ -949,6 +970,18 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             has_eval_wrapper = bool(_EVAL_WRAPPER_RE.search(command))
             has_python_literal = bool(_PYTHON_LITERAL_RE.search(command))
             if (has_shell_wrapper or has_eval_wrapper) and has_python_literal:
+                bypass_commands.append(command)
+                continue
+            # Command modifier prefix bypass: `command python -S ...`,
+            # `time python -S ...`, `nohup python -S ...`, `timeout 30
+            # python -S ...`. The python token is not in command position
+            # (it's an arg to the modifier), so the extractor skips it; the
+            # `-S` then runs without producing any visible invocation.
+            # When the modifier-prefixed-python pattern is paired with a
+            # word-bounded `-S` flag literal, fail closed.
+            if _COMMAND_MODIFIER_BEFORE_PYTHON_RE.search(command) and _BARE_BYPASS_FLAG_RE.search(
+                command
+            ):
                 bypass_commands.append(command)
                 continue
             if (

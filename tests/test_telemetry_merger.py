@@ -1479,6 +1479,72 @@ def test_merge_layers_diff_diff_subshell_python_attributes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R15 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_raises_on_command_modifier_python_dash_S(tmp_path):
+    """R15 P0: ``command python -S script.py`` invokes python through the
+    POSIX ``command`` builtin so the python token is not in command
+    position; pre-R15 the extractor skipped it and the ``-S`` ran without
+    sitecustomize. Post-R15 the bypass detector flags
+    modifier+python+``-S`` literal."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["command python -S script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_time_python_dash_S(tmp_path):
+    """R15 P0 variant: ``time python -S ...``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["time python -S script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_nohup_python_dash_S(tmp_path):
+    """R15 P0 variant: ``nohup python -S ...``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["nohup python -S script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_timeout_python_dash_S(tmp_path):
+    """R15 P0 variant: ``timeout 30 python -S ...`` (modifier with arg)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["timeout 30 python -S script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_bash_long_option_dash_c(tmp_path):
+    """R15 P0: ``bash --noprofile -c "python -S ..."`` has options before
+    the ``-c`` token. Pre-R15 the wrapper regex required ``-c`` to follow
+    the shell name immediately (no intervening options); post-R15 it
+    allows option tokens between."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ['bash --noprofile -c "python -S script.py"'])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_bash_dash_o_pipefail_dash_c(tmp_path):
+    """R15 P0 variant: ``bash -o pipefail -c "..."`` (multi-token option)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ['bash -o pipefail -c "python script.py"'])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+# ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
 
