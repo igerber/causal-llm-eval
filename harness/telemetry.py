@@ -143,10 +143,14 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 
 
 # Word-boundary regex for python-invocation detection in the layer-1
-# cross-check. Matches `python`, `python3`, `python3.11`, etc. at a token
-# boundary so compound shell commands (`pip install foo && python script.py`)
-# are caught and false-positives like `/opt/python/` are not.
-_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()])python(?:3(?:\.\d+)?)?(?:\s|$)")
+# cross-check. Matches `python`, `python3`, `python3.11` at a token boundary.
+# Boundary set includes `/` so absolute interpreter paths
+# (`/usr/bin/python3 script.py`, `/opt/venv/bin/python -c "..."`) are caught,
+# and `;`/`&`/`|`/`(` so compound shell commands
+# (`pip install foo && python script.py`) are caught. The trailing `\s|$`
+# requirement guards against false positives like `/opt/python/` (the `/`
+# after `python` is neither whitespace nor end-of-string).
+_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
 def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
@@ -275,11 +279,13 @@ def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
             if not isinstance(tool_input, dict):
                 continue
             file_path = tool_input.get("file_path", "")
-            if not isinstance(file_path, str):
+            if not isinstance(file_path, str) or not file_path:
                 continue
-            for known in known_filenames:
-                if file_path.endswith(known):
-                    opened[known] = True
+            # Exact basename match. Suffix matching would overmatch paths like
+            # `my-llms.txt` or any tmpdir-local file sharing the filename.
+            basename = Path(file_path).name
+            if basename in known_filenames:
+                opened[basename] = True
     return opened
 
 
@@ -351,15 +357,16 @@ def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
                 "is invalid for evaluation"
             )
     session_start_count = sum(1 for e in events if e.get("event") == "session_start")
-    if session_start_count == 0:
-        python_count = _count_python_invocations(stream_json_path)
-        if python_count > 0:
-            raise TelemetryMergeError(
-                f"agent transcript shows {python_count} python invocation(s) "
-                f"but in-process event log has no session_start event; "
-                f"sitecustomize shim never loaded in the agent's subprocess. "
-                f"Cold-start eval is invalid."
-            )
+    python_count = _count_python_invocations(stream_json_path)
+    if python_count > session_start_count:
+        raise TelemetryMergeError(
+            f"agent transcript shows {python_count} python invocation(s) but "
+            f"the in-process event log only has {session_start_count} "
+            f"session_start event(s); partial instrumentation (e.g. "
+            f"`python -S` bypassing sitecustomize, or an absolute-path "
+            f"interpreter outside the per-arm venv) leaves at least one "
+            f"Python execution un-instrumented. Cold-start eval is invalid."
+        )
 
 
 def _build_diff_diff_record(

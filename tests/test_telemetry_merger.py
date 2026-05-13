@@ -164,7 +164,7 @@ def test_merge_layers_diff_diff_raises_on_python_invocation_without_session_star
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])  # NO session_start
     _write_transcript(transcript, ["python -c 'print(1)'"])
-    with pytest.raises(TelemetryMergeError, match="shim never loaded"):
+    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -478,6 +478,108 @@ def test_python_invocation_detection_recognizes_compound_commands(tmp_path):
         ],
     )
     assert _count_python_invocations(transcript) == 3
+
+
+def test_python_invocation_detection_recognizes_absolute_paths(tmp_path):
+    """R1 P0: `/usr/bin/python3 script.py` must trigger detection."""
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            "/usr/bin/python3 script.py",
+            "/opt/venv/bin/python -c 'import diff_diff'",
+            "/Users/me/.venv/bin/python3.11 script.py",
+        ],
+    )
+    assert _count_python_invocations(transcript) == 3
+
+
+def test_python_invocation_detection_ignores_python_in_directory_names(tmp_path):
+    """`/opt/python/` is a directory, not an invocation; must not trigger."""
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            "ls /opt/python/",
+            "cat /home/python_project/README.md",
+            "cd /Users/me/python_tools && ls",
+        ],
+    )
+    assert _count_python_invocations(transcript) == 0
+
+
+def test_merge_layers_diff_diff_raises_on_partial_instrumentation(tmp_path):
+    """R1 P0: 2 python invocations + 1 session_start = partial instrumentation
+    (e.g. `python -S` bypassing sitecustomize). Must fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["python -c 'import diff_diff'", "python -S uninstrumented.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_absolute_python_without_session_start(
+    tmp_path,
+):
+    """Absolute-path invocation with no session_start must fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])  # no session_start
+    _write_transcript(transcript, ["/usr/bin/python3 script.py"])
+    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_path):
+    """3 python invocations + 3 session_starts = fully instrumented; OK."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(), _session_start_event(), _session_start_event()],
+    )
+    _write_transcript(
+        transcript,
+        ["python a.py", "/usr/bin/python3 b.py", "python -c 'pass'"],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_read_tool_exact_basename_does_not_overmatch(tmp_path):
+    """R1 P2: a path ending in `-llms.txt` (e.g. `my-llms.txt`) must not be
+    treated as a bundled diff_diff guide."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/some/tmpdir/my-llms.txt"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/llms.txt.bak"},
+                    },
+                ],
+            },
+        }
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+    assert record.opened_llms_practitioner is False
+    assert record.opened_llms_autonomous is False
+    assert record.opened_llms_full is False
 
 
 # ---------------------------------------------------------------------------
