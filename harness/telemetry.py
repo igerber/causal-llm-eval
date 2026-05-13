@@ -377,7 +377,7 @@ def _scan_read_tool_guide_accesses_in_entries(
     guide-file Read request has no matching tool_result, the merger
     fails closed: an incomplete transcript that would silently emit
     `opened_llms_*=False` for a Read that may have succeeded is treated
-    the same as the terminal-result truncation check — the per-run
+    the same as the terminal-result truncation check - the per-run
     record cannot be trusted.
 
     Only Read-tool evidence is recognized here. Bash-level guide reads
@@ -502,11 +502,11 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
 
     Args after the interpreter must match exactly (shell-tokenized argv from
     the visible Bash command compared against ``sys.orig_argv[1:]``). The
-    interpreter token (argv[0]) matches either exactly or by basename — e.g.
-    visible ``python`` matches session ``python``, ``/usr/bin/python``, or
-    ``python3.11`` (Python's argv[0] is whatever the shell passed to execvp,
-    but path-form variation occurs across PATH lookups, alias expansion,
-    and absolute-path invocations).
+    interpreter argv[0] matches either exactly or by basename (e.g. visible
+    ``python`` matches session ``python``, ``/usr/bin/python``, or
+    ``python3.11``); Python's argv[0] is whatever the shell passed to
+    execvp, but path-form variation occurs across PATH lookups, alias
+    expansion, and absolute-path invocations.
     """
     if not session_argv or not visible_argv:
         return False
@@ -522,10 +522,10 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
 
     Every transcript-visible python invocation must match an unused
     ``session_start`` by argv (interpreter basename + args). Surplus
-    session_starts that have no visible counterpart are allowed — pip
-    console-scripts, child processes spawned by an attributed run, etc.
-    record session_start without surfacing as a Bash ``python`` token in
-    the transcript.
+    session_starts that have no visible counterpart are allowed; pip
+    console-scripts and child processes spawned by an attributed run
+    record session_start without surfacing as a Bash ``python`` argv[0]
+    in the transcript.
 
     Argv matching closes the masking class where the transcript shows
     e.g. ``pip --version && python script.py`` while the event log

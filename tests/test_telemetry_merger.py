@@ -1075,7 +1075,7 @@ def test_merge_layers_diff_diff_raises_on_error_result_entry(tmp_path):
 
 def test_merge_layers_diff_diff_argv_matches_by_basename(tmp_path):
     """Argv-matching should accept path-vs-basename variation on the
-    interpreter token: visible ``python`` (bare name from a PATH lookup
+    interpreter argv[0]. Visible ``python`` (bare name from a PATH lookup
     in the shell) matches session ``argv[0] = /per-arm-venv/bin/python``
     (sys.orig_argv may carry the resolved absolute path)."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
