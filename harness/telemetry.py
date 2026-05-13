@@ -153,6 +153,15 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
+# Shell patterns that override the resolved interpreter via PATH or by
+# pointing at a specific binary. Any of these in front of a python token
+# means the resolved interpreter is NOT the per-arm-venv python — so the
+# shim may not have loaded. Fail-closed when seen.
+_PATH_OVERRIDE_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])PATH=\S+\s+(?:[^\s;&|]+\s+)*python")
+_ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
+_DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
+
+
 # Python interpreter flag that bypasses `sitecustomize.py`: `-S` disables
 # `site.py` (which is what imports sitecustomize). Note `-I` (isolated mode)
 # implies `-E`, `-P`, and `-s` (lowercase) — NOT `-S`. Isolated mode does
@@ -226,9 +235,10 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
     return _SHIM_WRITE_FAILURE_MARKER in content
 
 
-def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None:
+def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list[dict]:
     """Fail-closed preflight: layer-1 and layer-3 capture files must exist,
     and the transcript must be a non-empty sequence of JSON objects.
+    Returns the parsed transcript entries so the caller doesn't reparse.
 
     The three-layer telemetry contract requires the stream-JSON transcript
     (layer 1) and the CLI stderr capture (layer 3) to be present for every
@@ -264,6 +274,7 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None
             f"(empty transcript likely indicates stdout-capture failure "
             f"and would silently zero out layer-1 evidence)"
         )
+    return transcript_entries
 
 
 def _read_events(path: Path) -> list[dict]:
@@ -452,23 +463,20 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
 
 
 def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
-    """Return Bash commands that invoke python with a `-S` (or compact `-Sc`
-    etc.) flag.
+    """Return Bash commands containing a `-S` (or compact `-Sc`) flag,
+    inline `PATH=...` interpreter override, `env python`, or `./python`.
 
-    `python -S` skips `site.py` and therefore `sitecustomize.py`. The flag
-    bypasses the in-process shim even when other Python processes in the
-    same transcript fire `session_start` normally — per-invocation
-    attribution cannot recover from this because the bypassed interpreter
-    never writes `session_start`.
+    All of these forms can cause a Python interpreter to run without the
+    shim loading: `-S` disables `site.py`; `PATH=/usr/bin python3` resolves
+    to a non-per-arm-venv interpreter; `env python` resolves via PATH;
+    `./python` invokes a local binary that almost certainly isn't the per-
+    arm-venv interpreter.
 
-    For each detected python invocation in each Bash command, look at the
-    flag region between that invocation and the next shell separator
-    (``;``, ``&``, ``|``). If a bypass flag is present, record the command.
+    Per-invocation attribution cannot recover from these because the
+    bypassed interpreter never writes `session_start`. Fail closed.
 
-    Note: `-I` (isolated mode) is NOT in the bypass set. Isolated mode
-    implies `-E`, `-P`, and lowercase `-s` — none of which disable
-    sitecustomize. Earlier revisions of this code over-rejected `-I`; that
-    has been corrected.
+    Note: `-I` (isolated mode) is NOT a bypass; it implies `-E`, `-P`, and
+    lowercase `-s` — none of which disable sitecustomize.
     """
     bypass_commands: list[str] = []
     for entry in entries:
@@ -481,6 +489,15 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             command = tool_input.get("command", "")
             if not isinstance(command, str):
                 continue
+            # Inline PATH= / env / ./python overrides
+            if (
+                _PATH_OVERRIDE_BEFORE_PYTHON_RE.search(command)
+                or _ENV_BEFORE_PYTHON_RE.search(command)
+                or _DOT_PYTHON_RE.search(command)
+            ):
+                bypass_commands.append(command)
+                continue
+            # -S / -Sc / etc. as flag to a python invocation
             for m in _PYTHON_INVOCATION_RE.finditer(command):
                 rest = command[m.end() :]
                 sep_match = re.search(r"[;&|]", rest)
@@ -693,8 +710,7 @@ def merge_layers(
     The transcript is parsed exactly once (per-invocation attribution,
     guide-read scan, and bypass detection all consume the parsed entries).
     """
-    _validate_layer_artifacts(stream_json_path, stderr_path)
-    transcript_entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+    transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(
             f"shim event-write failure marker present in {stderr_path}; "

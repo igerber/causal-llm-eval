@@ -110,19 +110,41 @@ def test_merge_layers_diff_diff_zero_byte_events_jsonl(tmp_path):
     assert record.called_get_llm_guide is False
 
 
-def test_merge_layers_diff_diff_full_events(tmp_path, monkeypatch):
+def test_merge_layers_diff_diff_full_events(tmp_path):
     events_path, transcript, stderr_log = _make_paths(tmp_path)
-    # Set the env var so importing the shim module's top-level code doesn't raise.
-    # (Shim top-level writes a session_start event at import time.)
-    shim_event_log = tmp_path / "shim_session_start.jsonl"
-    shim_event_log.touch()
-    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(shim_event_log))
-    import sys
-
-    sys.modules.pop("harness.sitecustomize_template", None)
-    from harness.sitecustomize_template import (
-        _DIAGNOSTIC_FUNCTION_NAMES,
-        _ESTIMATOR_CLASS_NAMES,
+    # Constants hardcoded here to avoid importing harness.sitecustomize_template
+    # (which mutates global state at top-level). The bidirectional regression
+    # test in test_sitecustomize.py is the source of truth for these lists
+    # against diff_diff exports.
+    _ESTIMATOR_CLASS_NAMES = (
+        "DifferenceInDifferences",
+        "TwoWayFixedEffects",
+        "MultiPeriodDiD",
+        "SyntheticDiD",
+        "CallawaySantAnna",
+        "ChaisemartinDHaultfoeuille",
+        "ContinuousDiD",
+        "SunAbraham",
+        "ImputationDiD",
+        "TwoStageDiD",
+        "TripleDifference",
+        "TROP",
+        "StackedDiD",
+        "StaggeredTripleDifference",
+        "EfficientDiD",
+        "WooldridgeDiD",
+        "BaconDecomposition",
+        "HeterogeneousAdoptionDiD",
+        "HonestDiD",
+        "PreTrendsPower",
+        "LinearRegression",
+    )
+    _DIAGNOSTIC_FUNCTION_NAMES = (
+        "compute_pretrends_power",
+        "compute_honest_did",
+        "bacon_decompose",
+        "run_placebo_test",
+        "compute_power",
     )
 
     events: list[dict] = [_session_start_event()]
@@ -625,6 +647,39 @@ def test_merge_layers_diff_diff_accepts_python_dash_I_flag(tmp_path):
     _write_transcript(transcript, ["python -I script.py"])
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_raises_on_inline_path_override(tmp_path):
+    """R5 P0: `pip --version && PATH=/usr/bin python3 ...` — the PATH=
+    override forces resolution outside the per-arm-venv, so even though
+    `python3` is relative the resolved interpreter does not have the shim."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["pip --version && PATH=/usr/bin python3 uninstrumented.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_env_python(tmp_path):
+    """R5 P0: `env python` resolves via PATH; can pick up a non-shim
+    interpreter."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["env python script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_dot_python(tmp_path):
+    """R5 P0: `./python` invokes a local binary."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["./python script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 def test_merge_layers_diff_diff_raises_on_python_dash_Sc_compact_flag(tmp_path):

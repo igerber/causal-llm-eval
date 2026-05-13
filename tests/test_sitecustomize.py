@@ -28,19 +28,33 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
+def _unwrap(fn):
+    """Walk the __wrapped__ chain to recover the underlying original.
+
+    Other tests in the suite (test_harness_imports) trigger the shim's
+    top-level open/warn hooks without a cleanup fixture, so the "current"
+    `builtins.open` / `warnings.warn` may already be wrapped when this
+    fixture's save runs. Walking the chain finds the true original.
+    """
+    while getattr(fn, "__wrapped__", None) is not None:
+        fn = fn.__wrapped__
+    return fn
+
+
 @pytest.fixture
 def restore_globals():
     """Save and restore module globals the shim mutates."""
-    original_showwarning = warnings.showwarning
-    original_builtins_open = builtins.open
-    original_io_open = io.open
+    original_showwarning = _unwrap(warnings.showwarning)
+    original_warn = _unwrap(warnings.warn)
+    original_builtins_open = _unwrap(builtins.open)
+    original_io_open = _unwrap(io.open)
     original_meta_path = list(sys.meta_path)
     yield
     warnings.showwarning = original_showwarning
+    warnings.warn = original_warn
     builtins.open = original_builtins_open
     io.open = original_io_open
     sys.meta_path[:] = original_meta_path
-    # Drop our module from sys.modules so the next test's reload is clean
     sys.modules.pop("harness.sitecustomize_template", None)
 
 

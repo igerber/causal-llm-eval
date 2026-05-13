@@ -1,57 +1,5 @@
-"""Template for the in-process instrumentation shim.
-
-Copied into each per-run venv as `sitecustomize.py` (Python's standard
-auto-import-on-startup hook). Logs library access events to a per-run JSON
-event log specified by the `_PYRUNTIME_EVENT_LOG` environment variable. The
-underscore prefix + Python-runtime framing is a deliberate low-reactivity
-choice: an agent enumerating `os.environ` is less likely to flag the name as
-eval-related.
-
-Tracked events for arm 1 (diff-diff) - this contract pairs 1:1 with the
-discoverability fields on `TelemetryRecord` and the rubric's "Discovered LLM
-guidance" column:
-
-    - Every `import diff_diff` event
-    - Every direct guide-file read for the bundled guides (`llms.txt`,
-      `llms-practitioner.txt`, `llms-autonomous.txt`, `llms-full.txt`),
-      whether via `builtins.open()`, `pathlib.Path.read_text/read_bytes`,
-      `importlib.resources.files(...).read_text/read_bytes`, or any other
-      Python-internal path that returns the file's bytes. This grounds the
-      `opened_llms_*` flags on TelemetryRecord.
-    - Every `get_llm_guide(variant)` call with the variant argument
-    - Every fit-time `warnings.warn(...)` from `diff_diff.*` with message + category
-    - Every diagnostic method call (compute_pretrends_power, compute_honest_did,
-      bacon_decomposition, in_time_placebo, placebo_test, etc.)
-    - Every estimator class instantiation in `diff_diff.*`
-
-Tracked events for arm 2 (statsmodels) - parity instrumentation:
-    - Same set, watching `statsmodels.*` instead. Guide-file read tracking is
-      "not applicable" rather than "not discovered" for statsmodels (no bundled
-      LLM guides exist); the merger encodes this as `None`/sentinel rather than
-      `False` so comparator-fairness analysis can distinguish absence-of-feature
-      from absence-of-discovery. The statsmodels-side hooks are wired in a
-      follow-up PR alongside the case-study statsmodels prompt; this PR
-      establishes only the diff-diff side and the sentinel-None encoding.
-
-## Failure mode: fail closed at module load; fail open inside hooks
-
-If `_PYRUNTIME_EVENT_LOG` is unset or its path is unwritable AT MODULE LOAD,
-the shim MUST raise rather than silently no-op. A misconfigured run that
-returns a record with all-`False` discoverability flags is indistinguishable
-from a real "agent never accessed any guide" outcome and would corrupt the
-eval. Module-load failure is loud and fatal; the runner catches the exception
-and marks the run failed.
-
-Inside hook calls, transient OSError on event write is caught and logged to
-stderr (captured by layer 3) while the original function STILL executes.
-Telemetry loss on one event is recoverable; aborting the agent on telemetry
-hiccup would be a worse evaluation artifact. The runner-level
-`telemetry_missing` sentinel covers the case where the event log truly
-disappeared post-exec.
-
-Implements the contract above; see `harness/telemetry.py:merge_layers` for
-the consumer.
-"""
+"""Python runtime instrumentation. Module documentation lives outside this
+file in `harness/COLD_START_VERIFICATION.md`."""
 
 from __future__ import annotations
 
@@ -67,21 +15,10 @@ from datetime import datetime, timezone
 
 
 class TelemetryConfigError(RuntimeError):
-    """Raised when the in-process shim cannot find a writable event log path.
-
-    Failing closed prevents silent telemetry loss: a misconfigured run that
-    yields all-`False` discoverability flags is indistinguishable from a real
-    "no access" outcome and corrupts the eval. The runner is expected to catch
-    this and mark the run failed rather than continuing.
-    """
+    """Raised when the event log path is unset or unwritable."""
 
 
 # Canonical list of fit-bearing classes exported from `diff_diff.__all__`.
-# Patched at both `__init__` and `fit` to record agent usage.
-#
-# Includes HonestDiD and PreTrendsPower (class-based wrappers around the
-# diagnostic functions) so agents who write `HonestDiD(...).fit(...)` instead
-# of `compute_honest_did(...)` are still recorded.
 _ESTIMATOR_CLASS_NAMES: tuple[str, ...] = (
     "DifferenceInDifferences",
     "TwoWayFixedEffects",
@@ -108,7 +45,6 @@ _ESTIMATOR_CLASS_NAMES: tuple[str, ...] = (
 
 
 # Canonical list of module-level diagnostic functions in `diff_diff`.
-# Patched to record agent invocation.
 _DIAGNOSTIC_FUNCTION_NAMES: tuple[str, ...] = (
     "compute_pretrends_power",
     "compute_honest_did",
@@ -137,9 +73,7 @@ def _get_event_log_path() -> str:
     path = os.environ.get("_PYRUNTIME_EVENT_LOG")
     if not path:
         raise TelemetryConfigError(
-            "_PYRUNTIME_EVENT_LOG is unset; in-process telemetry cannot be "
-            "written. The runner must set this env var before spawning the "
-            "agent."
+            "_PYRUNTIME_EVENT_LOG is unset; runtime event log cannot be written."
         )
     return path
 
@@ -174,22 +108,10 @@ def _utc_iso_now() -> str:
 
 
 def _safe_write(event: dict) -> None:
-    """Write an event from inside a hook, catching transient write failures.
-
-    Differs from `_write_event` in that OSError is caught here (event is
-    dropped, message logged to stderr) so the wrapped function can still
-    execute. Telemetry loss on one event is recoverable; aborting the agent
-    mid-call would corrupt the run more than missing a single record.
-
-    `TelemetryConfigError` (env var unset) is NOT caught here because that
-    only fires if the env var was unset between module load and the call,
-    which would indicate a broken contract worth surfacing.
-    """
+    """Write an event, dropping on transient OSError so the caller proceeds."""
     try:
         _write_event(event)
     except OSError:
-        # Already logged to stderr by _write_event; drop the event and let
-        # the caller continue.
         pass
 
 
@@ -325,8 +247,7 @@ def _install_open_hook() -> None:
     - `importlib.resources.files("diff_diff.guides").joinpath("llms.txt").read_text()`
       (which goes through pathlib for installed packages)
 
-    Low-level `os.read` on raw file descriptors is not caught; agents on
-    causal-inference tasks don't reach for that.
+    Low-level `os.read` on raw file descriptors is not caught.
     """
     if getattr(builtins.open, "_pyruntime_wrapped", False):
         return
@@ -375,29 +296,15 @@ def _caller_is_from_diff_diff(start_frame) -> tuple[bool, str, int]:
 
 def _install_warning_hook() -> None:
     """Override `warnings.warn` to record warnings whose call stack passes
-    through diff_diff.
-
-    Wrapping `warn` (not `showwarning`) is necessary because `warn` lets the
-    caller rewrite the displayed filename via `stacklevel=N`. The previous
-    `showwarning` filter, which inspected the displayed filename, would miss
-    any diff_diff warning emitted with `stacklevel >= 2` (a common pattern
-    when libraries want the warning to point at user code).
-
-    By inspecting the actual call stack at warn-time, we attribute the
-    warning correctly regardless of `stacklevel`. Records the diff_diff
-    frame's filename and lineno, not the displayed (post-stacklevel) ones.
-
-    Idempotent: re-running the shim does not double-wrap.
-    """
+    through diff_diff. Idempotent."""
     if getattr(warnings.warn, "_pyruntime_wrapped", False):
         return
     original_warn = warnings.warn
 
     @functools.wraps(original_warn)
     def _pyruntime_warn(message, category=UserWarning, stacklevel=1, source=None, **kwargs):
-        # sys._getframe(1) is the agent's warning emission site (one frame
-        # up from our wrapper). Walk upward; record if a diff_diff frame is
-        # present anywhere in the chain.
+        # sys._getframe(1) is the immediate caller (one frame up from our
+        # wrapper). Walk upward; record if a diff_diff frame is present.
         try:
             matched, frame_filename, frame_lineno = _caller_is_from_diff_diff(sys._getframe(1))
         except ValueError:
@@ -452,19 +359,17 @@ def _attach_diff_diff_hooks(module) -> None:
         module.get_llm_guide = wrapped
         module._guides_api.get_llm_guide = wrapped
 
-    # Capture the guides dir for the open hook. Use importlib.resources to
-    # resolve the package's data dir without depending on __file__ layout.
-    try:
-        from importlib.resources import files as _resources_files
+    # Re-resolve the guides dir from the freshly-imported module (defense
+    # in depth; the top-level resolution via find_spec should already have
+    # set _diff_diff_guides_dir before any user code ran).
+    if _diff_diff_guides_dir is None:
+        try:
+            from importlib.resources import files as _resources_files
 
-        guides_traversable = _resources_files("diff_diff.guides")
-        _diff_diff_guides_dir = str(guides_traversable)
-    except (ImportError, ModuleNotFoundError):
-        # Should not happen — diff_diff.guides exists in the wheel — but
-        # fail-soft: the open hook simply won't fire if the dir is unknown.
-        _diff_diff_guides_dir = None
-
-    _install_open_hook()
+            guides_traversable = _resources_files("diff_diff.guides")
+            _diff_diff_guides_dir = str(guides_traversable)
+        except (ImportError, ModuleNotFoundError):
+            _diff_diff_guides_dir = None
 
     for class_name in _ESTIMATOR_CLASS_NAMES:
         cls = getattr(module, class_name, None)
@@ -541,20 +446,33 @@ class _DiffDiffPostImportHook:
         return spec
 
 
-# Module-load top-level: fail-closed write of session_start (requires
-# _PYRUNTIME_EVENT_LOG to be set), then install hooks. If the env var is
-# unset, _write_event raises TelemetryConfigError and the agent's Python
-# startup fails — exactly the PR #1 fail-closed contract.
+# Module-load top-level: record session_start with full identity (raises
+# TelemetryConfigError if `_PYRUNTIME_EVENT_LOG` is unset).
 _write_event(
     {
         "event": "session_start",
         "ts": _utc_iso_now(),
         "sys_executable": sys.executable,
+        "argv": list(getattr(sys, "orig_argv", sys.argv)),
         "pid": os.getpid(),
     }
 )
-# Insert at FRONT of meta_path so we win against the default PathFinder for
-# the diff_diff name. Appending would never fire because PathFinder already
-# resolves installed packages.
+
+# Resolve the bundled guides directory WITHOUT importing diff_diff. The
+# open-hook below needs this to recognize Path/open reads of guide files;
+# without top-level resolution, reads that happen before `import diff_diff`
+# would silently miss.
+try:
+    _diff_diff_spec = importlib.util.find_spec("diff_diff")
+    if _diff_diff_spec is not None and _diff_diff_spec.origin:
+        from pathlib import Path as _Path  # noqa: F401
+
+        _diff_diff_guides_dir = str(_Path(_diff_diff_spec.origin).resolve().parent / "guides")
+except (ImportError, ValueError, AttributeError):
+    pass
+
+# Insert post-import hook at FRONT of meta_path so it beats the default
+# PathFinder for `diff_diff`.
 sys.meta_path.insert(0, _DiffDiffPostImportHook())
 _install_warning_hook()
+_install_open_hook()
