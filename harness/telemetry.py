@@ -456,14 +456,62 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
+def _is_redirection_token(tok: str) -> bool:
+    """Return True if tok is a shell I/O redirection / pipe operator that
+    terminates a python program's argv list.
+
+    Catches:
+    - Pure redirections / heredocs: ``<``, ``>``, ``<<``, ``>>``, ``<<<``,
+      ``>out.txt`` (no space before filename), ``<infile`` etc.
+    - fd-prefixed: ``2>``, ``1>``, ``2>>``, ``2>&1``, ``&>`` etc.
+    - Pipes / sequencers: ``|``, ``&``, ``&&``, ``||``, ``;`` (defense in
+      depth; the outer regex usually splits on these first).
+
+    Tokens that contain ``<`` / ``>`` INSIDE quotes (e.g. ``"print(1>0)"``)
+    are kept by ``shlex.split`` as a single token starting with ``"`` or
+    ``p`` (an alphanumeric), so they are not flagged here.
+    """
+    if not tok:
+        return False
+    if tok in ("|", "&", "&&", "||", ";"):
+        return True
+    if tok[0] in ("<", ">"):
+        return True
+    # fd-prefixed: leading digit(s) then `<` or `>` (e.g. `2>`, `2>&1`, `1>>`).
+    i = 0
+    while i < len(tok) and tok[i].isdigit():
+        i += 1
+    if 0 < i < len(tok) and tok[i] in ("<", ">"):
+        return True
+    return False
+
+
+def _truncate_at_redirection(tokens: list[str]) -> list[str]:
+    """Drop everything from the first I/O redirection / pipe token onward.
+
+    Shell-managed I/O (heredoc body, redirection target file, fd dup) is
+    NOT part of the Python program's ``sys.orig_argv``; including those
+    tokens in the visible argv would prevent attribution against a
+    legitimate session_start.
+    """
+    result: list[str] = []
+    for tok in tokens:
+        if _is_redirection_token(tok):
+            break
+        result.append(tok)
+    return result
+
+
 def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
     """Return a list of argv-shaped token lists for each python invocation.
 
-    Each entry is the full argv slice: `[interpreter, *args]`. Args run up
+    Each entry is the full argv slice: `[interpreter, *args]` matching
+    what the Python process would see in ``sys.orig_argv``. Args run up
     to the next shell separator (``;``, ``&``, ``|``, end-of-string), with
-    quoting handled by `shlex.split`. The interpreter token preserves any
-    absolute path prefix (e.g. `/usr/bin/python3`) so the merger can later
-    match by basename or full path against `session_start.argv`.
+    quoting handled by `shlex.split`, and any I/O redirection tokens
+    (``>``, ``<``, ``<<``, ``2>&1``, etc.) are stripped because shell
+    redirection is not part of the Python program's argv. The interpreter
+    token preserves any absolute path prefix (e.g. `/usr/bin/python3`).
     """
     invocations: list[list[str]] = []
     for m in _PYTHON_INVOCATION_RE.finditer(command):
@@ -492,6 +540,7 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
             args_tokens = shlex.split(args_region, comments=False, posix=True)
         except ValueError:
             args_tokens = args_region.split()
+        args_tokens = _truncate_at_redirection(args_tokens)
         invocations.append([interpreter, *args_tokens])
     return invocations
 
@@ -501,12 +550,22 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
     python invocation's argv.
 
     Args after the interpreter must match exactly (shell-tokenized argv from
-    the visible Bash command compared against ``sys.orig_argv[1:]``). The
-    interpreter argv[0] matches either exactly or by basename (e.g. visible
-    ``python`` matches session ``python``, ``/usr/bin/python``, or
-    ``python3.11``); Python's argv[0] is whatever the shell passed to
-    execvp, but path-form variation occurs across PATH lookups, alias
-    expansion, and absolute-path invocations.
+    the visible Bash command compared against ``sys.orig_argv[1:]``).
+
+    Interpreter argv[0] matching is asymmetric:
+
+    - If the VISIBLE argv[0] is absolute (``startswith("/")``), require
+      exact equality with the session's argv[0]. Basename-only fallback
+      would silently attribute ``/usr/bin/python3 script.py`` (off-venv,
+      no sitecustomize) to a session whose argv[0] is
+      ``/per-arm-venv/bin/python3`` and whose args also match. The visible
+      absolute path is unambiguous and must identify the exact
+      interpreter.
+    - If the VISIBLE argv[0] is relative (bare ``python`` / ``python3``
+      / ``python3.11``), allow path-vs-basename fallback. The shell may
+      have PATH-resolved the bare name to an absolute interpreter, in
+      which case ``sys.orig_argv[0]`` carries the resolved path even
+      though the visible argv[0] is just the bare token.
     """
     if not session_argv or not visible_argv:
         return False
@@ -514,6 +573,9 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
         return False
     if session_argv[0] == visible_argv[0]:
         return True
+    # Asymmetric fallback: only when visible is relative.
+    if visible_argv[0].startswith("/"):
+        return False
     return Path(session_argv[0]).name == Path(visible_argv[0]).name
 
 

@@ -909,15 +909,21 @@ def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_p
 
 
 def test_merge_layers_diff_diff_raises_on_masked_absolute_python(tmp_path):
-    """R4 P0: `pip --version && /usr/bin/python3 ...` — pip's session_start
-    used to mask the uninstrumented /usr/bin/python3. With per-invocation
-    sys.executable matching, the absolute path must find a matching
-    session_start; an unrelated session_start (from pip's per-arm-venv
-    python, sys.executable = /per-arm-venv/bin/python) cannot supply it."""
+    """R4 P0: `pip --version && /usr/bin/python3 ...`. pip's session_start
+    used to mask the uninstrumented /usr/bin/python3 under sys_executable
+    pooling; under R10 argv attribution, the absolute visible path must
+    match a session whose argv[0] equals it exactly. An unrelated session
+    (from pip's per-arm-venv python, argv[0]=/per-arm-venv/bin/pip)
+    cannot supply that match."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(
         events_path,
-        [_session_start_event(sys_executable="/per-arm-venv/bin/python")],
+        [
+            _session_start_event(
+                sys_executable="/per-arm-venv/bin/python",
+                argv=["/per-arm-venv/bin/pip", "--version"],
+            )
+        ],
     )
     _write_transcript(
         transcript,
@@ -1099,6 +1105,83 @@ def test_merge_layers_diff_diff_argv_args_must_match_exactly(tmp_path):
     _write_transcript(transcript, ["python script.py"])
     with pytest.raises(TelemetryMergeError, match="no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_absolute_path_does_not_basename_match(tmp_path):
+    """R11 P0: when the visible argv[0] is absolute, basename fallback is
+    forbidden. `/usr/bin/python3 script.py` must NOT match a session whose
+    argv[0] is `/per-arm-venv/bin/python3 script.py`, even though the
+    basenames agree and the args match. The visible absolute path is
+    unambiguous and must identify the exact interpreter; otherwise an
+    off-venv `/usr/bin/python3` could silently inherit attribution from a
+    different instrumented session and skip layer-2 telemetry capture."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(
+                sys_executable="/per-arm-venv/bin/python3",
+                argv=["/per-arm-venv/bin/python3", "script.py"],
+            )
+        ],
+    )
+    _write_transcript(transcript, ["/usr/bin/python3 script.py"])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_absolute_path_exact_match_attributes(tmp_path):
+    """R11: absolute-path argv[0] DOES match the session_start with the
+    identical argv[0] (positive test). Pairs with the negative test above."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["/usr/bin/python3", "script.py"])],
+    )
+    _write_transcript(transcript, ["/usr/bin/python3 script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_strips_stdout_redirection(tmp_path):
+    """R11 P2: shell redirection like `python script.py > out.txt` is NOT
+    part of `sys.orig_argv`; the merger must strip it from the visible
+    argv before comparing, or instrumented heredoc-style runs will be
+    rejected as unattributed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(transcript, ["python script.py > out.txt"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_strips_heredoc(tmp_path):
+    """R11 P2: heredoc redirection `python - <<'PY' ... PY` puts the
+    heredoc body on stdin; the python program's argv is just `[python,
+    -]`. Visible argv after redirection-stripping must match."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-"])],
+    )
+    _write_transcript(transcript, ["python - <<'PY'\nprint(1)\nPY"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_strips_fd_redirection(tmp_path):
+    """R11 P2: fd-redirection `python script.py 2>&1` is not in argv."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(transcript, ["python script.py 2>&1"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
 
 
 # ---------------------------------------------------------------------------
