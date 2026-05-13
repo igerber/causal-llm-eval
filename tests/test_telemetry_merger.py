@@ -303,27 +303,48 @@ def test_merge_layers_diff_diff_raises_on_shim_write_failure_marker(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def _read_tool_request(tool_use_id: str, file_path: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Read",
+                    "input": {"file_path": file_path},
+                }
+            ],
+        },
+    }
+
+
+def _read_tool_result(tool_use_id: str, *, is_error: bool = False) -> dict:
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "is_error": is_error,
+                    "content": "file contents" if not is_error else "error",
+                }
+            ],
+        },
+    }
+
+
 def test_merge_layers_diff_diff_read_tool_guide_access_flips_opened_flag(tmp_path):
-    """Layer-1 evidence: Claude's Read tool on a bundled guide file must
-    populate `opened_llms_*` even when the in-process shim sees nothing
-    (agent read the file without invoking Python)."""
+    """Layer-1 evidence: Claude's Read tool on a bundled guide file (with
+    a non-error tool_result) populates `opened_llms_*`."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    # Transcript: a Read tool call on llms.txt; no Python invocation.
     transcript_entries = [
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/some/install/diff_diff/guides/llms.txt"},
-                    }
-                ],
-            },
-        }
+        _read_tool_request("read_1", "/some/install/diff_diff/guides/llms.txt"),
+        _read_tool_result("read_1"),
     ]
     with open(transcript, "w") as f:
         for entry in transcript_entries:
@@ -336,30 +357,20 @@ def test_merge_layers_diff_diff_read_tool_guide_access_flips_opened_flag(tmp_pat
 
 
 def test_merge_layers_diff_diff_read_tool_recognizes_all_guide_filenames(tmp_path):
-    """Verify all four bundled guides are detected via Read-tool evidence."""
+    """Verify all four bundled guides are detected when each has a
+    successful tool_result."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": f"/install/diff_diff/guides/{name}"},
-                    }
-                    for name in (
-                        "llms.txt",
-                        "llms-practitioner.txt",
-                        "llms-autonomous.txt",
-                        "llms-full.txt",
-                    )
-                ],
-            },
-        }
-    ]
+    transcript_entries = []
+    for i, name in enumerate(
+        ("llms.txt", "llms-practitioner.txt", "llms-autonomous.txt", "llms-full.txt"),
+        start=1,
+    ):
+        tool_use_id = f"read_{i}"
+        transcript_entries.append(
+            _read_tool_request(tool_use_id, f"/install/diff_diff/guides/{name}")
+        )
+        transcript_entries.append(_read_tool_result(tool_use_id))
     with open(transcript, "w") as f:
         for entry in transcript_entries:
             f.write(json.dumps(entry) + "\n")
@@ -368,6 +379,37 @@ def test_merge_layers_diff_diff_read_tool_recognizes_all_guide_filenames(tmp_pat
     assert record.opened_llms_practitioner is True
     assert record.opened_llms_autonomous is True
     assert record.opened_llms_full is True
+
+
+def test_merge_layers_diff_diff_read_tool_failed_read_does_not_flip_flag(tmp_path):
+    """R8 P1: a Read with is_error=True must NOT flip opened_llms_*."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+        _read_tool_result("r1", is_error=True),
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+
+
+def test_merge_layers_diff_diff_read_tool_missing_result_does_not_flip_flag(tmp_path):
+    """R8 P1: a Read tool_use with no matching tool_result must NOT flip
+    `opened_llms_*` (transcript may be truncated; safer not to count)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+        # no tool_result entry
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
 
 
 def test_merge_layers_diff_diff_read_tool_ignores_non_guide_files(tmp_path):

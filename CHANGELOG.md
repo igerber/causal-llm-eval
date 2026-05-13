@@ -133,7 +133,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).
 - `harness/telemetry.py` layer-3 docstring no longer claims to capture
-  Python warnings (layer 2 does that via the `showwarning` override); layer
+  Python warnings (layer 2 does that via the `warnings.warn` wrapper); layer
   3 is CLI-level stderr capture only.
 - `harness/sitecustomize_template.py` is no longer a skeleton: implements
   the full diff_diff hook surface per the contract in its module docstring.

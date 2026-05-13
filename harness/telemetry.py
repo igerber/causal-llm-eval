@@ -168,9 +168,21 @@ _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:[\
 # benign cases (e.g. `echo PATH=/foo && python`), but agents rarely emit
 # such patterns for non-bypass reasons; failing-closed is correct.
 _PATH_ASSIGNMENT_RE = re.compile(r"(?:^|[\s;&|])(?:export\s+)?PATH=\S+")
+# PYTHONPATH / PYTHONHOME / PYTHONSTARTUP / PYTHONUSERBASE all alter
+# Python's import resolution or run startup code in the agent's process;
+# if either is set, the interpreter resolves modules differently from a
+# clean per-arm-venv start, and the shim's discoverability claims are
+# at risk.
+_PYTHON_ENV_VAR_RE = re.compile(
+    r"(?:^|[\s;&|])(?:export\s+)?PYTHON(?:PATH|HOME|STARTUP|USERBASE)=\S+"
+)
 _SHELL_ACTIVATION_RE = re.compile(
     r"(?:^|[\s;&|])(?:source\s+\S+|\.\s+\S+|conda\s+activate|pyenv\s+shell)"
 )
+# Wrapper commands that launch Python through a tool-managed environment.
+# The launched Python may not have sitecustomize installed (uv/poetry use
+# their own venv; conda run / pyenv exec use the named env).
+_PYTHON_WRAPPER_RE = re.compile(r"(?:^|[\s;&|])(?:uv\s+run|poetry\s+run|conda\s+run|pyenv\s+exec)")
 _ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
 _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
 
@@ -305,11 +317,32 @@ def _read_events(path: Path) -> list[dict]:
     return _parse_jsonl_strict(path, "event log")
 
 
+def _iter_tool_result_blocks(entry):
+    """Yield tool_result blocks from a stream-JSON entry.
+
+    tool_result entries live on user messages (the role="user" turn that
+    carries tool outputs back to the assistant). The block contains
+    `tool_use_id` matching the originating Read/Bash request, plus
+    `is_error` and `content` indicating success/failure.
+    """
+    if not isinstance(entry, dict):
+        return
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    yield block
+    if entry.get("type") == "tool_result":
+        yield entry
+
+
 def _scan_read_tool_guide_accesses_in_entries(
     entries: list[dict],
 ) -> dict[str, bool]:
-    """Return ``{filename: True}`` for each bundled guide file accessed via
-    Claude's Read tool in the transcript.
+    """Return ``{filename: True}`` for each bundled guide file SUCCESSFULLY
+    accessed via Claude's Read tool in the transcript.
 
     Catches the case where an agent reads `llms.txt` (or any other bundled
     guide) via the Read tool without invoking Python; the in-process shim
@@ -319,17 +352,25 @@ def _scan_read_tool_guide_accesses_in_entries(
     a guide discovery.
 
     Path-matching uses adjacent path parts (``diff_diff`` / ``guides`` /
-    ``<filename>``) rather than substring match. Substring match would
-    accept paths like ``/tmp/notdiff_diff/guides/llms.txt`` or
+    ``<filename>``). Substring match would accept paths like
+    ``/tmp/notdiff_diff/guides/llms.txt`` or
     ``/some/path/diff_diff/guides_extra/llms.txt``; the part-adjacency
     check requires the read to be in the real bundled location.
+
+    A Read tool_use is only counted as evidence if the matching
+    tool_result is non-error (``is_error`` falsy or absent). A failed,
+    denied, or hallucinated Read does not flip `opened_llms_*`. If no
+    matching tool_result is found, the request is dropped (transcript may
+    have been truncated; not counting safer than counting).
 
     Only Read-tool evidence is recognized here. Bash-level guide reads
     (e.g. ``cat llms.txt``) are still part of the broader layer-1 parsing
     deferred to a future PR.
     """
-    opened: dict[str, bool] = {}
     known_filenames = set(_VARIANT_TO_FILENAME.values())
+
+    # First pass: collect candidate Read requests that target a guide path.
+    pending: dict[str, str] = {}  # tool_use_id -> filename
     for entry in entries:
         for block in _iter_tool_use_blocks(entry):
             if block.get("name") != "Read":
@@ -341,12 +382,31 @@ def _scan_read_tool_guide_accesses_in_entries(
             if not isinstance(file_path, str) or not file_path:
                 continue
             p = Path(file_path)
-            if (
+            if not (
                 p.name in known_filenames
                 and p.parent.name == "guides"
                 and p.parent.parent.name == "diff_diff"
             ):
-                opened[p.name] = True
+                continue
+            tool_use_id = block.get("id")
+            if isinstance(tool_use_id, str):
+                pending[tool_use_id] = p.name
+
+    if not pending:
+        return {}
+
+    # Second pass: find matching tool_results; only count non-error ones.
+    opened: dict[str, bool] = {}
+    for entry in entries:
+        for result in _iter_tool_result_blocks(entry):
+            tool_use_id = result.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            filename = pending.get(tool_use_id)
+            if filename is None:
+                continue
+            if not result.get("is_error", False):
+                opened[filename] = True
     return opened
 
 
@@ -508,10 +568,14 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             # per-arm-venv python.
             has_python = bool(_PYTHON_INVOCATION_RE.search(command))
             has_path_mutation = bool(_PATH_ASSIGNMENT_RE.search(command))
+            has_python_env_var = bool(_PYTHON_ENV_VAR_RE.search(command))
             has_activation = bool(_SHELL_ACTIVATION_RE.search(command))
+            has_wrapper = bool(_PYTHON_WRAPPER_RE.search(command))
             if (
                 (has_path_mutation and has_python)
+                or (has_python_env_var and has_python)
                 or (has_activation and has_python)
+                or has_wrapper
                 or _ENV_BEFORE_PYTHON_RE.search(command)
                 or _DOT_PYTHON_RE.search(command)
             ):
@@ -590,6 +654,29 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
                 "the agent's event log disappeared post-exec and the run "
                 "is invalid for evaluation"
             )
+    # A genuine shim-produced event log always writes `session_start`
+    # before any hook events. Nonempty event log + zero session_starts
+    # indicates truncation, deletion-then-recreation, or fabrication —
+    # fail closed.
+    has_session_start = any(e.get("event") == "session_start" for e in events)
+    has_hook_events = any(
+        e.get("event")
+        in {
+            "module_import",
+            "guide_file_read",
+            "estimator_init",
+            "estimator_fit",
+            "diagnostic_call",
+            "warning_emitted",
+        }
+        for e in events
+    )
+    if has_hook_events and not has_session_start:
+        raise TelemetryMergeError(
+            "in-process event log has hook events but no session_start; "
+            "log was truncated, deleted-and-recreated, or fabricated. "
+            "Cold-start eval is invalid."
+        )
     bypass_commands = _find_python_bypass_invocations_in_entries(transcript_entries)
     if bypass_commands:
         first = bypass_commands[0]
