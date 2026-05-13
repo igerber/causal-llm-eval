@@ -456,6 +456,38 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
+def _find_unquoted_separator(s: str) -> int | None:
+    """Return the position of the first unquoted shell separator (``;``,
+    ``&``, ``|``) in ``s``, or ``None`` if every such char is inside a
+    single- or double-quoted region.
+
+    Tracks shell quoting state so that the inline ``;`` in
+    ``python -c 'import os; print(1)'`` does not falsely terminate the
+    python invocation's argument region. Single-quoted regions are
+    literal; double-quoted regions honor backslash escapes for ``"`` and
+    ``\\`` only (no command substitution / variable expansion handling,
+    which is fine here because we only need to identify quote boundaries).
+    """
+    i = 0
+    quote_char: str | None = None
+    while i < len(s):
+        c = s[i]
+        if quote_char is None:
+            if c in ("'", '"'):
+                quote_char = c
+            elif c in (";", "&", "|"):
+                return i
+        else:
+            if quote_char == '"' and c == "\\" and i + 1 < len(s):
+                # Backslash inside double quotes escapes the next char.
+                i += 2
+                continue
+            if c == quote_char:
+                quote_char = None
+        i += 1
+    return None
+
+
 def _is_redirection_token(tok: str) -> bool:
     """Return True if tok is a shell I/O redirection / pipe operator that
     terminates a python program's argv list.
@@ -527,11 +559,14 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
         interpreter = command[i:interp_end]
         if interpreter and interpreter[0] in "; & | ( )":
             interpreter = interpreter[1:]
-        # Slice the args region: from end of match to next shell separator.
+        # Slice the args region: from end of match to next UNQUOTED shell
+        # separator. A raw-regex scan would falsely terminate at a
+        # in-quoted ``;`` in commands like
+        # ``python -c 'import os; print(1)'``.
         rest_start = m.end() - 1  # include the boundary char in rest
         rest = command[rest_start:]
-        sep_match = re.search(r"[;&|]", rest)
-        args_region = rest[: sep_match.start()] if sep_match else rest
+        sep_pos = _find_unquoted_separator(rest)
+        args_region = rest[:sep_pos] if sep_pos is not None else rest
         # Tokenize args with shlex; fall back to whitespace split if shlex
         # raises (unbalanced quotes, etc.).
         try:
@@ -688,8 +723,8 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             # -S / -Sc / etc. as flag to a python invocation
             for m in _PYTHON_INVOCATION_RE.finditer(command):
                 rest = command[m.end() :]
-                sep_match = re.search(r"[;&|]", rest)
-                args_segment = rest[: sep_match.start()] if sep_match else rest
+                sep_pos = _find_unquoted_separator(rest)
+                args_segment = rest[:sep_pos] if sep_pos is not None else rest
                 if _PYTHON_BYPASS_FLAG_RE.search(args_segment):
                     bypass_commands.append(command)
                     break  # one bypass per command is enough to record

@@ -433,17 +433,34 @@ class _DiffDiffPostImportHook:
     parent is sufficient.
     """
 
+    _in_lookup = False
+
     def find_spec(self, fullname, path, target=None):
         del path, target
         if fullname != "diff_diff":
             return None
-        # Remove ourselves so the recursive find_spec doesn't loop.
+        # Reentrancy guard: the inner `importlib.util.find_spec("diff_diff")`
+        # walks `sys.meta_path` and would call us again. A class-level flag
+        # is sufficient (Python imports are serialized by the import lock).
+        # We do NOT remove ourselves from meta_path: a plain availability
+        # check via `importlib.util.find_spec("diff_diff")` does not run
+        # `exec_module`, so removing the hook would permanently lose
+        # attachment for a later real `import diff_diff`.
+        cls = type(self)
+        if cls._in_lookup:
+            return None
+        cls._in_lookup = True
         try:
-            sys.meta_path.remove(self)
-        except ValueError:
-            pass
-        spec = importlib.util.find_spec("diff_diff")
+            spec = importlib.util.find_spec("diff_diff")
+        finally:
+            cls._in_lookup = False
         if spec is None or spec.loader is None:
+            return spec
+        # Idempotency: don't re-wrap if `find_spec` returned the same loader
+        # whose `exec_module` we've already wrapped. Double-wrapping would
+        # double-fire the `module_import` event and chain `_attach_diff_diff_hooks`
+        # (which itself is idempotent, but the event would not be).
+        if getattr(spec.loader.exec_module, "_pyruntime_wrapped", False):
             return spec
         original_exec_module = spec.loader.exec_module
 
@@ -458,6 +475,7 @@ class _DiffDiffPostImportHook:
             )
             _attach_diff_diff_hooks(module)
 
+        _wrapped_exec_module._pyruntime_wrapped = True  # type: ignore[attr-defined]
         spec.loader.exec_module = _wrapped_exec_module  # type: ignore[method-assign]
         return spec
 

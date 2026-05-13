@@ -139,6 +139,46 @@ def test_meta_path_hook_records_module_import(event_log):
     ), events
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("diff_diff") is None,
+    reason="diff_diff not importable in this venv",
+)
+def test_meta_path_hook_survives_find_spec_call(event_log):
+    """R12 P0: a plain ``importlib.util.find_spec("diff_diff")``
+    availability check (without subsequent import / exec_module) must
+    NOT consume the hook. Pre-R12 the hook removed itself from
+    sys.meta_path at find_spec time and never re-added; a later real
+    ``import diff_diff`` then loaded uninstrumented (silent layer-2
+    loss). Post-R12 the hook uses a reentrancy guard and stays on
+    meta_path."""
+    for name in list(sys.modules):
+        if name == "diff_diff" or name.startswith("diff_diff."):
+            del sys.modules[name]
+    shim = _import_shim_fresh()
+
+    # Simulate the availability-check pattern: find_spec without import.
+    spec = importlib.util.find_spec("diff_diff")
+    assert spec is not None, "diff_diff not findable in test venv"
+
+    # Hook must STILL be present on meta_path after find_spec.
+    assert any(
+        isinstance(finder, shim._DiffDiffPostImportHook) for finder in sys.meta_path
+    ), "shim hook was consumed by find_spec; re-importing diff_diff would be uninstrumented"
+
+    # And a subsequent real `import` must still trigger module_import + attach.
+    import diff_diff  # noqa: F401
+
+    events = _read_events(event_log)
+    module_import_count = sum(
+        1 for e in events if e.get("event") == "module_import" and e.get("module") == "diff_diff"
+    )
+    # Exactly one module_import event: idempotency guard prevents
+    # double-fire when find_spec is called before the real import.
+    assert (
+        module_import_count == 1
+    ), f"expected exactly 1 module_import event, got {module_import_count}: {events}"
+
+
 # ---------------------------------------------------------------------------
 # Wrapper builders (exercised without importing real diff_diff)
 # ---------------------------------------------------------------------------

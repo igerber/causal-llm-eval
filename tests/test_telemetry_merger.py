@@ -1184,6 +1184,63 @@ def test_merge_layers_diff_diff_argv_strips_fd_redirection(tmp_path):
     assert record.arm == "diff_diff"
 
 
+def test_merge_layers_diff_diff_argv_handles_quoted_semicolon(tmp_path):
+    """R12 P2: `python -c 'import os; print(1)'` must NOT truncate at
+    the in-quotes ``;``. Pre-R12 the raw-regex separator scan caught it
+    and emitted argv like ``['python', '-c', "'import", 'os']``, which
+    would never match a real session_start argv. Quote-aware scanning
+    keeps the quoted region intact so shlex tokenization recovers the
+    correct argv."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-c", "import os; print(1)"])],
+    )
+    _write_transcript(transcript, ["python -c 'import os; print(1)'"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_handles_quoted_pipe(tmp_path):
+    """R12 P2: quoted ``|`` in `python -c 'a | b'` must not split args."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-c", "a | b"])],
+    )
+    _write_transcript(transcript, ["python -c 'a | b'"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_handles_double_quoted_separator(tmp_path):
+    """R12 P2: double-quoted separators are also quote-aware. Backslash
+    escapes inside double quotes are honored (so an escaped quote inside
+    a double-quoted region does not prematurely close the quote)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-c", "print('x;y')"])],
+    )
+    _write_transcript(transcript, ["python -c \"print('x;y')\""])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_still_splits_unquoted_semicolon(tmp_path):
+    """R12 P2 regression-of-regression: the quote-aware scan must still
+    truncate at an UNQUOTED ``;`` (otherwise we'd accept `python a.py;
+    rm -rf /` as `python a.py rm -rf /`)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "a.py"])],
+    )
+    _write_transcript(transcript, ["python a.py; echo done"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
 # ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
