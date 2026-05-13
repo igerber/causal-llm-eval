@@ -150,6 +150,61 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
+def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
+    """Parse a JSONL file strictly; raise TelemetryMergeError on malformed lines.
+
+    Shared parser used by both layer-2 event-log reads and layer-1 transcript
+    reads. Empty lines are skipped; non-JSON content raises. The ``label``
+    string identifies the layer/file in the error message.
+
+    An empty (0-byte) file is permitted and returns ``[]``.
+    """
+    events: list[dict] = []
+    with open(path) as f:
+        for line_num, raw in enumerate(f, start=1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                events.append(json.loads(stripped))
+            except json.JSONDecodeError as e:
+                raise TelemetryMergeError(
+                    f"malformed JSON in {label} {path} at line {line_num}: {e}"
+                ) from e
+    return events
+
+
+def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None:
+    """Fail-closed preflight: layer-1 and layer-3 capture files must exist
+    AND the transcript must be well-formed JSONL.
+
+    The three-layer telemetry contract requires the stream-JSON transcript
+    (layer 1) and the CLI stderr capture (layer 3) to be present for every
+    run; missing files mean the runner did not finish capturing or the
+    output directory was tampered with. Either way, the per-run record is
+    not safe to consume.
+
+    Empty (0-byte) files are accepted — a trivial agent response can produce
+    an empty stderr log, and a vacuous transcript is rare but legitimate.
+    Non-JSON content in the transcript raises (the runner's contract is that
+    every line of `transcript.jsonl` is a single JSON object).
+    """
+    if not stream_json_path.exists():
+        raise TelemetryMergeError(
+            f"stream-JSON transcript missing at {stream_json_path}; "
+            f"layer-1 capture incomplete, per-run record cannot be validated"
+        )
+    if not stderr_path.exists():
+        raise TelemetryMergeError(
+            f"CLI stderr capture missing at {stderr_path}; "
+            f"layer-3 capture incomplete, per-run record cannot be validated"
+        )
+    # Validate transcript is parseable JSONL. Discard the parsed entries
+    # here; `_count_python_invocations` re-reads later (small redundant
+    # cost; clearer than threading parsed state through the call chain).
+    _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+
+
 def _read_events(path: Path) -> list[dict]:
     """Parse the in-process event log into a list of dicts.
 
@@ -162,47 +217,29 @@ def _read_events(path: Path) -> list[dict]:
             f"in-process event log not found at {path}; "
             f"the runner should have written a telemetry_missing sentinel"
         )
-    events: list[dict] = []
-    with open(path) as f:
-        for line_num, raw in enumerate(f, start=1):
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            try:
-                events.append(json.loads(stripped))
-            except json.JSONDecodeError as e:
-                raise TelemetryMergeError(
-                    f"malformed JSON in event log {path} at line {line_num}: {e}"
-                ) from e
-    return events
+    return _parse_jsonl_strict(path, "event log")
 
 
 def _count_python_invocations(stream_json_path: Path) -> int:
     """Return the number of Bash tool calls in the transcript whose command
     contains a python invocation.
 
-    Heuristic: scans each line of the stream-JSON transcript for ``Bash``
-    tool_use blocks and matches the command field against
-    ``_PYTHON_INVOCATION_RE``. False negatives (we miss some invocations)
-    are tolerable — they just mean the cross-check is more lenient.
-    False positives must be avoided because they cause spurious
-    ``TelemetryMergeError`` on otherwise-valid runs.
+    Parses each line of the stream-JSON transcript strictly: malformed JSONL
+    raises ``TelemetryMergeError`` via the shared `_parse_jsonl_strict`
+    helper, consistent with the layer-2 event-log parser. Existence of the
+    file is the caller's responsibility (`_validate_layer_artifacts` runs
+    first in `merge_layers`).
+
+    The cross-check the result feeds is intentionally minimal — false
+    negatives (we miss some invocations) are tolerable, but false positives
+    (counting non-invocations) must not cause spurious shim-never-loaded
+    errors. The word-boundary regex in `_PYTHON_INVOCATION_RE` and the
+    structural `tool_use`/Bash/command match guard against both.
     """
-    if not stream_json_path.exists():
-        return 0
+    entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     count = 0
-    with open(stream_json_path) as f:
-        for raw in f:
-            stripped = raw.strip()
-            if not stripped:
-                continue
-            try:
-                entry = json.loads(stripped)
-            except json.JSONDecodeError:
-                # Transcript may have non-JSON lines (CLI banners, etc.);
-                # skip them rather than fail.
-                continue
-            count += _python_invocations_in_entry(entry)
+    for entry in entries:
+        count += _python_invocations_in_entry(entry)
     return count
 
 
@@ -384,6 +421,7 @@ def merge_layers(
     - Runner-written ``telemetry_missing`` sentinel present.
     - Cross-layer inconsistency (python invoked but shim never loaded).
     """
+    _validate_layer_artifacts(stream_json_path, stderr_path)
     events = _read_events(in_process_events_path)
     _validate_shim_loaded(events, stream_json_path)
     if arm == "diff_diff":

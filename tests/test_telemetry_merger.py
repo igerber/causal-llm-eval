@@ -200,6 +200,39 @@ def test_merge_layers_diff_diff_raises_on_missing_event_log_file(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_raises_on_missing_transcript(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript.unlink()  # remove layer-1 capture
+    with pytest.raises(TelemetryMergeError, match="stream-JSON transcript missing"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_malformed_transcript(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript.write_text("{not valid json\n")
+    with pytest.raises(TelemetryMergeError, match="malformed JSON.*stream-JSON"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_missing_stderr(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    stderr_log.unlink()  # remove layer-3 capture
+    with pytest.raises(TelemetryMergeError, match="stderr capture missing"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_accepts_empty_transcript_and_stderr(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    # transcript and stderr_log are already 0-byte (touched by _make_paths).
+    # Zero-byte capture is acceptable (trivial agent responses produce these).
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
 # ---------------------------------------------------------------------------
 # statsmodels arm
 # ---------------------------------------------------------------------------

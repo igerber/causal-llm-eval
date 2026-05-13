@@ -282,10 +282,12 @@ _diff_diff_guides_dir: str | None = None
 def _path_is_diff_diff_guide(path) -> tuple[bool, str | None]:
     """Return (True, basename) if `path` is a bundled diff_diff guide file.
 
-    Checks (a) the path ends with one of the four known guide filenames, AND
-    (b) the path lies under the captured `_diff_diff_guides_dir`. Both checks
-    are necessary so non-guide opens (data files, source files) are not
-    recorded.
+    Checks (a) the path resolves to one of the four known guide filenames,
+    AND (b) the resolved path lies under the captured `_diff_diff_guides_dir`
+    via normalized containment (not raw startswith). Both checks are
+    necessary so non-guide opens (data files, source files) are not recorded
+    and sibling directories sharing a prefix (e.g. `.../guides_extra/`)
+    cannot overmatch.
     """
     try:
         path_str = os.fspath(path)
@@ -293,10 +295,16 @@ def _path_is_diff_diff_guide(path) -> tuple[bool, str | None]:
         return False, None
     if _diff_diff_guides_dir is None:
         return False, None
-    if not path_str.startswith(_diff_diff_guides_dir):
+    try:
+        from pathlib import Path as _Path
+
+        resolved = _Path(path_str).resolve()
+        guides_dir = _Path(_diff_diff_guides_dir).resolve()
+        resolved.relative_to(guides_dir)
+    except (ValueError, OSError):
         return False, None
     for filename in _GUIDE_FILENAMES:
-        if path_str.endswith(filename):
+        if resolved.name == filename:
             return True, filename
     return False, None
 
@@ -326,16 +334,22 @@ def _install_open_hook() -> None:
 
     @functools.wraps(original_open)
     def _pyruntime_open(file, *args, **kwargs):
-        matched, filename = _path_is_diff_diff_guide(file)
-        if matched:
-            _safe_write(
-                {
-                    "event": "guide_file_read",
-                    "via": "open",
-                    "filename": filename,
-                    "ts": _utc_iso_now(),
-                }
-            )
+        # Only record reads. Skip writes/appends/exclusive-creates, which
+        # would otherwise produce false-positive guide-discovery telemetry
+        # (a write to a guide path is not a read of guide content).
+        mode = args[0] if args else kwargs.get("mode", "r")
+        is_read = isinstance(mode, str) and "w" not in mode and "a" not in mode and "x" not in mode
+        if is_read:
+            matched, filename = _path_is_diff_diff_guide(file)
+            if matched:
+                _safe_write(
+                    {
+                        "event": "guide_file_read",
+                        "via": "open",
+                        "filename": filename,
+                        "ts": _utc_iso_now(),
+                    }
+                )
         return original_open(file, *args, **kwargs)
 
     _pyruntime_open._pyruntime_wrapped = True  # type: ignore[attr-defined]
