@@ -198,7 +198,39 @@ _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
 # `-c` short flag for inline code). Lowercase `-s` (skip user site) does
 # NOT bypass sitecustomize and is correctly ignored (regex requires
 # uppercase `S` specifically).
-_PYTHON_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*S[A-Za-z]*(?:[\s=]|$)")
+def _argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
+    """Return True if any pre-script Python interpreter short-flag token
+    contains uppercase ``S`` (the sitecustomize-disabling flag).
+
+    Walks shlex-tokenized argv left-to-right. A token starting with a
+    single ``-`` and at least one alphabetic character is a Python
+    short-flag combination (``-S``, ``-Sc``, ``-IS``, etc.); scan it for
+    ``S``. A token starting with ``--`` is a long flag and ignored. The
+    first non-flag entry (the script path, the ``-`` stdin marker, or any
+    other argv element) ends the interpreter-flag region. A ``-S`` after
+    that point is ``sys.argv`` for the script, not an interpreter flag,
+    and does not disable sitecustomize.
+
+    Operating on tokens (not raw text) makes the detector quote-aware:
+    a ``-S`` substring inside a quoted ``-c`` code argument (e.g.
+    ``python -c "print(' -S ')"``) lives inside the single token
+    ``print(' -S ')``, which does not start with ``-``, so the walk
+    terminates without flagging.
+    """
+    for tok in args_tokens:
+        if not tok:
+            continue
+        if tok == "-":  # stdin marker, not a flag
+            return False
+        if tok.startswith("--"):
+            continue  # long flag; cannot disable sitecustomize
+        if tok.startswith("-"):
+            if "S" in tok[1:]:
+                return True
+            continue
+        # First non-flag entry; interpreter flag region ends here.
+        return False
+    return False
 
 
 def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
@@ -242,7 +274,8 @@ _SHIM_WRITE_FAILURE_MARKER = "[pyruntime] cannot write event"
 
 
 def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
-    """Return True if stderr contains the shim's event-write failure marker.
+    """Return True if outer Claude CLI stderr contains the shim's event-write
+    failure marker.
 
     The shim's hook wrappers catch transient OSError on event writes so the
     agent's diff_diff call still completes (avoids aborting on telemetry
@@ -250,6 +283,13 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
     `[pyruntime] cannot write event to <path>: <err>` to stderr. The merger
     looks for that marker post-hoc: presence means at least one event was
     dropped, so the per-run record may be silently incomplete.
+
+    NOTE: this only covers stderr from the outer ``claude --bare`` process.
+    When the shim runs inside an agent-invoked python subprocess (the
+    common case), its stderr is captured into the corresponding Bash
+    ``tool_result`` block in the stream-JSON transcript, not into
+    ``cli_stderr.log``. Use ``_scan_tool_results_for_shim_failures`` for
+    that path; both are checked in ``merge_layers``.
     """
     try:
         content = stderr_path.read_text(errors="replace")
@@ -258,6 +298,41 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
         # capture problem worth surfacing.
         return True
     return _SHIM_WRITE_FAILURE_MARKER in content
+
+
+def _scan_tool_results_for_shim_failures(transcript_entries: list[dict]) -> bool:
+    """Return True if any Bash ``tool_result`` content contains the shim's
+    event-write failure marker.
+
+    Most shim event-write failures occur inside an agent-spawned python
+    subprocess (Claude's Bash tool runs the python child whose stderr is
+    captured by Claude into the matching ``tool_result`` block). The
+    outer ``cli_stderr.log`` only carries stderr from the ``claude
+    --bare`` process itself, which rarely sees inner subprocess output,
+    so a marker emitted by the shim is invisible to the layer-3 scan.
+
+    Iterating ``tool_result`` blocks closes that gap. Stringified content
+    (Claude sometimes returns a single string) and list-shaped content
+    (one or more text blocks) are both supported. A match is enough to
+    fail closed; per-block granularity is not needed because the
+    per-run record cannot be trusted once a single event is known to
+    have been dropped.
+    """
+    for entry in transcript_entries:
+        for block in _iter_tool_result_blocks(entry):
+            content = block.get("content")
+            if isinstance(content, str):
+                if _SHIM_WRITE_FAILURE_MARKER in content:
+                    return True
+            elif isinstance(content, list):
+                for sub in content:
+                    if isinstance(sub, dict):
+                        text = sub.get("text") or sub.get("content") or ""
+                        if isinstance(text, str) and _SHIM_WRITE_FAILURE_MARKER in text:
+                            return True
+                    elif isinstance(sub, str) and _SHIM_WRITE_FAILURE_MARKER in sub:
+                        return True
+    return False
 
 
 def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list[dict]:
@@ -456,6 +531,57 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Remove heredoc bodies (text between ``<<TAG`` and a closing ``TAG``
+    line) from a Bash command string.
+
+    Heredoc bodies are stdin content for the receiving command, not part
+    of any argv, so they must not be scanned for python invocations or
+    bypass flags. For example, ``cat <<'EOF'\\npython x.py\\nEOF`` is a
+    cat-creates-file pattern; the inner ``python x.py`` is data, not an
+    invocation.
+
+    Supports the ``<<TAG`` / ``<<-TAG`` / ``<<'TAG'`` / ``<<"TAG"`` forms.
+    The closing tag matches a line consisting of the tag with optional
+    leading whitespace (mandatory for the ``<<-`` form, optional in our
+    detection because Bash strips leading tabs only).
+
+    Multiple heredocs in a single command (rare, e.g.
+    ``cat <<A; cat <<B``) are handled by scanning iteratively.
+    Malformed heredocs (no closing tag) are treated as "body extends to
+    end-of-command" and stripped entirely from the opener onward.
+    """
+    out_parts: list[str] = []
+    pos = 0
+    while pos < len(command):
+        m = _HEREDOC_OPEN_RE.search(command, pos)
+        if not m:
+            out_parts.append(command[pos:])
+            break
+        # Keep everything up to and including the heredoc opener token; the
+        # opener itself is fine to scan (it's just a redirection operator).
+        out_parts.append(command[pos : m.end()])
+        tag = m.group(2)
+        # Body starts after the next newline (if any).
+        body_start_match = re.search(r"\n", command[m.end() :])
+        if body_start_match is None:
+            # No newline after opener: malformed; drop the rest.
+            break
+        body_start = m.end() + body_start_match.end()
+        # Look for the closing tag on its own line.
+        close_re = re.compile(rf"\n[ \t]*{re.escape(tag)}(?:\n|$)")
+        close_match = close_re.search(command, body_start)
+        if close_match is None:
+            # No closing tag: drop body to end.
+            break
+        # Skip the body and the closing tag; resume after.
+        pos = close_match.end()
+    return "".join(out_parts)
+
+
 def _find_unquoted_separator(s: str) -> int | None:
     """Return the position of the first unquoted shell separator (``;``,
     ``&``, ``|``) in ``s``, or ``None`` if every such char is inside a
@@ -544,21 +670,49 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
     (``>``, ``<``, ``<<``, ``2>&1``, etc.) are stripped because shell
     redirection is not part of the Python program's argv. The interpreter
     token preserves any absolute path prefix (e.g. `/usr/bin/python3`).
+
+    Heredoc bodies are stripped before scanning so that text inside
+    ``cat <<'EOF' ... EOF`` (a common agent file-creation pattern) is
+    not falsely matched as a python invocation.
     """
+    command = _strip_heredoc_bodies(command)
     invocations: list[list[str]] = []
     for m in _PYTHON_INVOCATION_RE.finditer(command):
-        # Walk left to recover any absolute-path prefix on the interpreter
-        # token (e.g. `/usr/bin/python3`).
         match_start = m.start()
-        i = match_start
-        while i > 0 and command[i - 1] not in (" ", "\t", ";", "&", "|", "(", ")"):
-            i -= 1
-        # The trailing-boundary char (space, <, etc.) is part of m.group(0);
-        # the interpreter token ends one char before m.end().
+        boundary_char = m.group(0)[0] if m.group(0) else ""
+        # interp_end is the position right after the python token (exclusive):
+        # m.end() points one past the trailing boundary char (space, `<`, etc.),
+        # so the python token ends at m.end() - 1.
         interp_end = m.end() - 1
-        interpreter = command[i:interp_end]
-        if interpreter and interpreter[0] in "; & | ( )":
-            interpreter = interpreter[1:]
+        if boundary_char == "/":
+            # Absolute path: walk left to recover the rest of the path
+            # (e.g. `/usr/bin/python3`). Stop at any shell separator,
+            # whitespace, redirection, or `=` (which marks an inline
+            # ``KEY=value`` env-var assignment ending and is not a valid
+            # interpreter path char).
+            i = match_start
+            while i > 0 and command[i - 1] not in (
+                " ",
+                "\t",
+                ";",
+                "&",
+                "|",
+                "(",
+                ")",
+                "<",
+                ">",
+                "=",
+            ):
+                i -= 1
+            interp_start = i
+        elif boundary_char in (" ", "\t", ";", "&", "|", "(", ")"):
+            # Boundary char is a separator; interpreter starts after it.
+            interp_start = match_start + 1
+        else:
+            # ``^`` start-of-command boundary (zero-width); m.start() is
+            # already the first char of the python token.
+            interp_start = match_start
+        interpreter = command[interp_start:interp_end]
         # Slice the args region: from end of match to next UNQUOTED shell
         # separator. A raw-regex scan would falsely terminate at a
         # in-quoted ``;`` in commands like
@@ -698,10 +852,15 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             tool_input = block.get("input") or block.get("tool_input")
             if not isinstance(tool_input, dict):
                 continue
-            command = tool_input.get("command", "")
-            if not isinstance(command, str):
+            raw_command = tool_input.get("command", "")
+            if not isinstance(raw_command, str):
                 continue
-            # PATH mutation / activation script / env / ./python — any of
+            # Strip heredoc bodies first: text inside ``<<EOF ... EOF`` is
+            # data on the receiving command's stdin, not a python invocation,
+            # PATH override, or `-S` bypass even if the literal substrings
+            # appear in the body.
+            command = _strip_heredoc_bodies(raw_command)
+            # PATH mutation / activation script / env / ./python: any of
             # these in a command containing a python invocation triggers
             # fail-closed because the resolved interpreter may not be the
             # per-arm-venv python.
@@ -720,12 +879,12 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             ):
                 bypass_commands.append(command)
                 continue
-            # -S / -Sc / etc. as flag to a python invocation
-            for m in _PYTHON_INVOCATION_RE.finditer(command):
-                rest = command[m.end() :]
-                sep_pos = _find_unquoted_separator(rest)
-                args_segment = rest[:sep_pos] if sep_pos is not None else rest
-                if _PYTHON_BYPASS_FLAG_RE.search(args_segment):
+            # -S / -Sc / etc. as a python interpreter flag (NOT inside
+            # quoted code, NOT after the script argument). The argv-walking
+            # check operates on shlex-tokenized argv so a -S substring
+            # inside a quoted -c code argument cannot false-positive.
+            for argv in _extract_python_invocations_from_command(command):
+                if _argv_contains_bypass_flag(argv[1:]):
                     bypass_commands.append(command)
                     break  # one bypass per command is enough to record
     return bypass_commands
@@ -948,7 +1107,9 @@ def merge_layers(
     - In-process event log missing or malformed.
     - Runner-written ``telemetry_missing`` sentinel present.
     - Empty or non-object transcript.
-    - Shim event-write failure marker in stderr.
+    - Shim event-write failure marker in outer cli_stderr.log OR in any
+      Bash tool_result content (the agent's python subprocess stderr is
+      captured into tool_result.content, not into cli_stderr.log).
     - Python bypass flag (`-S`) in any transcript command.
     - Stream-JSON transcript missing a terminal successful `result` entry
       (truncated capture).
@@ -966,6 +1127,13 @@ def merge_layers(
             f"shim event-write failure marker present in {stderr_path}; "
             f"at least one layer-2 event was dropped mid-run and the "
             f"per-run record may be silently incomplete"
+        )
+    if _scan_tool_results_for_shim_failures(transcript_entries):
+        raise TelemetryMergeError(
+            "shim event-write failure marker present in a Bash tool_result "
+            "(agent python subprocess stderr); at least one layer-2 event "
+            "was dropped mid-run and the per-run record may be silently "
+            "incomplete"
         )
     events = _read_events(in_process_events_path)
     _validate_shim_loaded(events, transcript_entries)

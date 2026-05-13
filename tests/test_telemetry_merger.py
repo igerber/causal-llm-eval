@@ -1242,6 +1242,160 @@ def test_merge_layers_diff_diff_argv_still_splits_unquoted_semicolon(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R13 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_raises_on_tool_result_shim_failure_marker(tmp_path):
+    """R13 P0: the shim's ``[pyruntime] cannot write event`` marker is
+    emitted from the agent-spawned python subprocess and ends up inside
+    the matching Bash ``tool_result.content``, NOT in outer
+    ``cli_stderr.log``. Pre-R13 the merger only scanned cli_stderr, so a
+    layer-2 event-write failure during agent execution was silently
+    invisible and the per-run record could emit false-False guide flags.
+    Post-R13 the merger scans both."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    # Build a transcript whose Bash tool_result contains the marker.
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": "bash_1",
+                        "input": {"command": "echo hi"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "bash_1",
+                        "is_error": False,
+                        "content": (
+                            "stdout: hi\n"
+                            "stderr: [pyruntime] cannot write event to "
+                            "/tmp/run123/events.jsonl: [Errno 28] No space left on device\n"
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    _write_transcript_entries(transcript, transcript_entries)
+    with pytest.raises(TelemetryMergeError, match="shim event-write failure marker.*tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_tool_result_marker_in_list_content(tmp_path):
+    """R13 P0 (variant): tool_result content can be a list of text blocks
+    instead of a single string. The scan must walk into list-shaped
+    content too."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "bash_1",
+                        "is_error": False,
+                        "content": [
+                            {"type": "text", "text": "some stdout"},
+                            {
+                                "type": "text",
+                                "text": "[pyruntime] cannot write event to events.jsonl: ...",
+                            },
+                        ],
+                    }
+                ],
+            },
+        },
+    ]
+    _write_transcript_entries(transcript, transcript_entries)
+    with pytest.raises(TelemetryMergeError, match="shim event-write failure marker.*tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_heredoc_body_not_treated_as_invocation(tmp_path):
+    """R13 P2: a heredoc body like ``cat <<'EOF'\\npython x.py\\nEOF`` is
+    cat-creates-file data, not a python invocation. Pre-R13 the regex
+    scanned the body and treated the inner ``python x.py`` as a
+    transcript-visible python invocation, requiring (and failing to
+    find) a session_start. Post-R13 the body is stripped before
+    scanning."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])  # no python invocations expected
+    _write_transcript(
+        transcript,
+        ["cat <<'EOF' > script.py\npython x.py\nimport diff_diff\nEOF"],
+    )
+    # No python invocations should be detected from the heredoc body; merger
+    # accepts the run with all-False discoverability.
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_quoted_dash_S_in_python_c_not_bypass(tmp_path):
+    """R13 P2: ``python -c "print(' -S ')"`` contains the substring
+    ``-S`` only inside the quoted code argument. That is not an
+    interpreter flag and must not be flagged as a sitecustomize-bypass.
+    Pre-R13 the raw-text bypass regex caught it. Post-R13 the bypass
+    detection walks shlex-tokenized argv and stops at the first non-flag
+    token (the quoted code string)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-c", "print(' -S ')"])],
+    )
+    _write_transcript(transcript, ["python -c \"print(' -S ')\""])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_bypass_S_after_script_is_not_bypass(tmp_path):
+    """R13 P2 (variant): ``python script.py -S`` does NOT bypass
+    sitecustomize: once the python interpreter sees the script argument,
+    everything after is ``sys.argv`` for the script. The argv-walking
+    bypass detector stops at the first non-flag token, so the trailing
+    ``-S`` is correctly ignored."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py", "-S"])],
+    )
+    _write_transcript(transcript, ["python script.py -S"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_inline_env_assignment_attributes(tmp_path):
+    """R13 P2 (variant): ``MPLBACKEND=Agg python script.py`` should
+    attribute normally. The env-var prefix is shell-level and not part of
+    ``sys.orig_argv``, so the visible argv is just ``[python, script.py]``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(transcript, ["MPLBACKEND=Agg python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+# ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
 
