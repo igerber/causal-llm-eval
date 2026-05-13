@@ -28,6 +28,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so default-model drift cannot affect runs.
 - 35 unit tests for `harness.runner` and `harness.probe`, plus 2 live tests
   gated by `@pytest.mark.live`.
+- In-process telemetry layer-2 hooks (`harness/sitecustomize_template.py`):
+  guide-file reads via `get_llm_guide` (wrapped at both
+  `diff_diff.get_llm_guide` and `diff_diff._guides_api.get_llm_guide` to close
+  the submodule-direct-import bypass), guide-file reads via `builtins.open`
+  and `io.open` (catches the `importlib.resources.files(...).read_text()` path
+  that pathlib routes through `io.open`), fit-time `warnings.warn` filtered
+  to `diff_diff.*`, estimator class instantiations and fits (21 classes
+  including HonestDiD, PreTrendsPower, and LinearRegression), diagnostic
+  function calls (5 functions), `session_start` event written at shim load.
+  All hooks use `functools.wraps` and `_pyruntime_wrapped` idempotency
+  markers; wrappers fail-open on transient `OSError` from the event log so
+  the agent's run is not aborted by telemetry hiccups.
+- `harness.telemetry.merge_layers()` real implementation: parses
+  `in_process_events.jsonl` plus a layer-1 (`transcript.jsonl`)
+  python-invocation count cross-check; raises new `TelemetryMergeError` on
+  missing event log, malformed JSONL, the runner-written `telemetry_missing`
+  sentinel, or python-invoked-but-shim-never-loaded. Returns a populated
+  `TelemetryRecord` honoring arm-aware sentinel semantics for both
+  `arm="diff_diff"` (bool flags) and `arm="statsmodels"` (None sentinels on
+  guide fields; bool/tuple zeros on the rest until the statsmodels arm
+  instrumentation lands).
+- 16 unit tests in `tests/test_sitecustomize.py` covering hook builders,
+  meta_path finder, `_guides_api` bypass closure, warning filter, fail-open
+  contract, idempotency, bidirectional regression guards against
+  `diff_diff.__all__`, and the 500-char message cap.
+- 17 unit tests in `tests/test_telemetry_merger.py` covering merger happy
+  paths (diff_diff + statsmodels), fail-closed inputs (missing file,
+  malformed JSONL, sentinel, python-invoked-without-session_start), 0-byte
+  events.jsonl, variant deduplication, open-vs-get_llm_guide flag
+  attribution, python-invocation word-boundary regex including compound
+  shell commands, and `_VARIANT_TO_FILENAME` dict-equality against
+  `diff_diff._guides_api._VARIANT_TO_FILE`.
+- `diff-diff>=3.3.2` added to `dev` extras in `pyproject.toml` so the
+  bidirectional regression tests actually run in CI rather than skipping.
 
 ### Changed
 - Renamed in-process telemetry env var from `CAUSAL_LLM_EVAL_EVENT_LOG` to
@@ -98,3 +132,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).
+- `harness/telemetry.py` layer-3 docstring no longer claims to capture
+  Python warnings (layer 2 does that via the `showwarning` override); layer
+  3 is CLI-level stderr capture only.
+- `harness/sitecustomize_template.py` is no longer a skeleton: implements
+  the full diff_diff hook surface per the contract in its module docstring.

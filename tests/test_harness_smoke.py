@@ -8,8 +8,17 @@ module surface stays stable.
 from __future__ import annotations
 
 
-def test_harness_imports():
-    """Harness package imports without error and exposes expected modules."""
+def test_harness_imports(tmp_path, monkeypatch):
+    """Harness package imports without error and exposes expected modules.
+
+    `harness.sitecustomize_template` writes a `session_start` event at module
+    load (fail-closed contract: missing `_PYRUNTIME_EVENT_LOG` raises). The
+    test sets a tmp event-log path so the import succeeds.
+    """
+    event_log = tmp_path / "events.jsonl"
+    event_log.touch()
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(event_log))
+
     import harness  # noqa: F401
     from harness import (  # noqa: F401
         extractor,

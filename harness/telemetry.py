@@ -12,16 +12,22 @@ Layer 2 - In-process Python instrumentation (the discoverability ground truth):
     Python, not Claude's Read tool). See `harness/sitecustomize_template.py`.
 
 Layer 3 - Subprocess stderr capture:
-    Captures Python warnings and any other stderr the agent's Python processes
-    emit. Cross-checked with the in-process warning log.
+    Captures CLI-level errors emitted by `claude --bare` and any other stderr
+    the agent's process writes. Python-level warnings from the agent's
+    diff_diff calls are captured by layer 2 via the `showwarning` override,
+    not here.
 
-Skeleton only.
+The merger (`merge_layers`) parses layers 1+2 and emits a per-run
+`TelemetryRecord` with arm-aware sentinel semantics.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -108,6 +114,259 @@ class TelemetryRecord:
                     )
 
 
+class TelemetryMergeError(RuntimeError):
+    """Raised when ``merge_layers`` cannot produce a valid TelemetryRecord.
+
+    Distinct cases:
+    - In-process event log file missing entirely.
+    - Malformed line in the event log (non-JSON).
+    - Runner-written ``telemetry_missing`` sentinel present (post-exec the
+      agent's event log disappeared; the runner already wrote the sentinel
+      and downgraded exit_code to -2).
+    - Cross-layer inconsistency: agent's transcript shows python invocations
+      but the in-process layer has no ``session_start`` event (shim never
+      loaded; cold-start eval is invalid).
+
+    All four cases are fail-closed; the merger does not silently downgrade
+    to a "no agent activity" record.
+    """
+
+
+# diff_diff bundled guide files mapped to the variant string `get_llm_guide`
+# accepts. Verified against `diff_diff/_guides_api.py:7-12`. Key ordering
+# follows the source for diff-friendliness.
+_VARIANT_TO_FILENAME: dict[str, str] = {
+    "concise": "llms.txt",
+    "full": "llms-full.txt",
+    "practitioner": "llms-practitioner.txt",
+    "autonomous": "llms-autonomous.txt",
+}
+
+
+# Word-boundary regex for python-invocation detection in the layer-1
+# cross-check. Matches `python`, `python3`, `python3.11`, etc. at a token
+# boundary so compound shell commands (`pip install foo && python script.py`)
+# are caught and false-positives like `/opt/python/` are not.
+_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()])python(?:3(?:\.\d+)?)?(?:\s|$)")
+
+
+def _read_events(path: Path) -> list[dict]:
+    """Parse the in-process event log into a list of dicts.
+
+    Raises ``TelemetryMergeError`` if the file is missing or contains a
+    non-JSON line. An empty (0-byte) file is permitted and returns ``[]``;
+    the validity check is the caller's responsibility.
+    """
+    if not path.exists():
+        raise TelemetryMergeError(
+            f"in-process event log not found at {path}; "
+            f"the runner should have written a telemetry_missing sentinel"
+        )
+    events: list[dict] = []
+    with open(path) as f:
+        for line_num, raw in enumerate(f, start=1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                events.append(json.loads(stripped))
+            except json.JSONDecodeError as e:
+                raise TelemetryMergeError(
+                    f"malformed JSON in event log {path} at line {line_num}: {e}"
+                ) from e
+    return events
+
+
+def _count_python_invocations(stream_json_path: Path) -> int:
+    """Return the number of Bash tool calls in the transcript whose command
+    contains a python invocation.
+
+    Heuristic: scans each line of the stream-JSON transcript for ``Bash``
+    tool_use blocks and matches the command field against
+    ``_PYTHON_INVOCATION_RE``. False negatives (we miss some invocations)
+    are tolerable — they just mean the cross-check is more lenient.
+    False positives must be avoided because they cause spurious
+    ``TelemetryMergeError`` on otherwise-valid runs.
+    """
+    if not stream_json_path.exists():
+        return 0
+    count = 0
+    with open(stream_json_path) as f:
+        for raw in f:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                # Transcript may have non-JSON lines (CLI banners, etc.);
+                # skip them rather than fail.
+                continue
+            count += _python_invocations_in_entry(entry)
+    return count
+
+
+def _python_invocations_in_entry(entry: Any) -> int:
+    """Count python invocations in a single stream-JSON entry.
+
+    The stream-JSON format nests tool_use blocks under
+    ``message.content[*]`` for assistant turns. We walk content blocks
+    looking for ``{"type": "tool_use", "name": "Bash", "input": {"command": "..."}}``.
+    Robust to schema variants: also checks shallow ``tool_input`` field.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    count = 0
+    # Shape 1: assistant message with content array
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                count += _count_python_in_tool_use_block(block)
+    # Shape 2: shallow tool_use (some schema variants emit this at top level)
+    if entry.get("type") == "tool_use":
+        count += _count_python_in_tool_use_block(entry)
+    return count
+
+
+def _count_python_in_tool_use_block(block: Any) -> int:
+    """Return 1 if `block` is a Bash tool_use with a python invocation."""
+    if not isinstance(block, dict):
+        return 0
+    if block.get("type") != "tool_use":
+        return 0
+    if block.get("name") != "Bash":
+        return 0
+    tool_input = block.get("input") or block.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        return 0
+    return 1 if _PYTHON_INVOCATION_RE.search(command) else 0
+
+
+def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
+    """Cross-layer fail-closed check before building the record.
+
+    Three cases:
+    1. ``telemetry_missing`` sentinel present (written by the runner when
+       the event log disappeared post-exec): raise.
+    2. Zero ``session_start`` events AND transcript shows python
+       invocations: shim never loaded inside the agent's Python subprocess
+       — eval invalid; raise.
+    3. Else accept (legitimate states: shim loaded + agent activity, OR
+       shim loaded + no Python at all, OR no Python + no session_start).
+    """
+    for event in events:
+        if event.get("event") == "telemetry_missing":
+            raise TelemetryMergeError(
+                "telemetry_missing sentinel present in event log; "
+                "the agent's event log disappeared post-exec and the run "
+                "is invalid for evaluation"
+            )
+    session_start_count = sum(1 for e in events if e.get("event") == "session_start")
+    if session_start_count == 0:
+        python_count = _count_python_invocations(stream_json_path)
+        if python_count > 0:
+            raise TelemetryMergeError(
+                f"agent transcript shows {python_count} python invocation(s) "
+                f"but in-process event log has no session_start event; "
+                f"sitecustomize shim never loaded in the agent's subprocess. "
+                f"Cold-start eval is invalid."
+            )
+
+
+def _build_diff_diff_record(
+    events: list[dict],
+    stream_json_path: Path,
+    in_process_events_path: Path,
+    stderr_path: Path,
+) -> TelemetryRecord:
+    """Construct a TelemetryRecord for arm='diff_diff' from parsed events.
+
+    Discoverability fields default to ``False`` (the diff-diff arm requires
+    explicit bool encoding per `TelemetryRecord.__post_init__`). Any event
+    flips its field to ``True``.
+    """
+    guide_reads = [e for e in events if e.get("event") == "guide_file_read"]
+    warnings_emitted = [e for e in events if e.get("event") == "warning_emitted"]
+    estimator_inits = [e for e in events if e.get("event") == "estimator_init"]
+    estimator_fits = [e for e in events if e.get("event") == "estimator_fit"]
+    diagnostic_calls = [e for e in events if e.get("event") == "diagnostic_call"]
+
+    opened = {filename: False for filename in _VARIANT_TO_FILENAME.values()}
+    variants_seen: set[str] = set()
+    for r in guide_reads:
+        via = r.get("via")
+        if via == "get_llm_guide":
+            variant = r.get("variant", "")
+            if variant in _VARIANT_TO_FILENAME:
+                variants_seen.add(variant)
+                opened[_VARIANT_TO_FILENAME[variant]] = True
+        elif via == "open":
+            filename = r.get("filename", "")
+            for known in opened:
+                if filename.endswith(known):
+                    opened[known] = True
+
+    return TelemetryRecord(
+        arm="diff_diff",
+        stream_json_path=stream_json_path,
+        in_process_events_path=in_process_events_path,
+        stderr_path=stderr_path,
+        opened_llms_txt=opened["llms.txt"],
+        opened_llms_practitioner=opened["llms-practitioner.txt"],
+        opened_llms_autonomous=opened["llms-autonomous.txt"],
+        opened_llms_full=opened["llms-full.txt"],
+        called_get_llm_guide=any(r.get("via") == "get_llm_guide" for r in guide_reads),
+        get_llm_guide_variants=tuple(sorted(variants_seen)),
+        saw_fit_time_warning=bool(warnings_emitted),
+        diagnostic_methods_invoked=tuple(
+            sorted({e["name"] for e in diagnostic_calls if "name" in e})
+        ),
+        estimator_classes_instantiated=tuple(
+            sorted({e["class"] for e in (estimator_inits + estimator_fits) if "class" in e})
+        ),
+    )
+
+
+def _build_statsmodels_record(
+    events: list[dict],
+    stream_json_path: Path,
+    in_process_events_path: Path,
+    stderr_path: Path,
+) -> TelemetryRecord:
+    """Construct a TelemetryRecord for arm='statsmodels' from parsed events.
+
+    Guide-related fields are ``None`` (sentinel: not applicable). Bool/tuple
+    fields are populated from events targeting `statsmodels` — the shim
+    in PR #4 has no statsmodels-specific hooks, so these will be False/()
+    until the statsmodels arm instrumentation lands.
+    """
+    statsmodels_warnings = [
+        e
+        for e in events
+        if e.get("event") == "warning_emitted" and "statsmodels" in str(e.get("filename", ""))
+    ]
+    return TelemetryRecord(
+        arm="statsmodels",
+        stream_json_path=stream_json_path,
+        in_process_events_path=in_process_events_path,
+        stderr_path=stderr_path,
+        opened_llms_txt=None,
+        opened_llms_practitioner=None,
+        opened_llms_autonomous=None,
+        opened_llms_full=None,
+        called_get_llm_guide=None,
+        get_llm_guide_variants=(),
+        saw_fit_time_warning=bool(statsmodels_warnings),
+        diagnostic_methods_invoked=(),
+        estimator_classes_instantiated=(),
+    )
+
+
 def merge_layers(
     arm: str,
     stream_json_path: Path,
@@ -120,7 +379,20 @@ def merge_layers(
     TelemetryRecord docstring): for arm == "statsmodels", `opened_llms_*`
     and `called_get_llm_guide` are encoded as None ("not applicable").
 
-    Implementation pending.
+    Raises ``TelemetryMergeError`` on fail-closed conditions:
+    - In-process event log missing or malformed.
+    - Runner-written ``telemetry_missing`` sentinel present.
+    - Cross-layer inconsistency (python invoked but shim never loaded).
     """
-    del arm, stream_json_path, in_process_events_path, stderr_path
-    raise NotImplementedError("telemetry.merge_layers is not yet implemented")
+    events = _read_events(in_process_events_path)
+    _validate_shim_loaded(events, stream_json_path)
+    if arm == "diff_diff":
+        return _build_diff_diff_record(
+            events, stream_json_path, in_process_events_path, stderr_path
+        )
+    elif arm == "statsmodels":
+        return _build_statsmodels_record(
+            events, stream_json_path, in_process_events_path, stderr_path
+        )
+    else:
+        raise ValueError(f"unknown arm: {arm!r}")

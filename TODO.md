@@ -16,8 +16,11 @@ For planned features and deliverables, see [ROADMAP.md](ROADMAP.md).
 
 | Issue | Location | PR | Priority |
 |-------|----------|----|----------|
-| Sitecustomize instrumentation hooks not yet wired (only env-var contract + empty event-log file as integration point). Layer 2 of the three-layer telemetry contract is unfilled until the hooks land. | `harness/sitecustomize_template.py` | #3 | Medium |
 | Probe leakage assessment uses substring blacklist with hardcoded operator-token list; could miss novel leakage forms or false-fire on unanticipated negation contexts. Revisit with negation-aware matching or AI-judge if real-world probe runs reveal heuristic gaps. | `harness/probe.py` | #3 | Low |
+| Statsmodels arm: shim has no hooks yet; `arm="statsmodels"` TelemetryRecord defaults to sentinels + all-False bools. Wires alongside the case-study statsmodels prompt (ROADMAP: "Statsmodels arm instrumentation"). | `harness/sitecustomize_template.py` | #4 → PR #7 prerequisite | Medium |
+| Layer-1 transcript parsing in merger is python-invocation-count only (sanity check). Full layer-1 parsing (Read-tool guide reads, Bash-level estimator usage) lands once judge prompts are written and we know which layer-1 evidence the rubric needs. | `harness/telemetry.py` | #4 → ROADMAP "Layer-1 transcript parsing" | Low |
+| Hook reactivity: monkey-patches detectable via `inspect.getsource`, `sys.modules['sitecustomize']`, `warnings.showwarning is custom`, `builtins.open` / `io.open` is custom. The `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants also leak the tracked-methodology surface. Accepted per PR #4 low-reactivity-via-documentation posture. Revisit if any early case-study agent probes the shim. | `harness/sitecustomize_template.py` | #4 → future | Low |
+| End-to-end live test of the shim firing inside a `claude --bare` subprocess deferred. Requires installing `sitecustomize.py` somewhere on `sys.path`; the only safe location is a per-arm venv. Lands alongside per-arm-venv pool. | `tests/test_telemetry_live.py` (not created in PR #4) | #4 → PR #5 | Medium |
 | `RunConfig.dataset_path` is plumbed through but the runner does NOT copy the dataset into the per-run tmpdir. Dataset copy + symlink guard + reject-non-file-paths land in PR #6+ alongside the synthetic DGP generator. PR #3's runner is intended for the probe + smoke tests only; real eval runs require this step. | `harness/runner.py:run_one` | #3 | High |
 | `RunMetadata` schema is locked but `run_one()` does NOT emit a populated `metadata.json` sidecar. Population (harness git SHA, claude binary version, dataset SHA, library version, prompt/rubric registry ids, seed, run_id, arm, model) lands in PR #6+ alongside the case-study runner. The schema is pinned HERE so subsequent PRs cannot quietly omit fields. | `harness/runner.py:run_one` | #3 | High |
 
@@ -31,8 +34,7 @@ For planned features and deliverables, see [ROADMAP.md](ROADMAP.md).
 
 | Issue | Location | PR | Priority |
 |-------|----------|----|----------|
-| Pyright "unused" warning on `_write_event` (intentional helper for not-yet-written hooks). Either silence with a `noqa` comment, restructure, or accept until the hook callers land. | `harness/sitecustomize_template.py:_write_event` | #1 | Low |
-| `telemetry.py` layer-3 docstring says "captures Python warnings from agent's Python subprocesses"; in practice the CLI captures those into stream-JSON and layer 3 only catches CLI-level errors. Refine wording when the telemetry merger lands. | `harness/telemetry.py:14-16` | #3 | Low |
+| _(none yet)_ | | | |
 
 ## Adapting Diff-Diff-Ported Files
 
