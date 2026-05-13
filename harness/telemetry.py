@@ -299,6 +299,20 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list
             f"(empty transcript likely indicates stdout-capture failure "
             f"and would silently zero out layer-1 evidence)"
         )
+    # Truncation check: a complete Claude stream-json transcript ends with a
+    # successful `result` entry. A transcript whose final entry is anything
+    # else (assistant message, tool_use, tool_result, or a `result` carrying
+    # `is_error=true`) indicates capture was cut short before the run
+    # finished, and per-run evidence (Bash invocations, Read tool_results,
+    # later guide accesses) may be silently missing.
+    last = transcript_entries[-1]
+    if not (isinstance(last, dict) and last.get("type") == "result" and not last.get("is_error")):
+        raise TelemetryMergeError(
+            f"stream-JSON transcript at {stream_json_path} does not end "
+            f"with a successful `type=result` entry; capture is truncated "
+            f"or the run did not complete cleanly, and per-run telemetry "
+            f"cannot be treated as complete"
+        )
     return transcript_entries
 
 
@@ -359,9 +373,12 @@ def _scan_read_tool_guide_accesses_in_entries(
 
     A Read tool_use is only counted as evidence if the matching
     tool_result is non-error (``is_error`` falsy or absent). A failed,
-    denied, or hallucinated Read does not flip `opened_llms_*`. If no
-    matching tool_result is found, the request is dropped (transcript may
-    have been truncated; not counting safer than counting).
+    denied, or hallucinated Read does not flip `opened_llms_*`. If a
+    guide-file Read request has no matching tool_result, the merger
+    fails closed: an incomplete transcript that would silently emit
+    `opened_llms_*=False` for a Read that may have succeeded is treated
+    the same as the terminal-result truncation check — the per-run
+    record cannot be trusted.
 
     Only Read-tool evidence is recognized here. Bash-level guide reads
     (e.g. ``cat llms.txt``) are still part of the broader layer-1 parsing
@@ -410,6 +427,15 @@ def _scan_read_tool_guide_accesses_in_entries(
             if not result.get("is_error", False):
                 opened[filename] = True
 
+    unmatched_ids = set(pending) - matched_ids
+    if unmatched_ids:
+        unmatched_filenames = sorted({pending[i] for i in unmatched_ids})
+        raise TelemetryMergeError(
+            f"Read tool_use for bundled guide file(s) {unmatched_filenames!r} "
+            f"has no matching tool_result in the transcript (tool_use_ids: "
+            f"{sorted(unmatched_ids)!r}). Transcript is incomplete; the "
+            f"per-run record cannot be trusted to reflect guide-discovery state."
+        )
     return opened
 
 
@@ -470,23 +496,51 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
     return invocations
 
 
-def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
-    """Per-invocation cross-check using sys_executable matching for
-    absolute-path invocations and unused-slot pooling for relative ones.
+def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list[str]) -> bool:
+    """Return True iff a session_start's argv matches a transcript-visible
+    python invocation's argv.
 
-    The reviewer's preferred argv-based attribution (matching
-    `session_start.argv` to each visible Bash python invocation) is
-    tracked as a deferred refinement; the current implementation closes
-    the bypass class via direct shell-pattern detection (PATH= /
-    `source` / `conda activate` / `uv run` / `poetry run` / etc.) plus
-    the absolute-path attribution below.
+    Args after the interpreter must match exactly (shell-tokenized argv from
+    the visible Bash command compared against ``sys.orig_argv[1:]``). The
+    interpreter token (argv[0]) matches either exactly or by basename — e.g.
+    visible ``python`` matches session ``python``, ``/usr/bin/python``, or
+    ``python3.11`` (Python's argv[0] is whatever the shell passed to execvp,
+    but path-form variation occurs across PATH lookups, alias expansion,
+    and absolute-path invocations).
     """
-    session_executables: list[str | None] = [
-        e.get("sys_executable") for e in events if e.get("event") == "session_start"
-    ]
+    if not session_argv or not visible_argv:
+        return False
+    if session_argv[1:] != visible_argv[1:]:
+        return False
+    if session_argv[0] == visible_argv[0]:
+        return True
+    return Path(session_argv[0]).name == Path(visible_argv[0]).name
 
-    absolute_invocations: list[tuple[str, str]] = []
-    relative_invocations: list[tuple[str, str]] = []
+
+def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
+    """Per-invocation cross-check by argv matching.
+
+    Every transcript-visible python invocation must match an unused
+    ``session_start`` by argv (interpreter basename + args). Surplus
+    session_starts that have no visible counterpart are allowed — pip
+    console-scripts, child processes spawned by an attributed run, etc.
+    record session_start without surfacing as a Bash ``python`` token in
+    the transcript.
+
+    Argv matching closes the masking class where the transcript shows
+    e.g. ``pip --version && python script.py`` while the event log
+    contains a session_start for pip (matching the visible ``python``
+    token by name) but none for the actual script. With basename-only
+    pooling, pip's session would be popped and the script's missing
+    session would go undetected. Argv matching binds pip's session to
+    pip's argv shape (e.g. ``[".../bin/pip", "--version"]``), leaving the
+    visible ``[python, script.py]`` invocation unattributed and forcing
+    the merger to fail closed.
+    """
+    sessions: list[dict] = [e for e in events if e.get("event") == "session_start"]
+    available_idx: list[int] = list(range(len(sessions)))
+
+    visible_invocations: list[tuple[str, list[str]]] = []
     for entry in transcript_entries:
         for block in _iter_tool_use_blocks(entry):
             if block.get("name") != "Bash":
@@ -498,34 +552,29 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             if not isinstance(command, str):
                 continue
             for argv in _extract_python_invocations_from_command(command):
-                if not argv:
-                    continue
-                interpreter = argv[0]
-                if interpreter.startswith("/"):
-                    absolute_invocations.append((command, interpreter))
-                else:
-                    relative_invocations.append((command, interpreter))
+                if argv:
+                    visible_invocations.append((command, argv))
 
-    for command, interpreter in absolute_invocations:
-        if interpreter in session_executables:
-            session_executables.remove(interpreter)
-            continue
-        raise TelemetryMergeError(
-            f"absolute-path python invocation {interpreter!r} has "
-            f"no matching session_start (recorded sys_executables: "
-            f"{[s for s in session_executables if s]!r}). The "
-            f"interpreter ran without sitecustomize and the eval is invalid."
-        )
-
-    for command, interpreter in relative_invocations:
-        if session_executables:
-            session_executables.pop(0)
-            continue
-        raise TelemetryMergeError(
-            f"python invocation in command {command[:120]!r} has "
-            f"no available session_start to claim; partial "
-            f"instrumentation. Cold-start eval is invalid."
-        )
+    for command, visible_argv in visible_invocations:
+        matched_idx: int | None = None
+        for idx in available_idx:
+            session_argv = sessions[idx].get("argv")
+            if not isinstance(session_argv, list):
+                continue
+            if _session_argv_matches_invocation(session_argv, visible_argv):
+                matched_idx = idx
+                break
+        if matched_idx is None:
+            remaining = [sessions[i].get("argv") for i in available_idx]
+            raise TelemetryMergeError(
+                f"python invocation argv={visible_argv!r} in command "
+                f"{command[:160]!r} has no matching session_start "
+                f"(remaining session argvs: {remaining!r}). The interpreter "
+                f"either ran without sitecustomize, or its session was "
+                f"masked by an unrelated entry point (e.g. a pip "
+                f"console-script). Cold-start eval is invalid."
+            )
+        available_idx.remove(matched_idx)
 
 
 def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
@@ -630,14 +679,14 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
        a compact form like ``-Sc`` / ``-Sm``: raise. Per-invocation
        attribution cannot help here because the bypassed process WOULD
        have a sys.executable but never fires `session_start`.
-    3. Per-invocation attribution: every visible python invocation in the
-       transcript MUST claim a `session_start` whose `sys_executable`
-       matches (absolute paths) or any remaining unused `session_start`
-       (relative `python`/`python3` forms). Unmatchable invocations raise.
-       This replaces the previous aggregate count parity, which could be
+    3. Per-invocation attribution by argv: every visible python invocation
+       in the transcript MUST claim a `session_start` whose ``argv``
+       matches the shell-tokenized invocation (interpreter token by
+       basename, args[1:] exact). Unmatchable invocations raise. This
+       replaces the previous sys_executable-only pooling, which could be
        masked by unrelated instrumented Python processes (e.g. `pip
-       --version` supplying a session_start that doesn't actually
-       correspond to the visible interpreter).
+       --version` supplying a session_start that satisfied a later
+       relative `python` token without actually corresponding to it).
     4. Else accept.
     """
     for event in events:
@@ -804,8 +853,12 @@ def merge_layers(
     - Empty or non-object transcript.
     - Shim event-write failure marker in stderr.
     - Python bypass flag (`-S`) in any transcript command.
+    - Stream-JSON transcript missing a terminal successful `result` entry
+      (truncated capture).
     - Any visible python invocation that cannot be attributed to a
-      session_start by `sys_executable`.
+      session_start by ``argv`` (interpreter basename + args).
+    - A guide-file Read tool_use with no matching tool_result
+      (incomplete transcript / cannot determine success).
 
     The transcript is parsed exactly once (per-invocation attribution,
     guide-read scan, and bypass detection all consume the parsed entries).

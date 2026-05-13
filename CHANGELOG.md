@@ -64,6 +64,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bidirectional regression tests actually run in CI rather than skipping.
 
 ### Changed
+- Per-invocation attribution now matches each transcript-visible python
+  invocation against a `session_start` by `argv` (interpreter basename +
+  args), not by `sys_executable` pool. Closes the `pip --version && python
+  script.py` masking case where pip's `session_start` could satisfy the
+  visible `python` token under unused-slot pooling, hiding `script.py`'s
+  missing instrumentation. Surplus session_starts that have no visible
+  counterpart (pip console-scripts, child processes) are still allowed.
+- `merge_layers()` now rejects stream-JSON transcripts that lack a terminal
+  successful `result` entry. A capture truncated mid-run (after a Read
+  tool_use but before its tool_result, or after the last visible Bash
+  command but before the final result frame) cannot be treated as
+  complete: per-run evidence past the cut-off is silently missing.
+- `merge_layers()` now fails closed when a guide-file Read tool_use has
+  no matching tool_result in the transcript. Same fail-closed posture as
+  the empty-transcript and missing-terminal-result checks: incomplete
+  transcript means we cannot emit a definitive `opened_llms_*=False`
+  without risking silent layer-1 loss.
 - Renamed in-process telemetry env var from `CAUSAL_LLM_EVAL_EVENT_LOG` to
   `_PYRUNTIME_EVENT_LOG`. The underscore prefix + Python-runtime framing is a
   deliberate low-reactivity choice so an agent enumerating `os.environ` is less

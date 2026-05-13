@@ -75,7 +75,7 @@ def _session_start_event(sys_executable: str | None = None, argv: list | None = 
     """Build a session_start event. Pass `argv` to match the corresponding
     transcript-visible python invocation under the new per-invocation
     attribution check."""
-    event = {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
+    event: dict = {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
     if sys_executable is not None:
         event["sys_executable"] = sys_executable
     if argv is not None:
@@ -213,7 +213,7 @@ def test_merge_layers_diff_diff_raises_on_python_invocation_without_session_star
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])  # NO session_start
     _write_transcript(transcript, ["python -c 'print(1)'"])
-    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -357,13 +357,13 @@ def test_merge_layers_diff_diff_read_tool_guide_access_flips_opened_flag(tmp_pat
     a non-error tool_result) populates `opened_llms_*`."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        _read_tool_request("read_1", "/some/install/diff_diff/guides/llms.txt"),
-        _read_tool_result("read_1"),
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("read_1", "/some/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("read_1"),
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is True
     # Read-tool-only access should NOT flip called_get_llm_guide.
@@ -386,9 +386,7 @@ def test_merge_layers_diff_diff_read_tool_recognizes_all_guide_filenames(tmp_pat
             _read_tool_request(tool_use_id, f"/install/diff_diff/guides/{name}")
         )
         transcript_entries.append(_read_tool_result(tool_use_id))
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(transcript, transcript_entries)
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is True
     assert record.opened_llms_practitioner is True
@@ -400,55 +398,57 @@ def test_merge_layers_diff_diff_read_tool_failed_read_does_not_flip_flag(tmp_pat
     """R8 P1: a Read with is_error=True must NOT flip opened_llms_*."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
-        _read_tool_result("r1", is_error=True),
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("r1", is_error=True),
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is False
 
 
-def test_merge_layers_diff_diff_read_tool_missing_result_does_not_flip_flag(tmp_path):
-    """R8 P1: a Read tool_use with no matching tool_result must NOT flip
-    `opened_llms_*` (transcript may be truncated; safer not to count)."""
+def test_merge_layers_diff_diff_read_tool_missing_result_raises(tmp_path):
+    """R10 P0: a guide-file Read tool_use with no matching tool_result
+    fails closed. Transcript may be truncated; emitting definitive False
+    would be silent layer-1 loss, identical in spirit to the empty-
+    transcript / missing-terminal-result check."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
-        # no tool_result entry
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
-    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
-    assert record.opened_llms_txt is False
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+            # no tool_result entry
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="no matching tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 def test_merge_layers_diff_diff_read_tool_ignores_non_guide_files(tmp_path):
     """Read tool on a non-guide path should not flip any flag."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/some/path/data.csv"},
-                    }
-                ],
-            },
-        }
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/some/path/data.csv"},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is False
     assert record.opened_llms_practitioner is False
@@ -700,7 +700,10 @@ def test_merge_layers_diff_diff_accepts_python_dash_I_flag(tmp_path):
     and lowercase `-s` — not `-S`. R4 code-quality correction: do not
     falsely reject `-I` runs."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
-    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-I", "script.py"])],
+    )
     _write_transcript(transcript, ["python -I script.py"])
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
@@ -848,7 +851,10 @@ def test_merge_layers_diff_diff_does_not_raise_on_lowercase_dash_s(tmp_path):
     """Lowercase `-s` (skip user site) does NOT bypass sitecustomize; the
     bypass detector must distinguish it from uppercase `-S`."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
-    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-s", "script.py"])],
+    )
     _write_transcript(transcript, ["python -s script.py"])
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
@@ -878,17 +884,20 @@ def test_merge_layers_diff_diff_raises_on_compound_partial_instrumentation(tmp_p
 
 
 def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_path):
-    """3 python invocations + 3 session_starts = fully instrumented. The
-    absolute-path invocation `/usr/bin/python3 b.py` must have a matching
-    session_start whose `sys_executable` equals that path; the relative
-    invocations claim any remaining session_start."""
+    """3 python invocations + 3 session_starts (each matching by argv) =
+    fully instrumented. Absolute-path and relative invocations both use
+    argv matching post-R10: the visible argv must equal a session's
+    ``argv`` (interpreter basename + args)."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(
         events_path,
         [
-            _session_start_event(sys_executable="/usr/bin/python3"),
-            _session_start_event(),
-            _session_start_event(),
+            _session_start_event(argv=["python", "a.py"]),
+            _session_start_event(
+                sys_executable="/usr/bin/python3",
+                argv=["/usr/bin/python3", "b.py"],
+            ),
+            _session_start_event(argv=["python", "-c", "pass"]),
         ],
     )
     _write_transcript(
@@ -925,29 +934,29 @@ def test_merge_layers_diff_diff_read_tool_requires_diff_diff_guides_path_segment
     `diff_diff/guides/` segment) must NOT flip opened_llms_txt."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/tmp/llms.txt"},
-                    },
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/Users/me/notes/llms-practitioner.txt"},
-                    },
-                ],
-            },
-        }
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/llms.txt"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/Users/me/notes/llms-practitioner.txt"},
+                        },
+                    ],
+                },
+            }
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is False
     assert record.opened_llms_practitioner is False
@@ -958,34 +967,138 @@ def test_merge_layers_diff_diff_read_tool_exact_basename_does_not_overmatch(tmp_
     treated as a bundled diff_diff guide."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript_entries = [
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/some/tmpdir/my-llms.txt"},
-                    },
-                    {
-                        "type": "tool_use",
-                        "name": "Read",
-                        "input": {"file_path": "/tmp/llms.txt.bak"},
-                    },
-                ],
-            },
-        }
-    ]
-    with open(transcript, "w") as f:
-        for entry in transcript_entries:
-            f.write(json.dumps(entry) + "\n")
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/some/tmpdir/my-llms.txt"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/llms.txt.bak"},
+                        },
+                    ],
+                },
+            }
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is False
     assert record.opened_llms_practitioner is False
     assert record.opened_llms_autonomous is False
     assert record.opened_llms_full is False
+
+
+# ---------------------------------------------------------------------------
+# R10 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_raises_on_pip_masking_relative_python(tmp_path):
+    """R10 P0: `pip --version && python script.py` masking case.
+
+    Pre-R10: pip's session_start (sys_executable = some per-arm-venv path,
+    argv = [pip-script, --version]) would satisfy the visible `python
+    script.py` relative invocation under unused-slot pooling, leaving
+    `script.py`'s missing instrumentation undetected.
+
+    Post-R10 argv attribution: the visible argv [`python`, `script.py`]
+    must match a session's ``argv``; pip's argv does not match, and no
+    other session is present, so the merger fails closed.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(
+                sys_executable="/per-arm-venv/bin/python",
+                argv=["/per-arm-venv/bin/pip", "--version"],
+            )
+        ],
+    )
+    _write_transcript(transcript, ["pip --version && python script.py"])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_truncated_transcript_no_terminal_result(
+    tmp_path,
+):
+    """R10 P0: a stream-JSON transcript missing the terminal successful
+    `result` entry indicates capture was cut short, and per-run evidence
+    after the cut-off (later Bash invocations, tool_results) may be
+    silently lost. Fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    with open(transcript, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {"file_path": "/some/path.txt"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+    with pytest.raises(TelemetryMergeError, match="does not end with a successful"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_error_result_entry(tmp_path):
+    """R10 P0: a terminal `result` entry with ``is_error=true`` indicates
+    the run did not complete cleanly. Fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript.write_text(
+        json.dumps({"type": "result", "is_error": True, "subtype": "error_during_execution"}) + "\n"
+    )
+    with pytest.raises(TelemetryMergeError, match="does not end with a successful"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_argv_matches_by_basename(tmp_path):
+    """Argv-matching should accept path-vs-basename variation on the
+    interpreter token: visible ``python`` (bare name from a PATH lookup
+    in the shell) matches session ``argv[0] = /per-arm-venv/bin/python``
+    (sys.orig_argv may carry the resolved absolute path)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["/per-arm-venv/bin/python", "script.py"])],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_argv_args_must_match_exactly(tmp_path):
+    """Argv args[1:] must match exactly; same interpreter + different
+    args does not satisfy attribution."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "other.py"])],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 # ---------------------------------------------------------------------------
