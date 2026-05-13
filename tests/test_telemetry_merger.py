@@ -532,6 +532,51 @@ def test_merge_layers_diff_diff_raises_on_absolute_python_without_session_start(
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_python_invocation_detection_counts_each_occurrence_in_compound_command(
+    tmp_path,
+):
+    """R2 P0: a single Bash command containing two python invocations
+    (`python a.py && python -S b.py`) must count as 2, not 1."""
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        ["python -c 'import diff_diff' && python -S uninstrumented.py"],
+    )
+    assert _count_python_invocations(transcript) == 2
+
+
+def test_python_invocation_detection_counts_semicolon_separated_invocations(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        ["python a.py; /usr/bin/python3 b.py"],
+    )
+    assert _count_python_invocations(transcript) == 2
+
+
+def test_python_invocation_detection_counts_pipe_separated_invocations(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        ["python -c 'print(1)' | python -c 'import sys; print(sys.stdin.read())'"],
+    )
+    assert _count_python_invocations(transcript) == 2
+
+
+def test_merge_layers_diff_diff_raises_on_compound_partial_instrumentation(tmp_path):
+    """R2 P0: one Bash call running both an instrumented `python` and an
+    uninstrumented `python -S` must fail closed even when the call count
+    is 1."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])  # only 1
+    _write_transcript(
+        transcript,
+        ["python -c 'import diff_diff' && python -S uninstrumented.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_path):
     """3 python invocations + 3 session_starts = fully instrumented; OK."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
@@ -545,6 +590,41 @@ def test_merge_layers_diff_diff_accepts_balanced_invocation_session_counts(tmp_p
     )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_read_tool_requires_diff_diff_guides_path_segment(
+    tmp_path,
+):
+    """R2 P2: a Read on `/tmp/llms.txt` (basename matches but no
+    `diff_diff/guides/` segment) must NOT flip opened_llms_txt."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/llms.txt"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/Users/me/notes/llms-practitioner.txt"},
+                    },
+                ],
+            },
+        }
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+    assert record.opened_llms_practitioner is False
 
 
 def test_merge_layers_diff_diff_read_tool_exact_basename_does_not_overmatch(tmp_path):

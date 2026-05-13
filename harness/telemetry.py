@@ -281,10 +281,13 @@ def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
             file_path = tool_input.get("file_path", "")
             if not isinstance(file_path, str) or not file_path:
                 continue
-            # Exact basename match. Suffix matching would overmatch paths like
-            # `my-llms.txt` or any tmpdir-local file sharing the filename.
+            # Exact basename match AND require the path segment
+            # `diff_diff/guides/` to anchor to the bundled package location.
+            # Either condition alone would overmatch: suffix-only catches
+            # `my-llms.txt`, basename-only catches `/tmp/llms.txt`. Both
+            # together require the read to look like a real package guide.
             basename = Path(file_path).name
-            if basename in known_filenames:
+            if basename in known_filenames and "diff_diff/guides/" in file_path:
                 opened[basename] = True
     return opened
 
@@ -307,20 +310,24 @@ def _iter_tool_use_blocks(entry):
 
 
 def _count_python_invocations(stream_json_path: Path) -> int:
-    """Return the number of Bash tool calls in the transcript whose command
-    contains a python invocation.
+    """Return the total number of python interpreter invocations across all
+    Bash tool commands in the transcript.
 
-    Parses each line of the stream-JSON transcript strictly: malformed JSONL
-    raises ``TelemetryMergeError`` via the shared `_parse_jsonl_strict`
-    helper, consistent with the layer-2 event-log parser. Existence of the
-    file is the caller's responsibility (`_validate_layer_artifacts` runs
-    first in `merge_layers`).
+    Counts EVERY occurrence within each command, not just one per Bash call,
+    so compound commands like
+    ``python a.py && python -S b.py`` register as 2 invocations. The
+    cross-check in ``_validate_shim_loaded`` requires this count to match
+    the number of ``session_start`` events; an undercount here would let
+    partial instrumentation silently pass.
 
-    The cross-check the result feeds is intentionally minimal — false
-    negatives (we miss some invocations) are tolerable, but false positives
-    (counting non-invocations) must not cause spurious shim-never-loaded
-    errors. The word-boundary regex in `_PYTHON_INVOCATION_RE` and the
-    structural `tool_use`/Bash/command match guard against both.
+    Parses each line of the stream-JSON transcript strictly via the shared
+    ``_parse_jsonl_strict`` helper. Existence of the file is the caller's
+    responsibility (``_validate_layer_artifacts`` runs first in
+    ``merge_layers``).
+
+    The word-boundary regex in ``_PYTHON_INVOCATION_RE`` and the structural
+    tool_use/Bash/command match guard against false positives like
+    ``/opt/python/`` (directory) or ``pythonic`` (substring).
     """
     entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     count = 0
@@ -332,22 +339,25 @@ def _count_python_invocations(stream_json_path: Path) -> int:
             if not isinstance(tool_input, dict):
                 continue
             command = tool_input.get("command", "")
-            if isinstance(command, str) and _PYTHON_INVOCATION_RE.search(command):
-                count += 1
+            if isinstance(command, str):
+                count += len(_PYTHON_INVOCATION_RE.findall(command))
     return count
 
 
 def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
     """Cross-layer fail-closed check before building the record.
 
-    Three cases:
+    Cases:
     1. ``telemetry_missing`` sentinel present (written by the runner when
        the event log disappeared post-exec): raise.
-    2. Zero ``session_start`` events AND transcript shows python
-       invocations: shim never loaded inside the agent's Python subprocess
-       — eval invalid; raise.
-    3. Else accept (legitimate states: shim loaded + agent activity, OR
-       shim loaded + no Python at all, OR no Python + no session_start).
+    2. Detected python invocations exceed ``session_start`` events: at
+       least one Python execution ran without sitecustomize firing
+       (e.g. ``python -S`` skipping sitecustomize, or an absolute-path
+       interpreter outside the per-arm venv). Partial instrumentation
+       leaves layer-2 silently incomplete; raise.
+    3. Else accept (legitimate states include: shim loaded with N python
+       invocations + N session_starts, shim loaded with no Python at all,
+       and no Python + no session_start).
     """
     for event in events:
         if event.get("event") == "telemetry_missing":
@@ -397,10 +407,12 @@ def _build_diff_diff_record(
                 variants_seen.add(variant)
                 opened[_VARIANT_TO_FILENAME[variant]] = True
         elif via == "open":
+            # The shim writes basename-only filenames after its own
+            # `_path_is_diff_diff_guide` check confirmed the path was under
+            # `diff_diff/guides/`. Match exactly here; defense in depth.
             filename = r.get("filename", "")
-            for known in opened:
-                if filename.endswith(known):
-                    opened[known] = True
+            if filename in opened:
+                opened[filename] = True
 
     # Layer-1 evidence: Claude's Read tool accessing a bundled guide file
     # without invoking Python. Layer-2 hooks see nothing in that path, so
