@@ -27,7 +27,6 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 @dataclass
@@ -174,6 +173,31 @@ def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
     return events
 
 
+# Substring marker the shim's `_write_event` prints to stderr when a write
+# fails mid-run. Used by the merger to fail-closed when telemetry events were
+# dropped after the hook deliberately continued executing the wrapped call.
+_SHIM_WRITE_FAILURE_MARKER = "[pyruntime] cannot write event"
+
+
+def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
+    """Return True if stderr contains the shim's event-write failure marker.
+
+    The shim's hook wrappers catch transient OSError on event writes so the
+    agent's diff_diff call still completes (avoids aborting on telemetry
+    hiccups). When that happens, `_write_event` first prints
+    `[pyruntime] cannot write event to <path>: <err>` to stderr. The merger
+    looks for that marker post-hoc: presence means at least one event was
+    dropped, so the per-run record may be silently incomplete.
+    """
+    try:
+        content = stderr_path.read_text(errors="replace")
+    except OSError:
+        # Existence was already validated; a read error here is itself a
+        # capture problem worth surfacing.
+        return True
+    return _SHIM_WRITE_FAILURE_MARKER in content
+
+
 def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None:
     """Fail-closed preflight: layer-1 and layer-3 capture files must exist
     AND the transcript must be well-formed JSONL.
@@ -220,6 +244,62 @@ def _read_events(path: Path) -> list[dict]:
     return _parse_jsonl_strict(path, "event log")
 
 
+def _scan_read_tool_guide_accesses(stream_json_path: Path) -> dict[str, bool]:
+    """Return ``{filename: True}`` for each bundled guide file accessed via
+    Claude's Read tool in the transcript.
+
+    Catches the case where an agent reads `llms.txt` (or any other bundled
+    guide) via the Read tool without invoking Python; the in-process shim
+    sees nothing in that path because no `open()` or `get_llm_guide` call
+    runs in the agent's subprocess. Without this layer-1 check the merger
+    would emit a definitive `opened_llms_txt=False` for what was actually
+    a guide discovery — a silent telemetry-validity bug per the cold-start
+    contract.
+
+    Existence of the transcript file is the caller's responsibility
+    (`_validate_layer_artifacts` runs first in `merge_layers`). Parsing
+    uses the shared strict JSONL helper.
+
+    Only Read-tool evidence is recognized here. Bash-level guide reads
+    (e.g. ``cat llms.txt``) are still part of the broader layer-1 parsing
+    deferred to a future PR.
+    """
+    entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+    opened: dict[str, bool] = {}
+    known_filenames = set(_VARIANT_TO_FILENAME.values())
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Read":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            file_path = tool_input.get("file_path", "")
+            if not isinstance(file_path, str):
+                continue
+            for known in known_filenames:
+                if file_path.endswith(known):
+                    opened[known] = True
+    return opened
+
+
+def _iter_tool_use_blocks(entry):
+    """Yield tool_use blocks from a stream-JSON entry, handling both
+    nested (`message.content[*]`) and shallow (top-level type=tool_use) shapes.
+    """
+    if not isinstance(entry, dict):
+        return
+    msg = entry.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    yield block
+    if entry.get("type") == "tool_use":
+        yield entry
+
+
 def _count_python_invocations(stream_json_path: Path) -> int:
     """Return the number of Bash tool calls in the transcript whose command
     contains a python invocation.
@@ -239,49 +319,16 @@ def _count_python_invocations(stream_json_path: Path) -> int:
     entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     count = 0
     for entry in entries:
-        count += _python_invocations_in_entry(entry)
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if isinstance(command, str) and _PYTHON_INVOCATION_RE.search(command):
+                count += 1
     return count
-
-
-def _python_invocations_in_entry(entry: Any) -> int:
-    """Count python invocations in a single stream-JSON entry.
-
-    The stream-JSON format nests tool_use blocks under
-    ``message.content[*]`` for assistant turns. We walk content blocks
-    looking for ``{"type": "tool_use", "name": "Bash", "input": {"command": "..."}}``.
-    Robust to schema variants: also checks shallow ``tool_input`` field.
-    """
-    if not isinstance(entry, dict):
-        return 0
-    count = 0
-    # Shape 1: assistant message with content array
-    msg = entry.get("message")
-    if isinstance(msg, dict):
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                count += _count_python_in_tool_use_block(block)
-    # Shape 2: shallow tool_use (some schema variants emit this at top level)
-    if entry.get("type") == "tool_use":
-        count += _count_python_in_tool_use_block(entry)
-    return count
-
-
-def _count_python_in_tool_use_block(block: Any) -> int:
-    """Return 1 if `block` is a Bash tool_use with a python invocation."""
-    if not isinstance(block, dict):
-        return 0
-    if block.get("type") != "tool_use":
-        return 0
-    if block.get("name") != "Bash":
-        return 0
-    tool_input = block.get("input") or block.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return 0
-    command = tool_input.get("command", "")
-    if not isinstance(command, str):
-        return 0
-    return 1 if _PYTHON_INVOCATION_RE.search(command) else 0
 
 
 def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
@@ -347,6 +394,15 @@ def _build_diff_diff_record(
             for known in opened:
                 if filename.endswith(known):
                     opened[known] = True
+
+    # Layer-1 evidence: Claude's Read tool accessing a bundled guide file
+    # without invoking Python. Layer-2 hooks see nothing in that path, so
+    # without this OR-merge the merger would silently emit
+    # opened_llms_*=False for an actual discovery.
+    read_tool_opens = _scan_read_tool_guide_accesses(stream_json_path)
+    for filename, was_opened in read_tool_opens.items():
+        if was_opened:
+            opened[filename] = True
 
     return TelemetryRecord(
         arm="diff_diff",
@@ -422,6 +478,12 @@ def merge_layers(
     - Cross-layer inconsistency (python invoked but shim never loaded).
     """
     _validate_layer_artifacts(stream_json_path, stderr_path)
+    if _scan_stderr_for_shim_failures(stderr_path):
+        raise TelemetryMergeError(
+            f"shim event-write failure marker present in {stderr_path}; "
+            f"at least one layer-2 event was dropped mid-run and the "
+            f"per-run record may be silently incomplete"
+        )
     events = _read_events(in_process_events_path)
     _validate_shim_loaded(events, stream_json_path)
     if arm == "diff_diff":

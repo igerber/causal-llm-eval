@@ -233,6 +233,116 @@ def test_merge_layers_diff_diff_accepts_empty_transcript_and_stderr(tmp_path):
     assert record.arm == "diff_diff"
 
 
+def test_merge_layers_diff_diff_raises_on_shim_write_failure_marker(tmp_path):
+    """Layer-3 cross-check: stderr containing the shim's event-write failure
+    marker means at least one layer-2 event was dropped mid-run; the per-run
+    record cannot be treated as complete."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    stderr_log.write_text(
+        "[pyruntime] cannot write event to /tmp/somewhere/events.jsonl: "
+        "[Errno 28] No space left on device\n"
+    )
+    with pytest.raises(TelemetryMergeError, match="shim event-write failure marker"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_read_tool_guide_access_flips_opened_flag(tmp_path):
+    """Layer-1 evidence: Claude's Read tool on a bundled guide file must
+    populate `opened_llms_*` even when the in-process shim sees nothing
+    (agent read the file without invoking Python)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    # Transcript: a Read tool call on llms.txt; no Python invocation.
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/some/install/diff_diff/guides/llms.txt"},
+                    }
+                ],
+            },
+        }
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+    # Read-tool-only access should NOT flip called_get_llm_guide.
+    assert record.called_get_llm_guide is False
+    assert record.get_llm_guide_variants == ()
+
+
+def test_merge_layers_diff_diff_read_tool_recognizes_all_guide_filenames(tmp_path):
+    """Verify all four bundled guides are detected via Read-tool evidence."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": f"/install/diff_diff/guides/{name}"},
+                    }
+                    for name in (
+                        "llms.txt",
+                        "llms-practitioner.txt",
+                        "llms-autonomous.txt",
+                        "llms-full.txt",
+                    )
+                ],
+            },
+        }
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+    assert record.opened_llms_practitioner is True
+    assert record.opened_llms_autonomous is True
+    assert record.opened_llms_full is True
+
+
+def test_merge_layers_diff_diff_read_tool_ignores_non_guide_files(tmp_path):
+    """Read tool on a non-guide path should not flip any flag."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/some/path/data.csv"},
+                    }
+                ],
+            },
+        }
+    ]
+    with open(transcript, "w") as f:
+        for entry in transcript_entries:
+            f.write(json.dumps(entry) + "\n")
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+    assert record.opened_llms_practitioner is False
+    assert record.opened_llms_autonomous is False
+    assert record.opened_llms_full is False
+
+
 # ---------------------------------------------------------------------------
 # statsmodels arm
 # ---------------------------------------------------------------------------
