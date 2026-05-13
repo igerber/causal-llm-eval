@@ -153,11 +153,23 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
-# Shell patterns that override the resolved interpreter via PATH or by
-# pointing at a specific binary. Any of these in front of a python token
-# means the resolved interpreter is NOT the per-arm-venv python — so the
-# shim may not have loaded. Fail-closed when seen.
-_PATH_OVERRIDE_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])PATH=\S+\s+(?:[^\s;&|]+\s+)*python")
+# Shell patterns that mutate or override the resolved interpreter location.
+# Any of these in a command containing a python invocation means the
+# resolved interpreter may NOT be the per-arm-venv python — fail-closed.
+#
+# Forms detected:
+# - Inline override: `PATH=/usr/bin python3 ...`
+# - Pre-invocation mutation: `PATH=... && python3 ...`, `PATH=... ; python3 ...`
+# - Exported mutation: `export PATH=... && python3 ...`
+# - env-driven resolution: `env python`, `env -u VAR python`
+# - Local binary: `./python`
+#
+# Detection is conservative: ANY `PATH=` or `export PATH=` assignment in a
+# command that ALSO contains a python invocation triggers fail-closed.
+# This over-catches PATH mutations followed by non-python commands, but the
+# false-positive rate is acceptable; agent shells rarely mutate PATH for
+# unrelated reasons.
+_PATH_ASSIGNMENT_RE = re.compile(r"(?:^|[\s;&|])(?:export\s+)?PATH=\S+")
 _ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
 _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
 
@@ -489,9 +501,16 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             command = tool_input.get("command", "")
             if not isinstance(command, str):
                 continue
-            # Inline PATH= / env / ./python overrides
+            # PATH mutation (inline or before any python invocation in the
+            # same command), `env python` resolution, or `./python` local
+            # binary. PATH mutation is flagged only when the command ALSO
+            # contains a python invocation; this catches `export PATH=...
+            # && python3 ...`, `PATH=... ; python3 ...`, and the inline
+            # `PATH=/usr/bin python3 ...` form.
+            has_python = bool(_PYTHON_INVOCATION_RE.search(command))
+            has_path_mutation = bool(_PATH_ASSIGNMENT_RE.search(command))
             if (
-                _PATH_OVERRIDE_BEFORE_PYTHON_RE.search(command)
+                (has_path_mutation and has_python)
                 or _ENV_BEFORE_PYTHON_RE.search(command)
                 or _DOT_PYTHON_RE.search(command)
             ):

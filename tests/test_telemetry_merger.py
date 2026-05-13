@@ -663,6 +663,51 @@ def test_merge_layers_diff_diff_raises_on_inline_path_override(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_raises_on_export_path_mutation_before_python(
+    tmp_path,
+):
+    """R6 P0: shell-level `export PATH=/usr/bin:$PATH && python3 ...`
+    mutates PATH for subsequent commands; python3 resolves to a non-shim
+    interpreter even though it's relative."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["pip --version && export PATH=/usr/bin:$PATH && python3 script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_standalone_path_then_python_amp(
+    tmp_path,
+):
+    """R6 P0: `PATH=/usr/bin:$PATH && python3 ...` — standalone assignment
+    propagated to the python3 invocation via `&&`."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["pip --version && PATH=/usr/bin:$PATH && python3 script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_standalone_path_then_python_semicolon(
+    tmp_path,
+):
+    """R6 P0: same pattern with `;` separator instead of `&&`."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(
+        transcript,
+        ["pip --version && PATH=/usr/bin:$PATH ; python3 script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_raises_on_env_python(tmp_path):
     """R5 P0: `env python` resolves via PATH; can pick up a non-shim
     interpreter."""

@@ -1,5 +1,4 @@
-"""Python runtime instrumentation. Module documentation lives outside this
-file in `harness/COLD_START_VERIFICATION.md`."""
+"""Python runtime instrumentation."""
 
 from __future__ import annotations
 
@@ -333,7 +332,7 @@ def _install_warning_hook() -> None:
 
 
 def _attach_diff_diff_hooks(module) -> None:
-    """Patch the loaded `diff_diff` module to record agent usage.
+    """Patch the loaded `diff_diff` module to record library entry-point calls.
 
     Called from `_DiffDiffPostImportHook.exec_module` after Python finishes
     importing `diff_diff`. Wraps:
