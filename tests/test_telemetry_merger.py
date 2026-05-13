@@ -53,11 +53,16 @@ def _write_transcript(path: Path, bash_commands: list[str]) -> None:
 
 
 def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Return (events_jsonl, transcript, stderr_log) paths under tmp_path."""
+    """Return (events_jsonl, transcript, stderr_log) paths under tmp_path.
+
+    transcript is pre-populated with a minimal result entry so the merger's
+    non-empty-transcript precondition is satisfied. Tests that want to
+    exercise an empty transcript should overwrite the file explicitly.
+    """
     events = tmp_path / "in_process_events.jsonl"
     transcript = tmp_path / "transcript.jsonl"
     stderr_log = tmp_path / "cli_stderr.log"
-    transcript.touch()
+    transcript.write_text('{"type": "result", "status": "ok"}\n')
     stderr_log.touch()
     return events, transcript, stderr_log
 
@@ -224,11 +229,33 @@ def test_merge_layers_diff_diff_raises_on_missing_stderr(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
-def test_merge_layers_diff_diff_accepts_empty_transcript_and_stderr(tmp_path):
+def test_merge_layers_diff_diff_raises_on_empty_transcript(tmp_path):
+    """R3 P0: empty stream-JSON transcripts indicate stdout-capture failure
+    and would silently zero out layer-1 evidence; must fail closed."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    # transcript and stderr_log are already 0-byte (touched by _make_paths).
-    # Zero-byte capture is acceptable (trivial agent responses produce these).
+    transcript.write_text("")  # explicitly empty
+    with pytest.raises(TelemetryMergeError, match="transcript.*is empty"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_non_object_transcript(tmp_path):
+    """R3 P0: every transcript line must be a JSON object; scalars/lists
+    indicate a corrupted capture."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript.write_text('"just a string"\n')
+    with pytest.raises(TelemetryMergeError, match="non-object JSON"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_accepts_empty_stderr_only(tmp_path):
+    """Empty stderr is fine (no CLI-level errors). The transcript must be
+    non-empty though, so provide a minimal entry."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript.write_text('{"type": "result", "status": "ok"}\n')
+    # stderr_log is 0-byte from _make_paths; that's fine.
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
 
@@ -509,15 +536,18 @@ def test_python_invocation_detection_ignores_python_in_directory_names(tmp_path)
 
 
 def test_merge_layers_diff_diff_raises_on_partial_instrumentation(tmp_path):
-    """R1 P0: 2 python invocations + 1 session_start = partial instrumentation
-    (e.g. `python -S` bypassing sitecustomize). Must fail closed."""
+    """R1 P0: an uninstrumented invocation (whether by `python -S` or by an
+    absolute-path interpreter outside the per-arm venv) must fail closed.
+    Updated post-R3: the bypass-flag detector catches `-S` directly with a
+    different error message; the partial-instrumentation count check
+    remains for absolute-path-without-shim cases."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
     _write_transcript(
         transcript,
         ["python -c 'import diff_diff'", "python -S uninstrumented.py"],
     )
-    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -563,17 +593,59 @@ def test_python_invocation_detection_counts_pipe_separated_invocations(tmp_path)
     assert _count_python_invocations(transcript) == 2
 
 
+def test_merge_layers_diff_diff_raises_on_python_dash_S_flag(tmp_path):
+    """R3 P0: `python -S` skips sitecustomize even if aggregate counts
+    balance via an unrelated instrumented invocation. Detect the flag
+    directly."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])  # 1 session
+    _write_transcript(
+        transcript,
+        ["pip --version && python -S uninstrumented.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_python_dash_I_flag(tmp_path):
+    """`-I` (isolated mode) implies `-S` and also bypasses sitecustomize."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["python -I script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_does_not_raise_on_lowercase_dash_s(tmp_path):
+    """Lowercase `-s` (skip user site) does NOT bypass sitecustomize; the
+    bypass detector must distinguish it from uppercase `-S`."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["python -s script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_raises_on_combined_bypass_flags(tmp_path):
+    """Combined short flag `-IS` or `-SI` is also a bypass."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, ["python -IS script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_raises_on_compound_partial_instrumentation(tmp_path):
     """R2 P0: one Bash call running both an instrumented `python` and an
-    uninstrumented `python -S` must fail closed even when the call count
-    is 1."""
+    uninstrumented `python -S` must fail closed. Post-R3 the bypass-flag
+    detector catches the `-S` directly."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])  # only 1
     _write_transcript(
         transcript,
         ["python -c 'import diff_diff' && python -S uninstrumented.py"],
     )
-    with pytest.raises(TelemetryMergeError, match="partial instrumentation"):
+    with pytest.raises(TelemetryMergeError, match="bypass flag"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 

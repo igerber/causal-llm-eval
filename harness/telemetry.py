@@ -153,14 +153,28 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
 _PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:\s|$)")
 
 
+# Python interpreter flags that bypass `sitecustomize.py` and therefore the
+# shim's hooks. `-S` disables `site.py` (which imports sitecustomize); `-I`
+# (isolated mode) implies `-S` plus `-E -s`. Lowercase `-s` (skip user site)
+# is unrelated and does NOT bypass sitecustomize, so the regex requires the
+# uppercase forms specifically. Compound short flags (`-IS`, `-SE`, etc.)
+# are matched too. Standalone `-X dev` and similar do not match because
+# their flag character set is `X` (no `S` or `I`).
+_PYTHON_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Z]*[SI][A-Z]*(?:\s|$)")
+
+
 def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
     """Parse a JSONL file strictly; raise TelemetryMergeError on malformed lines.
 
     Shared parser used by both layer-2 event-log reads and layer-1 transcript
-    reads. Empty lines are skipped; non-JSON content raises. The ``label``
-    string identifies the layer/file in the error message.
+    reads. Empty lines are skipped; non-JSON content raises; non-object
+    (scalar/list) entries also raise — the runner's contract is that every
+    line is a JSON OBJECT. The ``label`` string identifies the layer/file
+    in the error message.
 
-    An empty (0-byte) file is permitted and returns ``[]``.
+    An empty (0-byte) file is permitted and returns ``[]``. The caller is
+    responsible for whether emptiness is acceptable in that layer's
+    semantics.
     """
     events: list[dict] = []
     with open(path) as f:
@@ -169,11 +183,17 @@ def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
             if not stripped:
                 continue
             try:
-                events.append(json.loads(stripped))
+                parsed = json.loads(stripped)
             except json.JSONDecodeError as e:
                 raise TelemetryMergeError(
                     f"malformed JSON in {label} {path} at line {line_num}: {e}"
                 ) from e
+            if not isinstance(parsed, dict):
+                raise TelemetryMergeError(
+                    f"non-object JSON in {label} {path} at line {line_num}: "
+                    f"expected a JSON object, got {type(parsed).__name__}"
+                )
+            events.append(parsed)
     return events
 
 
@@ -203,19 +223,24 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
 
 
 def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None:
-    """Fail-closed preflight: layer-1 and layer-3 capture files must exist
-    AND the transcript must be well-formed JSONL.
+    """Fail-closed preflight: layer-1 and layer-3 capture files must exist,
+    and the transcript must be a non-empty sequence of JSON objects.
 
     The three-layer telemetry contract requires the stream-JSON transcript
     (layer 1) and the CLI stderr capture (layer 3) to be present for every
-    run; missing files mean the runner did not finish capturing or the
-    output directory was tampered with. Either way, the per-run record is
-    not safe to consume.
+    run.
 
-    Empty (0-byte) files are accepted — a trivial agent response can produce
-    an empty stderr log, and a vacuous transcript is rare but legitimate.
-    Non-JSON content in the transcript raises (the runner's contract is that
-    every line of `transcript.jsonl` is a single JSON object).
+    - Missing files mean the runner did not finish capturing or the output
+      directory was tampered with.
+    - An EMPTY stream-JSON transcript means stdout capture failed or was
+      truncated; without at least one entry, the merger cannot distinguish
+      a Read-tool guide access from no agent activity, so emitting
+      definitive ``opened_llms_*=False`` would be silent layer-1 loss.
+    - A non-object JSON line (scalar / list) violates the runner's contract
+      that every line is a single JSON object.
+
+    Empty stderr capture remains valid (a trivial agent response can produce
+    an empty stderr log; layer-3 only carries CLI-level errors).
     """
     if not stream_json_path.exists():
         raise TelemetryMergeError(
@@ -227,10 +252,14 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> None
             f"CLI stderr capture missing at {stderr_path}; "
             f"layer-3 capture incomplete, per-run record cannot be validated"
         )
-    # Validate transcript is parseable JSONL. Discard the parsed entries
-    # here; `_count_python_invocations` re-reads later (small redundant
-    # cost; clearer than threading parsed state through the call chain).
-    _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+    transcript_entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+    if not transcript_entries:
+        raise TelemetryMergeError(
+            f"stream-JSON transcript at {stream_json_path} is empty; "
+            f"mergeable runs require at least one transcript entry "
+            f"(empty transcript likely indicates stdout-capture failure "
+            f"and would silently zero out layer-1 evidence)"
+        )
 
 
 def _read_events(path: Path) -> list[dict]:
@@ -309,6 +338,42 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
+def _find_python_bypass_invocations(stream_json_path: Path) -> list[str]:
+    """Return Bash commands that invoke python with a `-S` or `-I` flag.
+
+    `python -S` skips `site.py` and therefore `sitecustomize.py`; `python -I`
+    (isolated mode) implies `-S`. Either form bypasses the in-process shim
+    even when other Python processes in the same transcript fire
+    `session_start` normally — so aggregate `python_count == session_start`
+    parity would silently pass while the bypassed process accessed
+    diff_diff uninstrumented.
+
+    For each detected python invocation in each Bash command, look at the
+    flag region between that invocation and the next shell separator
+    (``;``, ``&``, ``|``). If a bypass flag is present, record the command.
+    """
+    entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
+    bypass_commands: list[str] = []
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                continue
+            for m in _PYTHON_INVOCATION_RE.finditer(command):
+                rest = command[m.end() :]
+                sep_match = re.search(r"[;&|]", rest)
+                args_segment = rest[: sep_match.start()] if sep_match else rest
+                if _PYTHON_BYPASS_FLAG_RE.search(args_segment):
+                    bypass_commands.append(command)
+                    break  # one bypass per command is enough to record
+    return bypass_commands
+
+
 def _count_python_invocations(stream_json_path: Path) -> int:
     """Return the total number of python interpreter invocations across all
     Bash tool commands in the transcript.
@@ -350,12 +415,17 @@ def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
     Cases:
     1. ``telemetry_missing`` sentinel present (written by the runner when
        the event log disappeared post-exec): raise.
-    2. Detected python invocations exceed ``session_start`` events: at
-       least one Python execution ran without sitecustomize firing
-       (e.g. ``python -S`` skipping sitecustomize, or an absolute-path
-       interpreter outside the per-arm venv). Partial instrumentation
-       leaves layer-2 silently incomplete; raise.
-    3. Else accept (legitimate states include: shim loaded with N python
+    2. ANY visible python invocation uses ``-S`` or ``-I`` (sitecustomize
+       bypass): raise. Aggregate count parity cannot mask this — an
+       unrelated instrumented Python process can supply the session_start
+       event while the bypassed process runs uninstrumented, so per-command
+       bypass detection is required in addition to the count check below.
+    3. Detected python invocations exceed ``session_start`` events: at
+       least one Python execution ran without sitecustomize firing (e.g.
+       an absolute-path interpreter outside the per-arm venv whose runtime
+       lacks the shim). Partial instrumentation leaves layer-2 silently
+       incomplete; raise.
+    4. Else accept (legitimate states include: shim loaded with N python
        invocations + N session_starts, shim loaded with no Python at all,
        and no Python + no session_start).
     """
@@ -366,6 +436,17 @@ def _validate_shim_loaded(events: list[dict], stream_json_path: Path) -> None:
                 "the agent's event log disappeared post-exec and the run "
                 "is invalid for evaluation"
             )
+    bypass_commands = _find_python_bypass_invocations(stream_json_path)
+    if bypass_commands:
+        first = bypass_commands[0]
+        if len(first) > 200:
+            first = first[:200] + "..."
+        raise TelemetryMergeError(
+            f"python interpreter bypass flag (-S or -I) detected in "
+            f"{len(bypass_commands)} transcript command(s); first: "
+            f"{first!r}. These flags skip sitecustomize.py and bypass the "
+            f"in-process shim, leaving layer-2 silently incomplete."
+        )
     session_start_count = sum(1 for e in events if e.get("event") == "session_start")
     python_count = _count_python_invocations(stream_json_path)
     if python_count > session_start_count:
