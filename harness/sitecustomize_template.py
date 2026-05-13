@@ -115,12 +115,14 @@ def _safe_write(event: dict) -> None:
 
 
 def _wrap_get_llm_guide(original):
-    """Wrap `get_llm_guide(variant)` to record the variant before delegating."""
+    """Wrap `get_llm_guide(variant)` to record successful reads. The event is
+    emitted AFTER the underlying call returns, so failed reads don't count."""
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
     @functools.wraps(original)
     def wrapper(variant: str = "concise"):
+        result = original(variant)
         _safe_write(
             {
                 "event": "guide_file_read",
@@ -129,19 +131,27 @@ def _wrap_get_llm_guide(original):
                 "ts": _utc_iso_now(),
             }
         )
-        return original(variant)
+        return result
 
     wrapper._pyruntime_wrapped = True  # type: ignore[attr-defined]
     return wrapper
 
 
 def _wrap_estimator_init(original, class_name: str):
-    """Wrap an estimator class `__init__` to record instantiation."""
+    """Wrap an estimator class `__init__` to record SUCCESSFUL construction.
+
+    The event is emitted only if the constructor returns; a constructor
+    that raises does not produce telemetry. This matters because an agent
+    that attempts `CallawaySantAnna(...)` with bad arguments should not
+    have CallawaySantAnna in `estimator_classes_instantiated` — the
+    attempt failed.
+    """
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
     @functools.wraps(original)
     def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
         _safe_write(
             {
                 "event": "estimator_init",
@@ -149,19 +159,21 @@ def _wrap_estimator_init(original, class_name: str):
                 "ts": _utc_iso_now(),
             }
         )
-        return original(self, *args, **kwargs)
+        return result
 
     wrapper._pyruntime_wrapped = True  # type: ignore[attr-defined]
     return wrapper
 
 
 def _wrap_estimator_fit(original, class_name: str):
-    """Wrap an estimator class `fit` method to record the call."""
+    """Wrap `fit` method; record AFTER successful return so failed fits
+    don't count as use."""
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
     @functools.wraps(original)
     def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
         _safe_write(
             {
                 "event": "estimator_fit",
@@ -169,19 +181,21 @@ def _wrap_estimator_fit(original, class_name: str):
                 "ts": _utc_iso_now(),
             }
         )
-        return original(self, *args, **kwargs)
+        return result
 
     wrapper._pyruntime_wrapped = True  # type: ignore[attr-defined]
     return wrapper
 
 
 def _wrap_diagnostic(original, name: str):
-    """Wrap a module-level diagnostic function to record invocation."""
+    """Wrap a module-level diagnostic function; record AFTER successful
+    return so failed diagnostic calls don't count."""
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
+        result = original(*args, **kwargs)
         _safe_write(
             {
                 "event": "diagnostic_call",
@@ -189,7 +203,7 @@ def _wrap_diagnostic(original, name: str):
                 "ts": _utc_iso_now(),
             }
         )
-        return original(*args, **kwargs)
+        return result
 
     wrapper._pyruntime_wrapped = True  # type: ignore[attr-defined]
     return wrapper
@@ -259,6 +273,9 @@ def _install_open_hook() -> None:
         # (a write to a guide path is not a read of guide content).
         mode = args[0] if args else kwargs.get("mode", "r")
         is_read = isinstance(mode, str) and "w" not in mode and "a" not in mode and "x" not in mode
+        # Delegate first; record only if the underlying open succeeded so
+        # FileNotFoundError / PermissionError don't count as discovery.
+        result = original_open(file, *args, **kwargs)
         if is_read:
             matched, filename = _path_is_diff_diff_guide(file)
             if matched:
@@ -270,7 +287,7 @@ def _install_open_hook() -> None:
                         "ts": _utc_iso_now(),
                     }
                 )
-        return original_open(file, *args, **kwargs)
+        return result
 
     _pyruntime_open._pyruntime_wrapped = True  # type: ignore[attr-defined]
     builtins.open = _pyruntime_open  # type: ignore[assignment]

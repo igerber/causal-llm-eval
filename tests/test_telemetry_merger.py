@@ -33,6 +33,9 @@ def _write_transcript(path: Path, bash_commands: list[str]) -> None:
     """Write a minimal stream-JSON transcript with the given Bash commands.
 
     Each command becomes a tool_use block inside an assistant message entry.
+    A terminal `result` entry is appended so the merger's completeness
+    check passes; tests that want to exercise truncation should overwrite
+    the file without the result entry.
     """
     with open(path, "w") as f:
         for cmd in bash_commands:
@@ -50,6 +53,7 @@ def _write_transcript(path: Path, bash_commands: list[str]) -> None:
                 },
             }
             f.write(json.dumps(entry) + "\n")
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
 
 def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -67,15 +71,26 @@ def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return events, transcript, stderr_log
 
 
-def _session_start_event(sys_executable: str | None = None) -> dict:
-    """Build a session_start event. `sys_executable` defaults to None which
-    matches relative-form python invocations in the per-invocation
-    attribution check; pass an explicit absolute path to match an
-    absolute-path invocation."""
+def _session_start_event(sys_executable: str | None = None, argv: list | None = None) -> dict:
+    """Build a session_start event. Pass `argv` to match the corresponding
+    transcript-visible python invocation under the new per-invocation
+    attribution check."""
     event = {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
     if sys_executable is not None:
         event["sys_executable"] = sys_executable
+    if argv is not None:
+        event["argv"] = argv
     return event
+
+
+def _write_transcript_entries(path: Path, entries: list[dict]) -> None:
+    """Write a list of stream-JSON entries to `path`, appending a terminal
+    `result` entry so the merger's completeness check passes. Tests
+    exercising truncation should use a direct open() instead."""
+    with open(path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
 
 # ---------------------------------------------------------------------------

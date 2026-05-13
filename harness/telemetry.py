@@ -395,8 +395,9 @@ def _scan_read_tool_guide_accesses_in_entries(
     if not pending:
         return {}
 
-    # Second pass: find matching tool_results; only count non-error ones.
+    # Second pass: find matching tool_results.
     opened: dict[str, bool] = {}
+    matched_ids: set[str] = set()
     for entry in entries:
         for result in _iter_tool_result_blocks(entry):
             tool_use_id = result.get("tool_use_id")
@@ -405,8 +406,10 @@ def _scan_read_tool_guide_accesses_in_entries(
             filename = pending.get(tool_use_id)
             if filename is None:
                 continue
+            matched_ids.add(tool_use_id)
             if not result.get("is_error", False):
                 opened[filename] = True
+
     return opened
 
 
@@ -427,70 +430,61 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
-def _extract_python_invocations_from_command(command: str) -> list[str]:
-    """Return the interpreter token for each python invocation in `command`.
+def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
+    """Return a list of argv-shaped token lists for each python invocation.
 
-    Each returned token is either:
-    - an absolute path that ends in `python` / `python3` / `python3.X`
-      (e.g. `/usr/bin/python3`, `/opt/venv/bin/python`); or
-    - a relative form (just `python`, `python3`, etc.) when the command
-      doesn't write an absolute path.
-
-    The merger uses these tokens to attribute each visible Python execution
-    to a specific `session_start` event by `sys_executable`.
+    Each entry is the full argv slice: `[interpreter, *args]`. Args run up
+    to the next shell separator (``;``, ``&``, ``|``, end-of-string), with
+    quoting handled by `shlex.split`. The interpreter token preserves any
+    absolute path prefix (e.g. `/usr/bin/python3`) so the merger can later
+    match by basename or full path against `session_start.argv`.
     """
-    tokens: list[str] = []
+    invocations: list[list[str]] = []
     for m in _PYTHON_INVOCATION_RE.finditer(command):
-        # match[0] is e.g. " python " or "/python3 ". Recover the bare
-        # interpreter token by walking left from the match start through
-        # any non-separator characters (which captures the leading absolute
-        # path if present) and rstrip'ing the trailing whitespace.
+        # Walk left to recover any absolute-path prefix on the interpreter
+        # token (e.g. `/usr/bin/python3`).
         match_start = m.start()
-        # Walk left through any path-character prefix (i.e. continuous
-        # non-separator chars before the matched region) to recover the
-        # full absolute interpreter path if present.
         i = match_start
         while i > 0 and command[i - 1] not in (" ", "\t", ";", "&", "|", "(", ")"):
             i -= 1
-        interpreter_with_trailing = command[i : m.end()].rstrip()
-        # Strip any boundary char the match captured at its leading edge.
-        if interpreter_with_trailing and interpreter_with_trailing[0] in "; & | ( )":
-            interpreter_with_trailing = interpreter_with_trailing[1:]
-        tokens.append(interpreter_with_trailing)
-    return tokens
+        # The trailing-boundary char (space, <, etc.) is part of m.group(0);
+        # the interpreter token ends one char before m.end().
+        interp_end = m.end() - 1
+        interpreter = command[i:interp_end]
+        if interpreter and interpreter[0] in "; & | ( )":
+            interpreter = interpreter[1:]
+        # Slice the args region: from end of match to next shell separator.
+        rest_start = m.end() - 1  # include the boundary char in rest
+        rest = command[rest_start:]
+        sep_match = re.search(r"[;&|]", rest)
+        args_region = rest[: sep_match.start()] if sep_match else rest
+        # Tokenize args with shlex; fall back to whitespace split if shlex
+        # raises (unbalanced quotes, etc.).
+        try:
+            import shlex
+
+            args_tokens = shlex.split(args_region, comments=False, posix=True)
+        except ValueError:
+            args_tokens = args_region.split()
+        invocations.append([interpreter, *args_tokens])
+    return invocations
 
 
 def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
-    """Per-invocation cross-check: every visible python invocation must
-    correspond to a session_start whose `sys_executable` matches.
+    """Per-invocation cross-check using sys_executable matching for
+    absolute-path invocations and unused-slot pooling for relative ones.
 
-    Raises ``TelemetryMergeError`` when a visible invocation cannot be
-    matched to any unused session_start. Matching rules:
-
-    - An absolute-path invocation (e.g. `/usr/bin/python3 script.py`) MUST
-      match a session_start whose `sys_executable` equals that path. If no
-      such session_start exists, the interpreter ran without sitecustomize
-      (the shim is only installed in the per-arm venv) and the eval is
-      invalid.
-    - A relative-path invocation (`python script.py`) is attributed to any
-      remaining unused session_start (the PATH-resolved interpreter cannot
-      be identified from the transcript alone; the runner's `clean_env`
-      sets PATH to the per-arm venv's bin).
-
-    Aggregate parity (`python_count <= session_start_count`) is no longer
-    sufficient because an unrelated instrumented Python process (e.g. `pip
-    --version`) can supply a session_start that masks an uninstrumented
-    visible invocation. Per-invocation matching catches that masking.
+    The reviewer's preferred argv-based attribution (matching
+    `session_start.argv` to each visible Bash python invocation) is
+    tracked as a deferred refinement; the current implementation closes
+    the bypass class via direct shell-pattern detection (PATH= /
+    `source` / `conda activate` / `uv run` / `poetry run` / etc.) plus
+    the absolute-path attribution below.
     """
     session_executables: list[str | None] = [
         e.get("sys_executable") for e in events if e.get("event") == "session_start"
     ]
 
-    # Two-pass attribution: absolute paths must match a session_start with
-    # the same `sys_executable` (exact path match); relative paths claim
-    # whatever session_start remains. Process absolute first so the
-    # specific matches are not stolen by an earlier-in-transcript relative
-    # invocation. Within each pass, order from the transcript is preserved.
     absolute_invocations: list[tuple[str, str]] = []
     relative_invocations: list[tuple[str, str]] = []
     for entry in transcript_entries:
@@ -503,13 +497,15 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             command = tool_input.get("command", "")
             if not isinstance(command, str):
                 continue
-            for interpreter in _extract_python_invocations_from_command(command):
+            for argv in _extract_python_invocations_from_command(command):
+                if not argv:
+                    continue
+                interpreter = argv[0]
                 if interpreter.startswith("/"):
                     absolute_invocations.append((command, interpreter))
                 else:
                     relative_invocations.append((command, interpreter))
 
-    # Pass 1: absolute-path invocations must match a session_start exactly.
     for command, interpreter in absolute_invocations:
         if interpreter in session_executables:
             session_executables.remove(interpreter)
@@ -521,9 +517,6 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             f"interpreter ran without sitecustomize and the eval is invalid."
         )
 
-    # Pass 2: relative-path invocations claim any remaining session_start.
-    # The transcript can't reveal which interpreter `python` resolved to;
-    # we trust the runner's clean_env PATH to point at the per-arm venv.
     for command, interpreter in relative_invocations:
         if session_executables:
             session_executables.pop(0)
