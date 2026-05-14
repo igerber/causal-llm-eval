@@ -652,6 +652,26 @@ def _install_production_state() -> None:
     _install_warning_hook()
     _install_open_hook()
 
+    # PR #5 R1: route ``subprocess.Popen([sys.executable, ...])`` and
+    # equivalent child-spawn idioms through the layer-1.5 wrapper rather
+    # than the real interpreter. After ``exec "$real" "$@"`` in the
+    # wrapper, the real python initializes ``sys.executable`` to the
+    # path of ``python-real`` (which lives at
+    # ``${venv}/.pyruntime-real/python-real``, off the agent's PATH).
+    # A child spawn via ``[sys.executable, ...]`` would therefore exec
+    # the real interpreter directly, skipping the wrapper. Rewriting
+    # ``sys.executable`` to the wrapper's path closes this: any
+    # subprocess.Popen([sys.executable, ...]) call now re-enters the
+    # wrapper, which records exec_python and exec's python-real again.
+    _real_executable = sys.executable
+    if _real_executable.endswith("/python-real"):
+        # Map ${venv}/.pyruntime-real/python-real -> ${venv}/bin/python
+        # by walking up to the venv root and then into bin/.
+        _venv_root = os.path.dirname(os.path.dirname(_real_executable))
+        _wrapper_path = os.path.join(_venv_root, "bin", "python")
+        if os.path.exists(_wrapper_path):
+            sys.executable = _wrapper_path
+
 
 if __name__ == "sitecustomize":
     # Production path: Python's site machinery loads this file as

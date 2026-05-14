@@ -170,50 +170,76 @@ def _install_shim_into_venv(venv_path: Path) -> None:
     shutil.copyfile(_SITECUSTOMIZE_SOURCE, target)
 
 
+_REAL_INTERPRETER_DIRNAME = ".pyruntime-real"
+_REAL_INTERPRETER_FILENAME = "python-real"
+
+
 def _install_python_wrapper(venv_path: Path) -> None:
     """Replace each ``${venv}/bin/python*`` interpreter with the layer-1.5
-    wrapper, preserving the real interpreter at ``${venv}/bin/python-real``.
+    wrapper, preserving the real interpreter at
+    ``${venv}/.pyruntime-real/python-real``.
 
-    The wrapper computes its real-interpreter target as
-    ``$(dirname "$0")/python-real`` so any of the renamed interpreters can
-    invoke the same canonical real binary.
+    The real interpreter lives OUTSIDE ``bin/`` so it does not appear on
+    the agent's PATH. An agent's ``python-real`` typed on the command
+    line gets "command not found"; absolute-path invocations
+    (``${venv}/.pyruntime-real/python-real``) are catchable via
+    filesystem-scan defenses but are not on the easy bypass path.
+
+    The wrapper computes its target as
+    ``$(dirname "$0")/../.pyruntime-real/python-real``.
 
     Steps:
         1. For the first existing name in :data:`_PYTHON_INTERPRETER_NAMES`,
-           resolve its absolute target (venvs typically symlink ``python`` ->
-           ``python3.X`` -> the real system interpreter). Place the
-           canonical ``python-real`` symlink at ``${venv}/bin/python-real``
-           pointing at that absolute target.
+           materialize the real interpreter at
+           ``${venv}/.pyruntime-real/python-real``.
+           - If the existing entry is a symlink, the canonical real path is
+             ``os.path.realpath()`` of it; symlink ``python-real`` -> that
+             absolute path.
+           - If the existing entry is a real file copy (``symlinks=False``
+             in ``venv.create``), MOVE it to ``python-real``. We cannot
+             symlink-to-self because the next step overwrites the
+             original.
         2. For every existing name in :data:`_PYTHON_INTERPRETER_NAMES`,
            remove the existing entry and write a fresh copy of the wrapper
            script at that path (``chmod +x``).
     """
     bin_dir = venv_path / "bin"
-    real_target = bin_dir / "python-real"
+    real_dir = venv_path / _REAL_INTERPRETER_DIRNAME
+    real_dir.mkdir(parents=True, exist_ok=True)
+    real_target = real_dir / _REAL_INTERPRETER_FILENAME
 
-    # Pass 1: pick the first existing interpreter and capture its real path.
-    canonical_real: Path | None = None
-    for name in _PYTHON_INTERPRETER_NAMES:
-        original = bin_dir / name
-        if original.exists() or original.is_symlink():
-            canonical_real = Path(os.path.realpath(original))
-            break
-
-    if canonical_real is None:
-        raise RuntimeError(
-            f"no python interpreter found in {bin_dir!r}; venv build appears incomplete"
-        )
-
-    # Place python-real symlink (or skip if it already resolves correctly).
-    if real_target.exists() or real_target.is_symlink():
-        real_target.unlink()
-    os.symlink(canonical_real, real_target)
-
-    # Pass 2: replace each interpreter name with the wrapper script.
+    # Pass 1: find the first existing interpreter and materialize python-real.
+    materialized = False
     for name in _PYTHON_INTERPRETER_NAMES:
         original = bin_dir / name
         if not (original.exists() or original.is_symlink()):
             continue
-        original.unlink()
+        if real_target.exists() or real_target.is_symlink():
+            real_target.unlink()
+        if original.is_symlink():
+            # symlinks=True venv path: original is a symlink chain to the
+            # real system interpreter. Symlink python-real to the absolute
+            # realpath target so it survives the next overwrite.
+            canonical_real = Path(os.path.realpath(original))
+            os.symlink(canonical_real, real_target)
+        else:
+            # symlinks=False venv path: original IS the real binary copy.
+            # MOVE it (rename) to python-real so it survives the next
+            # overwrite. A symlink would dangle once the original is
+            # replaced with the wrapper.
+            original.rename(real_target)
+        materialized = True
+        break
+
+    if not materialized:
+        raise RuntimeError(
+            f"no python interpreter found in {bin_dir!r}; venv build appears incomplete"
+        )
+
+    # Pass 2: replace each interpreter name with the wrapper script.
+    for name in _PYTHON_INTERPRETER_NAMES:
+        original = bin_dir / name
+        if original.exists() or original.is_symlink():
+            original.unlink()
         shutil.copyfile(_WRAPPER_SOURCE, original)
         original.chmod(0o755)

@@ -196,7 +196,9 @@ def _exec_python_event(
         "pid": pid,
         "ppid": ppid,
         "ts": ts,
-        "executable": executable if executable is not None else "/tmp/venv/bin/python-real",
+        "executable": (
+            executable if executable is not None else "/tmp/venv/.pyruntime-real/python-real"
+        ),
         "argv": argv,
     }
 
@@ -3103,7 +3105,8 @@ def _make_paths_with_venv(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     events, transcript, stderr_log = _make_paths(tmp_path)
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True, exist_ok=True)
-    (venv / "bin" / "python-real").touch()
+    (venv / ".pyruntime-real").mkdir(parents=True, exist_ok=True)
+    (venv / ".pyruntime-real" / "python-real").touch()
     return events, transcript, stderr_log, venv
 
 
@@ -3112,7 +3115,7 @@ def test_merge_layers_three_layer_consistent_attribution(tmp_path):
     matching pid → clean TelemetryRecord.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3138,7 +3141,7 @@ def test_merge_layers_zero_agent_exec_python_with_sentinel_passes(tmp_path):
     present → clean. The sentinel proves wiring, the AST sees no python
     invocations, the three-layer check has nothing to enforce."""
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         _sentinel_events(executable=exe),
@@ -3192,7 +3195,7 @@ def test_merge_layers_forged_executable_outside_venv_root_raises(tmp_path):
         ],
     )
     _write_transcript(transcript, [])
-    with pytest.raises(TelemetryMergeError, match="not within the run's venv root"):
+    with pytest.raises(TelemetryMergeError, match="not the run's venv real interpreter"):
         merge_layers(
             "diff_diff",
             transcript,
@@ -3208,7 +3211,7 @@ def test_merge_layers_layer1_invocation_with_no_layer15_event_raises(tmp_path):
     event raises ``RunValidityError("layer-1.5 attestation missing")``.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3235,7 +3238,7 @@ def test_merge_layers_layer1_invocation_with_no_session_start_raises(tmp_path):
     attestation missing")``.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3267,7 +3270,7 @@ def test_merge_layers_exec_python_argv1plus_must_match(tmp_path):
     is allowed; argv[1:] mismatch is not.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3300,7 +3303,7 @@ def test_merge_layers_xargs_one_layer1_invocation_matches_multiple_exec_python_e
     agent exec_python events (xargs/find/parallel spawn N children).
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     # Build 3 agent exec_python events with the same argv[1:] (simulating
     # xargs spawning 3 python children).
     _write_events_jsonl(
@@ -3337,7 +3340,7 @@ def test_merge_layers_schema_rejects_malformed_exec_python_event(tmp_path):
         "pid": 12345,
         "ppid": _DEFAULT_RUNNER_PID,
         "ts": "2026-05-12T00:00:00Z",
-        "executable": str(venv / "bin" / "python-real"),
+        "executable": str(venv / ".pyruntime-real" / "python-real"),
         # missing "argv"
     }
     with open(events_path, "w") as f:
@@ -3372,7 +3375,7 @@ def test_merge_layers_schema_rejects_exec_python_executable_not_in_venv(tmp_path
         ],
     )
     _write_transcript(transcript, [])
-    with pytest.raises(TelemetryMergeError, match="not within the run's venv root"):
+    with pytest.raises(TelemetryMergeError, match="not the run's venv real interpreter"):
         merge_layers(
             "diff_diff",
             transcript,
@@ -3414,7 +3417,7 @@ def test_merge_layers_sentinel_exec_python_without_matching_session_start_raises
     sentinel invocation, no session_start is emitted -> fail closed.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3440,7 +3443,7 @@ def test_merge_layers_agent_exec_python_without_matching_session_start_raises(tm
     closed even when layer-1 didn't extract the invocation.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3469,7 +3472,7 @@ def test_merge_layers_agent_exec_python_with_dash_S_flag_raises(tmp_path):
     bypass class.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     _write_events_jsonl(
         events_path,
         [
@@ -3502,12 +3505,43 @@ def test_merge_layers_python_real_direct_invocation_flagged_as_bypass(tmp_path):
     checks.
     """
     events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
-    exe = str(venv / "bin" / "python-real")
+    exe = str(venv / ".pyruntime-real" / "python-real")
     # Provide events that would otherwise validate; the bypass check
     # should fire FIRST.
     _write_events_jsonl(events_path, _sentinel_events(executable=exe))
     _write_transcript(transcript, [f"{venv}/bin/python-real script.py"])
     with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_session_start_without_matching_exec_python_raises(tmp_path):
+    """R1 P0 #1 reciprocal: every session_start MUST have a matching
+    exec_python by pid. A session_start with no exec_python proves
+    sitecustomize loaded on an interpreter the wrapper did NOT see
+    (i.e., the agent invoked the real interpreter directly, bypassing
+    the wrapper).
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            # Bypass session: agent invoked python-real directly. Sitecustomize
+            # loaded (so session_start fires) but no exec_python event because
+            # the wrapper was skipped.
+            _session_start_event(argv=["python-real", "script.py"], pid=12345),
+        ],
+    )
+    _write_transcript(transcript, [])
+    with pytest.raises(RunValidityError, match="session_start pid"):
         merge_layers(
             "diff_diff",
             transcript,

@@ -367,24 +367,19 @@ _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
 }
 
 
-def _expected_exec_python_executables(venv_path: Path) -> set[str]:
-    """The set of valid ``executable`` values for an ``exec_python`` event
-    given a known venv root.
+def _expected_exec_python_executable(venv_path: Path) -> str:
+    """The canonical ``executable`` value for an ``exec_python`` event
+    given a known venv root, in ``os.path.normpath`` form.
 
-    Mirrors the rename set produced by
-    :func:`harness.venv_pool._install_python_wrapper`. Used by the merger to
-    structurally reject agent-forged ``exec_python`` events whose
-    ``executable`` field points anywhere outside the run's venv root.
+    PR #5 R1: the real interpreter lives at
+    ``${venv}/.pyruntime-real/python-real`` so it stays off the agent's
+    PATH. The wrapper records the path as
+    ``$(dirname "$0")/../.pyruntime-real/python-real`` (with an embedded
+    ``/..`` segment); the merger normalizes both sides before comparing,
+    so the wrapper's literal form and the resolved form both compare
+    equal to this canonical value.
     """
-    bin_dir = venv_path / "bin"
-    return {
-        str(bin_dir / "python-real"),
-        str(bin_dir / "python3-real"),
-    } | {
-        # Cover any python3.X-real alias the venv produced.
-        str(p)
-        for p in bin_dir.glob("python3.*-real")
-    }
+    return os.path.normpath(str(venv_path / ".pyruntime-real" / "python-real"))
 
 
 def _validate_event_schemas(
@@ -510,17 +505,21 @@ def _validate_event_schemas(
             argv = event["argv"]
             if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
                 _bail(f"argv must be list[str], got {type(argv).__name__}={argv!r}")
-            # Venv-root-anchored allowlist (PR #5): structurally rejects
+            # Venv-root-anchored exact match (PR #5): structurally rejects
             # agent-forged exec_python events whose `executable` points
-            # outside the run's venv root. Skipped when venv_path is None
-            # (legacy fixture mode).
+            # outside the run's venv root. Both sides normalized through
+            # os.path.normpath so the wrapper's literal
+            # ``${venv}/bin/../.pyruntime-real/python-real`` and the
+            # resolved form ``${venv}/.pyruntime-real/python-real``
+            # compare equal. Skipped when venv_path is None (legacy
+            # fixture mode).
             if venv_path is not None:
-                allowed = _expected_exec_python_executables(venv_path)
-                if executable not in allowed:
+                expected = _expected_exec_python_executable(venv_path)
+                if os.path.normpath(executable) != expected:
                     _bail(
-                        f"executable {executable!r} is not within the run's "
-                        f"venv root {venv_path}; expected one of {sorted(allowed)!r}. "
-                        f"This guards against agent-forged exec_python events."
+                        f"executable {executable!r} is not the run's venv "
+                        f"real interpreter; expected {expected!r}. This "
+                        f"guards against agent-forged exec_python events."
                     )
 
 
@@ -1150,7 +1149,17 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
     # must match the session exactly.
     if "/" in visible_argv[0]:
         return False
-    return Path(session_argv[0]).name == Path(visible_argv[0]).name
+    session_basename = Path(session_argv[0]).name
+    visible_basename = Path(visible_argv[0]).name
+    # PR #5 R1: after the wrapper's ``exec "$real" "$@"`` the real python
+    # records ``sys.orig_argv[0]`` as the path to ``python-real``, so its
+    # basename is e.g. ``python-real``. A visible bare-token invocation
+    # like ``python script.py`` should still match the session created
+    # by routing through the wrapper. Strip the ``-real`` suffix on the
+    # session side before comparing basenames.
+    if session_basename.endswith("-real"):
+        session_basename = session_basename[: -len("-real")]
+    return session_basename == visible_basename
 
 
 def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
@@ -1299,12 +1308,18 @@ def _validate_three_layer_consistency(
         if isinstance(pid, int) and not isinstance(pid, bool):
             sessions_by_pid.setdefault(pid, []).append(s)
 
-    # Reciprocal check (R0 P0 #2): every exec_python event - sentinel and
-    # agent alike - MUST have a matching session_start by pid. The wrapper
-    # exec's into the real python, which loads sitecustomize and emits
-    # session_start with the SAME pid. A missing session_start means
-    # sitecustomize failed to load (e.g., the agent invoked the real
-    # python with ``-S`` which skips ``site.py`` import).
+    all_exec_pids: set[int] = set()
+    for evt in sentinels + agent_exec_events:
+        pid = evt.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            all_exec_pids.add(pid)
+
+    # Reciprocal check #1 (R0 P0 #2): every exec_python event - sentinel
+    # and agent alike - MUST have a matching session_start by pid. The
+    # wrapper exec's into the real python, which loads sitecustomize and
+    # emits session_start with the SAME pid. A missing session_start
+    # means sitecustomize failed to load (e.g., the agent invoked the
+    # real python with ``-S`` which skips ``site.py`` import).
     for evt in sentinels + agent_exec_events:
         pid = evt.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool):
@@ -1317,6 +1332,30 @@ def _validate_three_layer_consistency(
                 f"The wrapper recorded a python invocation but sitecustomize "
                 f"did not load (likely a ``-S`` flag or otherwise neutered "
                 f"site.py import). Cold-start eval is invalid."
+            )
+
+    # Reciprocal check #2 (R1 P0 #1): every session_start MUST have a
+    # matching exec_python by pid. The wrapper fires BEFORE sitecustomize
+    # (wrapper writes exec_python then exec's the real python which loads
+    # sitecustomize and emits session_start), so a session_start without
+    # a matching exec_python proves sitecustomize loaded on an interpreter
+    # the wrapper did NOT see. The only way that happens is the agent
+    # invoked the real interpreter directly (e.g.,
+    # ``${venv}/.pyruntime-real/python-real script.py`` via filesystem
+    # discovery, or a ``find -exec`` delegated form that found the real
+    # binary). The merger fails closed.
+    for s in sessions:
+        pid = s.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if pid not in all_exec_pids:
+            raise RunValidityError(
+                f"layer-1.5 attestation missing for session_start pid={pid}: "
+                f"no exec_python event with matching pid. Sitecustomize "
+                f"loaded but the layer-1.5 wrapper did NOT fire for this "
+                f"interpreter invocation. Likely a direct exec of the real "
+                f"interpreter that bypassed the wrapper. Cold-start eval "
+                f"is invalid."
             )
 
     # Reciprocal check: any exec_python.argv containing ``-S`` (or compact

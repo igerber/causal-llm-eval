@@ -24,48 +24,50 @@
 # Tested compatible with dash, mawk/gawk/busybox awk, macOS bash 3.2 in
 # POSIX mode.
 
-real="$(dirname "$0")/python-real"
+real="$(dirname "$0")/../.pyruntime-real/python-real"
 
 log="${_PYRUNTIME_EVENT_LOG:-}"
 if [ -n "$log" ]; then
-    # Fail closed on newline/CR in any argv element BEFORE encoding. The
-    # line-oriented awk encoder cannot preserve embedded newlines (one
-    # element with a newline would split into two records, so the JSON
-    # array no longer matches the real argv). POSIX argv may legally
-    # contain newlines but realistic agent invocations never do; the
-    # wrapper fails closed rather than emit corrupted attestation.
-    nl=$(printf '\n')
-    cr=$(printf '\r')
-    for a in "$@"; do
-        case "$a" in
-            *"$nl"* | *"$cr"*)
-                printf '[pyruntime-wrapper] argv contains newline/CR; cannot attest\n' >&2
-                exit 2
-                ;;
-        esac
-    done
-
     # JSON-encode argv via a single awk invocation. The recorded argv is
     # ``[basename($0), $@]`` so the merger can match on ``argv[1:]``
     # against the layer-1 AST extraction (which produces
     # ``[interpreter, *args]``) and against layer-2's ``sys.orig_argv[1:]``
-    # (which the real python records post-exec). All three layers'
-    # ``argv[1:]`` = the script + flags.
+    # (which the real python records post-exec).
+    #
+    # POSIX argv may legally contain newlines, but the line-oriented
+    # printf-awk pipeline cannot preserve embedded newlines (one arg with
+    # a newline splits into two records). The wrapper fails closed on
+    # newline/CR via awk's NR record count: if awk processes more records
+    # than (expected_args + 1), an arg contained an embedded newline.
+    # The +1 accounts for the basename($0) prepended to the stream.
+    #
+    # Note: $(printf '\n') strips its own trailing newline and would
+    # produce an empty string; case-pattern matching against an empty
+    # substring matches every argv. Using awk's NR counter avoids this
+    # POSIX shell-quoting trap entirely.
     arg0_basename=$(basename "$0")
-    args_json=$(printf '%s\n' "$arg0_basename" "$@" | awk '
+    expected_records=$(($# + 1))
+    args_json=$(printf '%s\n' "$arg0_basename" "$@" | awk -v expected="$expected_records" '
         BEGIN { first = 1; printf "[" }
         {
             gsub(/\\/, "\\\\")
             gsub(/"/, "\\\"")
             gsub(/\010/, "\\b")
             gsub(/\014/, "\\f")
+            gsub(/\015/, "\\r")
             gsub(/\t/, "\\t")
             if (first) { first = 0 } else { printf "," }
             printf "\"%s\"", $0
         }
-        END { printf "]" }
+        END {
+            printf "]"
+            if (NR != expected) {
+                printf "RECORD_COUNT_MISMATCH" > "/dev/stderr"
+                exit 2
+            }
+        }
     ') || {
-        printf '[pyruntime-wrapper] argv encoding failed\n' >&2
+        printf '[pyruntime-wrapper] argv contains embedded newline; cannot attest\n' >&2
         exit 2
     }
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
