@@ -1545,6 +1545,59 @@ def test_merge_layers_diff_diff_raises_on_bash_dash_o_pipefail_dash_c(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# R16 regressions: wrapper-aware unwrap closes the architectural class
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Absolute path under modifiers (R16 finding 1, examples 1-2)
+        "command /usr/bin/python -S script.py",
+        "time /usr/bin/python -S script.py",
+        # Modifier with options (R16 finding 1, examples 3-5)
+        "nice -n 10 python -S script.py",
+        "timeout --signal=KILL 30 python -S script.py",
+        "xargs -I{} python -S script.py",
+        # env modifier (R16 finding 1, example 6)
+        "env /usr/bin/python -S script.py",
+        # Shell control structures (R16 finding 1, examples 7-9)
+        "{ python -S script.py; }",
+        "if python -S script.py; then echo ok; fi",
+        "! python -S script.py",
+        # Backtick command substitution (R16 finding 1, example 10)
+        "echo `python -S script.py`",
+    ],
+)
+def test_merge_layers_diff_diff_unwrap_catches_hidden_dash_S(command, tmp_path):
+    """R16 P0: shell wrappers / modifiers / control structures /
+    substitutions can hide the ``-S`` bypass primitive from outer
+    scanning. The unwrapper recursively strips known forms and the
+    bypass detector inspects each variant for python+``-S``.
+    Pre-R16 the merger could accept these with an empty event log
+    because no visible python invocation was extracted."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, [command])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_unwrap_does_not_overflag_safe_wrappers(tmp_path):
+    """R16 negative test: a benign wrapper around python (no ``-S``) must
+    not be flagged as bypass. ``time python script.py`` should attribute
+    normally given a matching session_start."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(transcript, ["time python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+# ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
 

@@ -220,6 +220,140 @@ _BARE_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*S[A-Za-z]*(?:[\s=]|$)")
 _PYTHON_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_])python(?:3(?:\.\d+)?)?(?![A-Za-z0-9_])")
 
 
+# Recursive shell unwrapper: strip known wrapper forms (modifiers, shell -c
+# wrappers, brace groups, control prefixes, command substitutions) so the
+# inner python invocation is exposed to the existing primitive detectors.
+# The architectural insight: PR #5's per-arm-venv install makes wrappers
+# THEMSELVES harmless (any python that PATH-resolves to the venv binary
+# auto-loads sitecustomize). The remaining bypass primitives are ``-S``,
+# absolute non-venv interpreter paths, and ``PATH=`` overrides; what the
+# unwrapper protects is letting THOSE be hidden inside arbitrary wrappers.
+#
+# Each extractor is intentionally narrow: it pattern-matches one recognized
+# wrapper form and yields the inner content. The orchestrator iterates to
+# fixed point so e.g. ``time bash -c "python -S ..."`` unwraps to the
+# inner ``python -S ...`` in two passes.
+_BASH_DASH_C_RE = re.compile(
+    r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\b(?:\s+\S+)*?\s+-[a-zA-Z]*c\s+(['\"])((?:(?!\1).)*)\1"
+)
+_EVAL_PAYLOAD_RE = re.compile(r"(?:^|[\s;&|()])(?:eval|exec)\s+(['\"])((?:(?!\1).)*)\1")
+_DOLLAR_PAREN_RE = re.compile(r"\$\(([^()]+)\)")
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_BRACE_GROUP_RE = re.compile(r"\{\s+(.+?);\s*\}")
+_PAREN_SUBSHELL_RE = re.compile(r"(?:^|\s)\(\s*([^()]+?)\s*\)")
+_IF_PREFIX_RE = re.compile(r"^if\s+(.+?);\s*then\b", re.DOTALL)
+_WHILE_PREFIX_RE = re.compile(r"^(?:while|until)\s+(.+?);\s*do\b", re.DOTALL)
+_NEGATION_PREFIX_RE = re.compile(r"^!\s+(.+)$")
+
+# Recognized command modifiers that take a command (and possibly options /
+# numeric args) before that command.
+_COMMAND_MODIFIER_NAMES = (
+    "command",
+    "time",
+    "nohup",
+    "nice",
+    "timeout",
+    "env",
+    "xargs",
+    "exec",
+    "stdbuf",
+    "ionice",
+    "chrt",
+)
+
+
+def _strip_command_modifier_prefix(command: str) -> list[str]:
+    """If ``command`` starts with a recognized modifier word (``command``,
+    ``time``, ``nohup``, ``nice``, ``timeout``, ``env``, ``xargs``,
+    ``exec``, etc.), strip JUST the modifier word and return the rest.
+
+    Option/arg structure is intentionally NOT parsed: the bypass
+    detector iterating over variants is content-based (looks for
+    ``python`` literal AND ``-S`` literal anywhere in the variant),
+    so leaving option tokens like ``-n 10`` or ``--signal=KILL 30`` in
+    the variant is harmless. They don't match python+``-S`` themselves
+    and they don't suppress the match downstream.
+
+    Returns ``[]`` if no modifier is present.
+    """
+    s = command.lstrip()
+    for mod in _COMMAND_MODIFIER_NAMES:
+        if s.startswith(mod + " ") or s.startswith(mod + "\t"):
+            rest = s[len(mod) :].lstrip()
+            if rest and rest != s:
+                return [rest]
+    return []
+
+
+def _strip_shell_control_prefix(command: str) -> list[str]:
+    """Extract the test/body command from leading shell-control structures:
+    ``if CMD; then``, ``while CMD; do``, ``until CMD; do``, ``! CMD``."""
+    out: list[str] = []
+    s = command.lstrip()
+    m = _NEGATION_PREFIX_RE.match(s)
+    if m:
+        out.append(m.group(1).strip())
+    m = _IF_PREFIX_RE.match(s)
+    if m:
+        out.append(m.group(1).strip())
+    m = _WHILE_PREFIX_RE.match(s)
+    if m:
+        out.append(m.group(1).strip())
+    return out
+
+
+def _unwrap_command_for_inspection(command: str, max_depth: int = 10) -> list[str]:
+    """Return a list of inner-command strings extracted by recursively
+    unwrapping known shell wrapper forms.
+
+    The original command is always the first element. Each recognized
+    wrapper contributes one or more entries: the bare inner command after
+    the wrapper is stripped. Recursion is bounded by ``max_depth`` and a
+    visited set so cyclic-looking constructs cannot loop.
+
+    Wrappers handled:
+
+    - **Quoted-payload shell wrappers**: ``bash [opts] -c "CODE"``,
+      ``sh -c 'CODE'``, ``eval "CODE"``, ``exec "CODE"`` (and zsh/dash/ksh).
+    - **Command modifiers**: ``command``, ``time``, ``nohup``, ``nice
+      [-n N]``, ``timeout [opts] N``, ``env [-u VAR | VAR=val]*``,
+      ``xargs [opts]``, ``exec``, ``stdbuf``, ``ionice``, ``chrt``.
+    - **Shell control**: ``! CMD``, ``if CMD; then ...``, ``while CMD; do
+      ...``, ``until CMD; do ...``, ``{ CMD; }`` brace groups,
+      ``( CMD )`` subshells.
+    - **Substitution**: ``$(CMD)``, ``\\`CMD\\```.
+
+    The bypass detector iterates over the returned list and runs primitive
+    bypass checks (``-S`` flag literal, absolute non-venv path, ``PATH=``)
+    on each variant. A primitive hidden inside any recognized wrapper is
+    surfaced.
+    """
+    seen: set[str] = {command}
+    out: list[str] = [command]
+    queue: list[tuple[str, int]] = [(command, 0)]
+    extractors = (
+        lambda c: [m.group(2) for m in _BASH_DASH_C_RE.finditer(c)],
+        lambda c: [m.group(2) for m in _EVAL_PAYLOAD_RE.finditer(c)],
+        lambda c: [m.group(1).strip() for m in _DOLLAR_PAREN_RE.finditer(c)],
+        lambda c: [m.group(1).strip() for m in _BACKTICK_RE.finditer(c)],
+        lambda c: [m.group(1).strip() for m in _BRACE_GROUP_RE.finditer(c)],
+        lambda c: [m.group(1).strip() for m in _PAREN_SUBSHELL_RE.finditer(c)],
+        _strip_command_modifier_prefix,
+        _strip_shell_control_prefix,
+    )
+    while queue:
+        cmd, depth = queue.pop()
+        if depth >= max_depth:
+            continue
+        for extractor in extractors:
+            for inner in extractor(cmd):
+                if inner and inner not in seen:
+                    seen.add(inner)
+                    out.append(inner)
+                    queue.append((inner, depth + 1))
+    return out
+
+
 # Python interpreter flag that bypasses `sitecustomize.py`: `-S` disables
 # `site.py` (which is what imports sitecustomize). Note `-I` (isolated mode)
 # implies `-E`, `-P`, and `-s` (lowercase) — NOT `-S`. Isolated mode does
@@ -998,10 +1132,25 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             # quoted code, NOT after the script argument). The argv-walking
             # check operates on shlex-tokenized argv so a -S substring
             # inside a quoted -c code argument cannot false-positive.
+            argv_walk_hit = False
             for argv in _extract_python_invocations_from_command(command):
                 if _argv_contains_bypass_flag(argv[1:]):
                     bypass_commands.append(command)
+                    argv_walk_hit = True
                     break  # one bypass per command is enough to record
+            if argv_walk_hit:
+                continue
+            # Wrapper-aware unwrap: extract inner-command variants from
+            # known shell wrappers (modifiers, bash -c "...", brace groups,
+            # if/while/!, $(...), `...`) and check each variant for the
+            # python+`-S` primitive. Catches forms the regexes above missed
+            # because the wrapper hid the python invocation from outer
+            # scanning. The original command is element [0]; the regex
+            # checks above already handled that, so skip it here.
+            for variant in _unwrap_command_for_inspection(command)[1:]:
+                if _PYTHON_LITERAL_RE.search(variant) and _BARE_BYPASS_FLAG_RE.search(variant):
+                    bypass_commands.append(command)
+                    break
     return bypass_commands
 
 
