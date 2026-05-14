@@ -7,6 +7,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `harness/shell_parser.py`: bashlex-AST-based Bash command parser for
+  layer-1 attestation. Public surface: `parse_python_invocations`,
+  `find_python_bypass_invocations`, `argv_contains_bypass_flag`.
+  Replaces ~600 lines of regex-based extractors and wrapper-unwrappers
+  that grew shape-by-shape across PR #4's 26 review rounds. The AST
+  walker visits every CommandNode reachable from the parsed tree
+  (including bodies of if/while/for, contents of `eval` /
+  `bash -c "..."` payloads via recursive re-parse, and command
+  substitutions in `$(...)` / backticks) so wrapper-attribution forms
+  surface from language structure rather than from a hand-curated
+  list of regex patterns.
+- `RunValidityError` exception (neutral parent class).
+  `TelemetryMergeError` is now a subclass. New parser-side subclasses
+  `ShellCommandIndeterminate` (variable expansion / command-
+  substitution / parameter expansion in a Python command-word or
+  argv-word) and `ShellCommandParseError` (bashlex cannot model the
+  command; e.g. `case` patterns) both inherit from `RunValidityError`,
+  so callers catching the parent unify fail-closed handling across
+  layer-1 and layer-2/3 failures.
+- `bashlex==0.18` as a new runtime dependency (pinned exactly; upstream
+  is dormant and AST-shape drift would silently break parsing).
+
+### Changed
+- Layer-1 Python-invocation extraction in `harness/telemetry.py` now
+  delegates to `harness.shell_parser`. The previous regex extractors
+  (`_extract_python_invocations_from_command`,
+  `_unwrap_command_for_inspection`, `_strip_heredoc_bodies`,
+  `_strip_command_modifier_prefix`, `_strip_shell_control_prefix`,
+  `_is_in_command_position`, `_find_unquoted_separator`, plus ~20
+  regex constants) are removed. The wrapper-attribution enumeration
+  class (R20 command substitution, R23 P0#2 relative-slash paths, R25
+  modifiers-after-separators, R26 quoted command words /
+  path-qualified wrappers / sudo) closes as a category - no longer a
+  list of patterns to maintain.
+- Indeterminate command-words (variable expansion, command
+  substitution, parameter expansion) and bashlex parse failures
+  now raise `RunValidityError` subclasses. The merger fails closed
+  rather than silently treating these as no-Python.
+
+### Removed
+- ~600 lines of regex-based shell-parsing helpers and their
+  constants from `harness/telemetry.py`. Functionality is preserved
+  in `harness/shell_parser.py` via AST walking. No external
+  consumers existed (verified by audit).
+
+
 - Cold-start agent runner (`harness.runner.run_one`) implementing the locked
   `claude --bare ...` invocation with `cwd=tmpdir`, `env=clean_env`, and
   pre-spawn writability check on the per-run event log path. `_PYRUNTIME_EVENT_LOG`

@@ -11,6 +11,7 @@ import pytest
 
 from harness.telemetry import (
     _VARIANT_TO_FILENAME,
+    RunValidityError,
     TelemetryMergeError,
     TelemetryRecord,
     _count_python_invocations,
@@ -1273,21 +1274,30 @@ def test_merge_layers_diff_diff_raises_on_standalone_path_then_python_semicolon(
 
 
 def test_merge_layers_diff_diff_raises_on_env_python(tmp_path):
-    """R5 P0: `env python` resolves via PATH; can pick up a non-shim
-    interpreter."""
+    """R5 P0: ``env python`` resolves the interpreter via PATH; in the
+    per-arm-venv design the resolved interpreter may differ from the
+    session_start's argv (which records the absolute resolved path
+    via sys.orig_argv). With the AST parser, ``env`` is stripped as a
+    wrapper and ``python script.py`` is the extracted invocation;
+    attribution fails because the session_start argv won't match.
+    Fail-closed via 'no matching session_start' instead of 'bypass'."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
     _write_transcript(transcript, ["env python script.py"])
-    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+    with pytest.raises(RunValidityError, match="bypass flag|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 def test_merge_layers_diff_diff_raises_on_dot_python(tmp_path):
-    """R5 P0: `./python` invokes a local binary."""
+    """R5 P0: ``./python`` invokes a local binary - one whose path
+    contains a separator. The AST parser extracts ``[./python,
+    script.py]``; exact-match attribution (no basename fallback for
+    slash-containing paths) finds no matching session and fails closed
+    via 'no matching session_start'."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
     _write_transcript(transcript, ["./python script.py"])
-    with pytest.raises(TelemetryMergeError, match="bypass flag"):
+    with pytest.raises(RunValidityError, match="bypass flag|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -2297,12 +2307,18 @@ def test_merge_layers_diff_diff_post_heredoc_python_dash_S(tmp_path):
 )
 def test_merge_layers_diff_diff_shell_control_body_requires_session(command, tmp_path):
     """R18 P0 #1: python in a one-line shell-control body (for/while/if-then/
-    case-arm) must be extracted and attributed. Pre-R18 the body command was
-    not unwrapped, so absent session_start did not fail closed."""
+    case-arm) must be extracted and attributed. The AST walker recurses
+    into body subtrees so all variants surface; ``for`` bodies with
+    non-literal argv (``$f``) raise ShellCommandIndeterminate, ``case``
+    raises ShellCommandParseError (bashlex doesn't model patterns), and
+    the rest produce 'no matching session_start' on an empty event log."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])  # no session
     _write_transcript(transcript, [command])
-    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+    with pytest.raises(
+        RunValidityError,
+        match=("bypass|no matching session_start|non-literal expansion|" "unsupported Bash form"),
+    ):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -2533,13 +2549,17 @@ def test_merge_layers_diff_diff_env_wrapper_and_command_substitution(command, tm
     """R20 P0: absolute env wrappers (/usr/bin/env, /bin/env,
     /usr/local/bin/env), env -S forms, and command-substitution python
     launches (``$(which python)``, ``\\`which python\\```, ``$(command -v
-    python)``) all fail closed. Pre-R20 the env_before_python regex only
-    matched bare ``env``, and command-substitution argv0 forms were
-    invisible to the extractor."""
+    python)``) all fail closed. With the AST parser, command-
+    substitution argv[0] forms raise ShellCommandIndeterminate (their
+    resolved value cannot be statically known); env wrappers walk to the
+    inner python and fail attribution."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])
     _write_transcript(transcript, [command])
-    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+    with pytest.raises(
+        RunValidityError,
+        match=("bypass|no matching session_start|non-literal expansion|" "unsupported Bash form"),
+    ):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 

@@ -25,9 +25,16 @@ from __future__ import annotations
 
 import json
 import os.path
-import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from harness.shell_parser import (
+    RunValidityError,
+    ShellCommandIndeterminate,
+    ShellCommandParseError,
+    find_python_bypass_invocations,
+    parse_python_invocations,
+)
 
 
 @dataclass
@@ -114,7 +121,7 @@ class TelemetryRecord:
                     )
 
 
-class TelemetryMergeError(RuntimeError):
+class TelemetryMergeError(RunValidityError):
     """Raised when ``merge_layers`` cannot produce a valid TelemetryRecord.
 
     Distinct cases:
@@ -127,8 +134,10 @@ class TelemetryMergeError(RuntimeError):
       but the in-process layer has no ``session_start`` event (shim never
       loaded; cold-start eval is invalid).
 
-    All four cases are fail-closed; the merger does not silently downgrade
-    to a "no agent activity" record.
+    Subclass of ``RunValidityError`` so callers catching either class
+    handle this case. ``RunValidityError`` is the neutral parent that
+    layer-1 parser issues (``ShellCommandIndeterminate``,
+    ``ShellCommandParseError``) also derive from.
     """
 
 
@@ -141,384 +150,6 @@ _VARIANT_TO_FILENAME: dict[str, str] = {
     "practitioner": "llms-practitioner.txt",
     "autonomous": "llms-autonomous.txt",
 }
-
-
-# Word-boundary regex for python-invocation detection in the layer-1
-# cross-check. Matches `python`, `python3`, `python3.11` at a token boundary.
-# Boundary set includes `/` so absolute interpreter paths
-# (`/usr/bin/python3 script.py`, `/opt/venv/bin/python -c "..."`) are caught,
-# and `;`/`&`/`|`/`(` so compound shell commands
-# (`pip install foo && python script.py`) are caught. The trailing `\s|$`
-# requirement guards against false positives like `/opt/python/` (the `/`
-# after `python` is neither whitespace nor end-of-string).
-_PYTHON_INVOCATION_RE = re.compile(r"(?:^|[\s;&|()/])python(?:3(?:\.\d+)?)?(?:[\s<>]|$)")
-
-
-# Shell patterns that mutate or override the resolved interpreter location.
-# Any of these in a command containing a python invocation means the
-# resolved interpreter may NOT be the per-arm-venv python — fail-closed.
-#
-# Forms detected:
-# - Inline / pre-invocation / exported PATH mutation
-# - venv activation: `source X`, `. X`, `conda activate`, `pyenv shell`
-# - env-driven resolution: `env python`, `env -u VAR python`
-# - Local binary: `./python`
-#
-# Detection is conservative: ANY of these patterns in a command that ALSO
-# contains a python invocation triggers fail-closed. This over-catches
-# benign cases (e.g. `echo PATH=/foo && python`), but agents rarely emit
-# such patterns for non-bypass reasons; failing-closed is correct.
-_PATH_ASSIGNMENT_RE = re.compile(r"(?:^|[\s;&|])(?:export\s+)?PATH=\S+")
-# PYTHONPATH / PYTHONHOME / PYTHONSTARTUP / PYTHONUSERBASE all alter
-# Python's import resolution or run startup code in the agent's process;
-# if either is set, the interpreter resolves modules differently from a
-# clean per-arm-venv start, and the shim's discoverability claims are
-# at risk.
-_PYTHON_ENV_VAR_RE = re.compile(
-    r"(?:^|[\s;&|])(?:export\s+)?PYTHON(?:PATH|HOME|STARTUP|USERBASE)=\S+"
-)
-_SHELL_ACTIVATION_RE = re.compile(
-    r"(?:^|[\s;&|])(?:source\s+\S+|\.\s+\S+|conda\s+activate|pyenv\s+shell)"
-)
-# Wrapper commands that launch Python through a tool-managed environment.
-# The launched Python may not have sitecustomize installed (uv/poetry use
-# their own venv; conda run / pyenv exec use the named env).
-_PYTHON_WRAPPER_RE = re.compile(r"(?:^|[\s;&|])(?:uv\s+run|poetry\s+run|conda\s+run|pyenv\s+exec)")
-# env wrapper: bare ``env``, ``/usr/bin/env``, ``/bin/env``, ``/usr/local/bin/env``,
-# all followed by optional flags (e.g. ``env -S python``, ``env -u VAR python``)
-# and then the python token. The path-prefix variants resolve to the same
-# binary as bare ``env`` and bypass PATH-based interpreter resolution the
-# same way.
-_ENV_BEFORE_PYTHON_RE = re.compile(
-    r"(?:^|[\s;&|()])(?:/(?:usr/(?:local/)?)?bin/)?env" r"(?:\s+-\S+(?:\s+\S+)?)*\s+python"
-)
-_DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
-# Command-substitution that resolves to a python interpreter path:
-# ``$(which python)``, ``$(command -v python)``, ``$(type -p python)``, and
-# backtick equivalents. The substitution resolves at shell-eval time to a
-# path we cannot predict, so any python invocation through this form is
-# fail-closed (no session_start argv can be matched against an opaque
-# substitution).
-_PYTHON_COMMAND_SUBSTITUTION_RE = re.compile(
-    r"(?:\$\(|`)\s*(?:which|command\s+-v|type\s+-p)\s+python(?:3(?:\.\d+)?)?\s*(?:\)|`)"
-)
-# Shell wrappers that take a quoted code payload (``bash -c``, ``sh -c``,
-# ``zsh -c``, ``bash -lc``, etc. plus ``eval`` and ``exec``). When such a
-# wrapper appears AND the command also contains a ``python``-shaped token
-# anywhere (including inside the quoted payload), the inner python invocation
-# is invisible to the regex-based attribution path; fail-closed.
-_SHELL_WRAPPER_RE = re.compile(
-    # Shell name, then zero or more option tokens (lazy), then -c (or -lc /
-    # -ic / -Sc etc). The lazy `(?:\s+\S+)*?` allows option-token forms like
-    # `bash --noprofile -c "..."` or `bash -o pipefail -c "..."`.
-    r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\b(?:\s+\S+)*?\s+-[a-zA-Z]*c(?:\s|$)"
-)
-_EVAL_WRAPPER_RE = re.compile(r"(?:^|[\s;&|()])(?:eval|exec)(?:\s|$)")
-# Command modifier prefixes that take a command as their argument:
-# `command python ...`, `time python ...`, `nohup python ...`, `nice python ...`,
-# `timeout 30 python ...`, `xargs python ...`. The python token is not in
-# command position by `_is_in_command_position`, so the extractor skips it.
-# When a command pairs one of these with a python literal AND a `-S`-style
-# bypass flag literal, fail closed.
-_COMMAND_MODIFIER_BEFORE_PYTHON_RE = re.compile(
-    r"(?:^|[\s;&|()])(?:command|time|nohup|nice|timeout|xargs)"
-    r"(?:\s+-?\d+\S*)*"  # optional numeric/short-flag args (e.g. `timeout 30`)
-    r"\s+(?:[A-Z_][A-Za-z0-9_]*=\S+\s+)*"  # optional KEY=value env-prefixes
-    r"python(?:3(?:\.\d+)?)?\b"
-)
-# Word-boundary `-S` short-flag pattern (also catches compact forms like
-# `-Sc`, `-IS`). Used together with the modifier pattern above to detect
-# command-prefix bypass without enumerating every modifier+flag combination.
-_BARE_BYPASS_FLAG_RE = re.compile(r"(?:^|\s)-[A-Za-z]*S[A-Za-z]*(?:[\s=]|$)")
-# Word-boundary ``python`` match that ignores ``pythonic`` / ``/opt/python_libs/``
-# but DOES find ``python`` inside quoted strings (because string content is
-# inspected raw here, not via shlex). Used together with the wrapper regexes
-# to detect inner-payload bypasses.
-_PYTHON_LITERAL_RE = re.compile(r"(?<![A-Za-z0-9_])python(?:3(?:\.\d+)?)?(?![A-Za-z0-9_])")
-
-
-# Recursive shell unwrapper: strip known wrapper forms (modifiers, shell -c
-# wrappers, brace groups, control prefixes, command substitutions) so the
-# inner python invocation is exposed to the existing primitive detectors.
-# The architectural insight: PR #5's per-arm-venv install makes wrappers
-# THEMSELVES harmless (any python that PATH-resolves to the venv binary
-# auto-loads sitecustomize). The remaining bypass primitives are ``-S``,
-# absolute non-venv interpreter paths, and ``PATH=`` overrides; what the
-# unwrapper protects is letting THOSE be hidden inside arbitrary wrappers.
-#
-# Each extractor is intentionally narrow: it pattern-matches one recognized
-# wrapper form and yields the inner content. The orchestrator iterates to
-# fixed point so e.g. ``time bash -c "python -S ..."`` unwraps to the
-# inner ``python -S ...`` in two passes.
-_BASH_DASH_C_RE = re.compile(
-    r"(?:^|[\s;&|()])(?:bash|sh|zsh|dash|ksh)\b(?:\s+\S+)*?\s+-[a-zA-Z]*c\s+(['\"])((?:(?!\1).)*)\1"
-)
-_EVAL_PAYLOAD_RE = re.compile(r"(?:^|[\s;&|()])(?:eval|exec)\s+(['\"])((?:(?!\1).)*)\1")
-_DOLLAR_PAREN_RE = re.compile(r"\$\(([^()]+)\)")
-_BACKTICK_RE = re.compile(r"`([^`]+)`")
-_BRACE_GROUP_RE = re.compile(r"\{\s+(.+?);\s*\}")
-_PAREN_SUBSHELL_RE = re.compile(r"(?:^|\s)\(\s*([^()]+?)\s*\)")
-_IF_PREFIX_RE = re.compile(r"^if\s+(.+?);\s*then\b", re.DOTALL)
-_WHILE_PREFIX_RE = re.compile(r"^(?:while|until)\s+(.+?);\s*do\b", re.DOTALL)
-_NEGATION_PREFIX_RE = re.compile(r"^!\s+(.+)$")
-# Shell control BODIES (test command vs body command): the prefix patterns
-# above extract the test command; these extract the body. ``then BODY (else
-# BODY)? fi``, ``do BODY done``, and ``case ... in PATTERN) BODY ;;`` arms.
-_THEN_BODY_RE = re.compile(r"\bthen\s+(.+?)(?:\s*;\s*(?:else|elif|fi)\b|$)", re.DOTALL)
-_ELSE_BODY_RE = re.compile(r"\belse\s+(.+?)(?:\s*;\s*fi\b|$)", re.DOTALL)
-_DO_BODY_RE = re.compile(r"\bdo\s+(.+?)(?:\s*;\s*done\b|$)", re.DOTALL)
-_CASE_ARM_RE = re.compile(r"\)\s+([^;)]+?)\s*;;", re.DOTALL)
-
-# Recognized command modifiers that take a command (and possibly options /
-# numeric args) before that command.
-_COMMAND_MODIFIER_NAMES = (
-    "command",
-    "time",
-    "nohup",
-    "nice",
-    "timeout",
-    "env",
-    "xargs",
-    "exec",
-    "stdbuf",
-    "ionice",
-    "chrt",
-)
-
-
-_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*")
-
-
-def _split_on_unquoted_separators(command: str) -> list[str]:
-    """Split ``command`` on every unquoted shell separator and return the
-    resulting segments. Each segment is a single shell command (with no
-    leading/trailing separator), suitable for per-segment modifier
-    detection.
-
-    Mirrors ``_find_unquoted_separator`` semantics (tracks single/double
-    quoting; recognizes ``;``, ``&``, ``|``, ``)``, ``\\n``) but yields
-    all segments instead of just the first separator position. Multi-char
-    operators ``&&`` and ``||`` are handled by extending the skip width
-    when the next char matches.
-    """
-    segments: list[str] = []
-    rest = command
-    while rest:
-        sep_pos = _find_unquoted_separator(rest)
-        if sep_pos is None:
-            segments.append(rest)
-            break
-        segments.append(rest[:sep_pos])
-        # ``&&`` / ``||`` are two-char separators; advance past both.
-        skip = 1
-        if sep_pos + 1 < len(rest) and rest[sep_pos : sep_pos + 2] in ("&&", "||"):
-            skip = 2
-        rest = rest[sep_pos + skip :]
-    return segments
-
-
-def _strip_leading_env_prefix(s: str) -> str:
-    """Strip leading ``KEY=value`` env-assignment prefixes from ``s``.
-
-    ``VAR=1 OTHER=2 time python ...`` and ``MPLBACKEND=Agg python ...``
-    are common shell shapes; the env prefix is not part of the
-    invocation and must be removed before per-segment modifier detection
-    can see the modifier word.
-    """
-    s = s.lstrip()
-    while True:
-        m = _ENV_ASSIGNMENT_RE.match(s)
-        if not m:
-            return s
-        s = s[m.end() :].lstrip()
-
-
-def _strip_command_modifier_prefix(command: str) -> list[str]:
-    """Generate progressive-strip variants for every shell SEGMENT in
-    ``command`` that starts (after optional ``KEY=value`` env-prefix)
-    with a recognized command modifier (``command``, ``time``, ``nohup``,
-    ``nice``, ``timeout``, ``env``, ``xargs``, ``exec``, ``stdbuf``,
-    ``ionice``, ``chrt``).
-
-    Splits ``command`` on unquoted shell separators (``;``, ``&``, ``&&``,
-    ``|``, ``||``, ``)``, ``\\n``) and applies the modifier-strip logic
-    to each segment. This catches compound forms like ``cd /tmp && time
-    python script.py``, ``VAR=1 nice -n 10 python script.py``, and
-    ``foo; timeout 30 python script.py`` - any of which would silently
-    bypass attribution if the modifier strip ran only at start-of-command
-    (R25 P0).
-
-    For each segment starting with a modifier, generates variants by
-    progressively stripping the modifier word, then modifier+1 leading
-    token, then +2, etc., stopping at the first variant whose remainder
-    begins with a python invocation. This catches modifier-with-args
-    forms (``nice -n 10 python ...``, ``timeout --signal=KILL 30
-    python ...``) without per-modifier option knowledge.
-
-    Returns ``[]`` if no segment carries a recognized modifier.
-    """
-    out: list[str] = []
-    for segment in _split_on_unquoted_separators(command):
-        s = _strip_leading_env_prefix(segment)
-        for mod in _COMMAND_MODIFIER_NAMES:
-            if not (s.startswith(mod + " ") or s.startswith(mod + "\t")):
-                continue
-            after_mod = s[len(mod) :].lstrip()
-            if not after_mod:
-                break
-            out.append(after_mod)
-            tokens = after_mod.split()
-            for i in range(1, len(tokens)):
-                rest = " ".join(tokens[i:])
-                if not rest:
-                    continue
-                out.append(rest)
-                # Stop once we've reached a python-prefixed remainder.
-                if re.match(r"python(?:3(?:\.\d+)?)?(?:\s|$)", rest):
-                    break
-            break
-    return out
-
-
-def _strip_shell_control_prefix(command: str) -> list[str]:
-    """Extract test commands AND body commands from shell-control structures.
-
-    Test commands (return what the structure tests):
-    - ``! CMD`` -> ``CMD``
-    - ``if CMD; then ...`` -> ``CMD``
-    - ``while CMD; do ...`` / ``until CMD; do ...`` -> ``CMD``
-
-    Body commands (return what the structure executes):
-    - ``then BODY ; (else|elif|fi)`` -> ``BODY``
-    - ``else BODY ; fi`` -> ``BODY``
-    - ``do BODY ; done`` -> ``BODY`` (covers for/while/until loops)
-    - ``case ... in PATTERN) BODY ;;`` -> each ``BODY`` arm
-
-    Body extraction matters because a one-line ``for f in x; do python "$f";
-    done`` or ``if true; then python -S; fi`` would otherwise hide the
-    python invocation from extraction (the python token isn't in command
-    position by ``_is_in_command_position`` because ``do`` / ``then`` are
-    not in the separator set).
-    """
-    out: list[str] = []
-    s = command.lstrip()
-    m = _NEGATION_PREFIX_RE.match(s)
-    if m:
-        out.append(m.group(1).strip())
-    m = _IF_PREFIX_RE.match(s)
-    if m:
-        out.append(m.group(1).strip())
-    m = _WHILE_PREFIX_RE.match(s)
-    if m:
-        out.append(m.group(1).strip())
-    # Body extraction: search anywhere in the command (not just at start).
-    for m in _THEN_BODY_RE.finditer(s):
-        out.append(m.group(1).strip())
-    for m in _ELSE_BODY_RE.finditer(s):
-        out.append(m.group(1).strip())
-    for m in _DO_BODY_RE.finditer(s):
-        out.append(m.group(1).strip())
-    for m in _CASE_ARM_RE.finditer(s):
-        out.append(m.group(1).strip())
-    return out
-
-
-def _unwrap_command_for_inspection(command: str, max_depth: int = 10) -> list[str]:
-    """Return a list of inner-command strings extracted by recursively
-    unwrapping known shell wrapper forms.
-
-    The original command is always the first element. Each recognized
-    wrapper contributes one or more entries: the bare inner command after
-    the wrapper is stripped. Recursion is bounded by ``max_depth`` and a
-    visited set so cyclic-looking constructs cannot loop.
-
-    Wrappers handled:
-
-    - **Quoted-payload shell wrappers**: ``bash [opts] -c "CODE"``,
-      ``sh -c 'CODE'``, ``eval "CODE"``, ``exec "CODE"`` (and zsh/dash/ksh).
-    - **Command modifiers**: ``command``, ``time``, ``nohup``, ``nice
-      [-n N]``, ``timeout [opts] N``, ``env [-u VAR | VAR=val]*``,
-      ``xargs [opts]``, ``exec``, ``stdbuf``, ``ionice``, ``chrt``.
-    - **Shell control**: ``! CMD``, ``if CMD; then ...``, ``while CMD; do
-      ...``, ``until CMD; do ...``, ``{ CMD; }`` brace groups,
-      ``( CMD )`` subshells.
-    - **Substitution**: ``$(CMD)``, ``\\`CMD\\```.
-
-    The bypass detector iterates over the returned list and runs primitive
-    bypass checks (``-S`` flag literal, absolute non-venv path, ``PATH=``)
-    on each variant. A primitive hidden inside any recognized wrapper is
-    surfaced.
-    """
-    seen: set[str] = {command}
-    out: list[str] = [command]
-    queue: list[tuple[str, int]] = [(command, 0)]
-    extractors = (
-        lambda c: [m.group(2) for m in _BASH_DASH_C_RE.finditer(c)],
-        lambda c: [m.group(2) for m in _EVAL_PAYLOAD_RE.finditer(c)],
-        lambda c: [m.group(1).strip() for m in _DOLLAR_PAREN_RE.finditer(c)],
-        lambda c: [m.group(1).strip() for m in _BACKTICK_RE.finditer(c)],
-        lambda c: [m.group(1).strip() for m in _BRACE_GROUP_RE.finditer(c)],
-        lambda c: [m.group(1).strip() for m in _PAREN_SUBSHELL_RE.finditer(c)],
-        _strip_command_modifier_prefix,
-        _strip_shell_control_prefix,
-    )
-    while queue:
-        cmd, depth = queue.pop()
-        if depth >= max_depth:
-            continue
-        for extractor in extractors:
-            for inner in extractor(cmd):
-                if inner and inner not in seen:
-                    seen.add(inner)
-                    out.append(inner)
-                    queue.append((inner, depth + 1))
-    return out
-
-
-# Python interpreter flag that bypasses `sitecustomize.py`: `-S` disables
-# `site.py` (which is what imports sitecustomize). Note `-I` (isolated mode)
-# implies `-E`, `-P`, and `-s` (lowercase) — NOT `-S`. Isolated mode does
-# not skip sitecustomize when the shim is installed in the venv's
-# site-packages, so it is not in the bypass list.
-#
-# Compact short-flag forms are matched too: `python -Sc 'code'` is
-# equivalent to `python -S -c 'code'` (the `-S` is the bypass; `c` is the
-# `-c` short flag for inline code). Lowercase `-s` (skip user site) does
-# NOT bypass sitecustomize and is correctly ignored (regex requires
-# uppercase `S` specifically).
-def _argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
-    """Return True if any pre-script Python interpreter short-flag token
-    contains uppercase ``S`` (the sitecustomize-disabling flag).
-
-    Walks shlex-tokenized argv left-to-right. A token starting with a
-    single ``-`` and at least one alphabetic character is a Python
-    short-flag combination (``-S``, ``-Sc``, ``-IS``, etc.); scan it for
-    ``S``. A token starting with ``--`` is a long flag and ignored. The
-    first non-flag entry (the script path, the ``-`` stdin marker, or any
-    other argv element) ends the interpreter-flag region. A ``-S`` after
-    that point is ``sys.argv`` for the script, not an interpreter flag,
-    and does not disable sitecustomize.
-
-    Operating on tokens (not raw text) makes the detector quote-aware:
-    a ``-S`` substring inside a quoted ``-c`` code argument (e.g.
-    ``python -c "print(' -S ')"``) lives inside the single token
-    ``print(' -S ')``, which does not start with ``-``, so the walk
-    terminates without flagging.
-    """
-    for tok in args_tokens:
-        if not tok:
-            continue
-        if tok == "-":  # stdin marker, not a flag
-            return False
-        if tok.startswith("--"):
-            continue  # long flag; cannot disable sitecustomize
-        if tok.startswith("-"):
-            if "S" in tok[1:]:
-                return True
-            continue
-        # First non-flag entry; interpreter flag region ends here.
-        return False
-    return False
 
 
 def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
@@ -929,7 +560,7 @@ def _validate_python_bash_results_non_error(entries: list[dict]) -> None:
             command = tool_input.get("command", "")
             if not isinstance(command, str) or not command:
                 continue
-            python_invocations = _extract_python_invocations_from_command(command)
+            python_invocations = parse_python_invocations(command)
             if not python_invocations:
                 continue
             result = bash_results.get(tool_use_id)
@@ -1145,316 +776,6 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
-_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
-
-
-def _strip_heredoc_bodies(command: str) -> str:
-    """Remove heredoc bodies (text between ``<<TAG`` and a closing ``TAG``
-    line) from a Bash command string.
-
-    Heredoc bodies are stdin content for the receiving command, not part
-    of any argv, so they must not be scanned for python invocations or
-    bypass flags. For example, ``cat <<'EOF'\\npython x.py\\nEOF`` is a
-    cat-creates-file pattern; the inner ``python x.py`` is data, not an
-    invocation.
-
-    Supports the ``<<TAG`` / ``<<-TAG`` / ``<<'TAG'`` / ``<<"TAG"`` forms.
-    The closing tag matches a line consisting of the tag with optional
-    leading whitespace (mandatory for the ``<<-`` form, optional in our
-    detection because Bash strips leading tabs only).
-
-    Multiple heredocs in a single command (rare, e.g.
-    ``cat <<A; cat <<B``) are handled by scanning iteratively.
-    Malformed heredocs (no closing tag) are treated as "body extends to
-    end-of-command" and stripped entirely from the opener onward.
-    """
-    out_parts: list[str] = []
-    pos = 0
-    while pos < len(command):
-        m = _HEREDOC_OPEN_RE.search(command, pos)
-        if not m:
-            out_parts.append(command[pos:])
-            break
-        # Keep everything up to and including the heredoc opener token; the
-        # opener itself is fine to scan (it's just a redirection operator).
-        out_parts.append(command[pos : m.end()])
-        tag = m.group(2)
-        # Body starts after the next newline (if any).
-        body_start_match = re.search(r"\n", command[m.end() :])
-        if body_start_match is None:
-            # No newline after opener: malformed; drop the rest.
-            break
-        body_start = m.end() + body_start_match.end()
-        # Look for the closing tag on its own line.
-        close_re = re.compile(rf"\n[ \t]*{re.escape(tag)}(?:\n|$)")
-        close_match = close_re.search(command, body_start)
-        if close_match is None:
-            # No closing tag: drop body to end.
-            break
-        # Skip the body and the closing tag; resume after. Insert a synthetic
-        # ``\n`` separator so any post-heredoc command (``cat <<EOF\n...\nEOF\n
-        # python script.py``) is not glued onto the heredoc opener and lost
-        # to the python-invocation regex. The synthetic newline is a real
-        # shell command separator and is honored by ``_PYTHON_INVOCATION_RE``,
-        # ``_is_in_command_position``, and ``_find_unquoted_separator``.
-        out_parts.append("\n")
-        pos = close_match.end()
-    return "".join(out_parts)
-
-
-def _find_unquoted_separator(s: str) -> int | None:
-    """Return the position of the first unquoted shell separator (``;``,
-    ``&``, ``|``, ``)``, ``\\n``) in ``s``, or ``None`` if every such char
-    is inside a single- or double-quoted region.
-
-    Includes ``)`` so that ``(python script.py)`` truncates correctly
-    without the closing paren attaching to the last argv token, and
-    includes ``\\n`` because newline is a shell command separator (a
-    multiline Bash command's ``cmd1\\ncmd2`` is two commands).
-
-    Tracks shell quoting state so that the inline ``;`` in
-    ``python -c 'import os; print(1)'`` does not falsely terminate the
-    python invocation's argument region. Single-quoted regions are
-    literal; double-quoted regions honor backslash escapes for ``"`` and
-    ``\\`` only (no command substitution / variable expansion handling,
-    which is fine here because we only need to identify quote boundaries).
-    """
-    i = 0
-    quote_char: str | None = None
-    while i < len(s):
-        c = s[i]
-        if quote_char is None:
-            if c in ("'", '"'):
-                quote_char = c
-            elif c in (";", "&", "|", ")", "\n"):
-                return i
-        else:
-            if quote_char == '"' and c == "\\" and i + 1 < len(s):
-                # Backslash inside double quotes escapes the next char.
-                i += 2
-                continue
-            if c == quote_char:
-                quote_char = None
-        i += 1
-    return None
-
-
-def _is_in_command_position(command: str, interp_start: int) -> bool:
-    """Return True iff the python token at ``command[interp_start:]`` is in
-    shell command position (start of a command segment), not a positional
-    argument to another command.
-
-    Walks left from ``interp_start``, skipping:
-
-    - Whitespace.
-    - Posix env-var assignment prefixes (``KEY=value`` or ``KEY=``); these
-      precede the command in shell syntax (``MPLBACKEND=Agg python ...``)
-      and do not change command position.
-
-    Then checks the previous char: a separator (``;``, ``&``, ``|``,
-    ``(``, ``\\n``) or start-of-command means command position; anything
-    else (e.g. ``p`` of ``grep``, ``o`` of ``echo``) means the token is
-    an argument and should NOT be treated as a python invocation.
-    """
-    i = interp_start - 1
-    while i >= 0 and command[i] in (" ", "\t"):
-        i -= 1
-    if i < 0:
-        return True
-    while i >= 0:
-        # Try to parse a trailing KEY=VALUE (or KEY=) preceding this
-        # position. Walk back to find a `=` whose left side is `[A-Za-z_][A-Za-z0-9_]*`.
-        j = i
-        while j >= 0 and command[j] not in (" ", "\t", ";", "&", "|", "(", "\n"):
-            j -= 1
-        # command[j+1 : i+1] is a single shell word (no whitespace/separators).
-        word = command[j + 1 : i + 1]
-        if "=" in word:
-            key = word.split("=", 1)[0]
-            if (
-                key
-                and (key[0].isalpha() or key[0] == "_")
-                and all(c.isalnum() or c == "_" for c in key)
-            ):
-                # Skip past this assignment and any preceding whitespace.
-                i = j
-                while i >= 0 and command[i] in (" ", "\t"):
-                    i -= 1
-                if i < 0:
-                    return True
-                continue
-        break
-    return command[i] in (";", "&", "|", "(", "\n")
-
-
-def _is_redirection_token(tok: str) -> bool:
-    """Return True if tok is a shell I/O redirection / pipe operator that
-    terminates a python program's argv list.
-
-    Catches:
-    - Pure redirections / heredocs: ``<``, ``>``, ``<<``, ``>>``, ``<<<``,
-      ``>out.txt`` (no space before filename), ``<infile`` etc.
-    - fd-prefixed: ``2>``, ``1>``, ``2>>``, ``2>&1``, ``&>`` etc.
-    - Pipes / sequencers: ``|``, ``&``, ``&&``, ``||``, ``;`` (defense in
-      depth; the outer regex usually splits on these first).
-
-    Tokens that contain ``<`` / ``>`` INSIDE quotes (e.g. ``"print(1>0)"``)
-    are kept by ``shlex.split`` as a single token starting with ``"`` or
-    ``p`` (an alphanumeric), so they are not flagged here.
-    """
-    if not tok:
-        return False
-    if tok in ("|", "&", "&&", "||", ";"):
-        return True
-    if tok[0] in ("<", ">"):
-        return True
-    # fd-prefixed: leading digit(s) then `<` or `>` (e.g. `2>`, `2>&1`, `1>>`).
-    i = 0
-    while i < len(tok) and tok[i].isdigit():
-        i += 1
-    if 0 < i < len(tok) and tok[i] in ("<", ">"):
-        return True
-    return False
-
-
-def _truncate_at_redirection(tokens: list[str]) -> list[str]:
-    """Drop everything from the first I/O redirection / pipe token onward.
-
-    Shell-managed I/O (heredoc body, redirection target file, fd dup) is
-    NOT part of the Python program's ``sys.orig_argv``; including those
-    tokens in the visible argv would prevent attribution against a
-    legitimate session_start.
-    """
-    result: list[str] = []
-    for tok in tokens:
-        if _is_redirection_token(tok):
-            break
-        result.append(tok)
-    return result
-
-
-def _extract_python_invocations_from_segment(command: str) -> list[list[str]]:
-    """Return argv-shaped token lists for each python invocation in a single
-    pre-stripped, pre-unwrapped command segment. Used by
-    ``_extract_python_invocations_from_command`` per shell variant.
-    """
-    invocations: list[list[str]] = []
-    for m in _PYTHON_INVOCATION_RE.finditer(command):
-        match_start = m.start()
-        boundary_char = m.group(0)[0] if m.group(0) else ""
-        # interp_end is the position right after the python token (exclusive).
-        # The trailing group is ``(?:[\s<>]|$)`` - when a real boundary char
-        # (space, `<`, `>`) was consumed, m.end() points one past it and the
-        # python token ends at m.end() - 1. When the match ended via ``$``
-        # (zero-width, no boundary consumed), m.end() IS the end of the
-        # python token and subtracting 1 would truncate the last char.
-        if m.group(0) and m.group(0)[-1] in (" ", "\t", "\n", "<", ">"):
-            interp_end = m.end() - 1
-        else:
-            interp_end = m.end()
-        if boundary_char == "/":
-            # Absolute path: walk left to recover the rest of the path
-            # (e.g. `/usr/bin/python3`). Stop at any shell separator,
-            # whitespace, redirection, or `=` (which marks an inline
-            # ``KEY=value`` env-var assignment ending and is not a valid
-            # interpreter path char).
-            i = match_start
-            while i > 0 and command[i - 1] not in (
-                " ",
-                "\t",
-                "\n",
-                ";",
-                "&",
-                "|",
-                "(",
-                ")",
-                "<",
-                ">",
-                "=",
-            ):
-                i -= 1
-            interp_start = i
-        elif boundary_char in (" ", "\t", "\n", ";", "&", "|", "(", ")"):
-            # Boundary char is a separator; interpreter starts after it.
-            # ``\n`` is included so post-heredoc / multiline-Bash python
-            # invocations on a fresh line are extracted.
-            interp_start = match_start + 1
-        else:
-            # ``^`` start-of-command boundary (zero-width); m.start() is
-            # already the first char of the python token.
-            interp_start = match_start
-        # Command-position check: skip ``python`` tokens that are arguments
-        # to another command (``grep python script.py``, ``echo python``).
-        # ``python`` must appear at the start of a shell command segment
-        # (after ``;``, ``&``, ``|``, ``(``, ``\\n``, or start-of-command,
-        # optionally preceded by ``KEY=value`` env-var assignments).
-        if not _is_in_command_position(command, interp_start):
-            continue
-        interpreter = command[interp_start:interp_end]
-        # Slice the args region: from end of match to next UNQUOTED shell
-        # separator. A raw-regex scan would falsely terminate at a
-        # in-quoted ``;`` in commands like
-        # ``python -c 'import os; print(1)'``.
-        # Args region starts at the trailing boundary char (so e.g. ``python -c``
-        # gives args ``  -c`` with leading whitespace that shlex tolerates).
-        # When the match ended via ``$`` (no boundary char consumed), there is
-        # no trailing boundary to include; rest is empty.
-        if m.group(0) and m.group(0)[-1] in (" ", "\t", "\n", "<", ">"):
-            rest_start = m.end() - 1
-        else:
-            rest_start = m.end()
-        rest = command[rest_start:]
-        sep_pos = _find_unquoted_separator(rest)
-        args_region = rest[:sep_pos] if sep_pos is not None else rest
-        # Tokenize args with shlex; fall back to whitespace split if shlex
-        # raises (unbalanced quotes, etc.).
-        try:
-            import shlex
-
-            args_tokens = shlex.split(args_region, comments=False, posix=True)
-        except ValueError:
-            args_tokens = args_region.split()
-        args_tokens = _truncate_at_redirection(args_tokens)
-        invocations.append([interpreter, *args_tokens])
-    return invocations
-
-
-def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
-    """Return argv-shaped token lists for every python invocation visible in
-    ``command``, INCLUDING those hidden inside shell wrappers.
-
-    Pipeline:
-
-    1. Strip heredoc bodies (so script content inside ``<<EOF ... EOF`` is
-       not falsely matched as an invocation).
-    2. Recursively unwrap known shell wrappers (modifiers, ``bash -c``,
-       brace groups, ``if/while/!``, ``$()``, backticks) via
-       ``_unwrap_command_for_inspection``.
-    3. Run the per-segment regex extractor on each variant.
-    4. Deduplicate argv lists (different unwrap paths often surface the
-       same inner invocation).
-
-    Each entry is the full argv slice ``[interpreter, *args]`` matching
-    what the Python process would see in ``sys.orig_argv``. Args run up
-    to the next unquoted shell separator (``;``, ``&``, ``|``, ``)``,
-    ``\\n``, end-of-string), with quoting handled by ``shlex.split``,
-    and any I/O redirection tokens (``>``, ``<``, ``<<``, ``2>&1``,
-    etc.) are stripped because shell redirection is not part of the
-    Python program's argv.
-    """
-    command = _strip_heredoc_bodies(command)
-    seen_argvs: set[tuple[str, ...]] = set()
-    out: list[list[str]] = []
-    for variant in _unwrap_command_for_inspection(command):
-        for argv in _extract_python_invocations_from_segment(variant):
-            key = tuple(argv)
-            if key in seen_argvs:
-                continue
-            seen_argvs.add(key)
-            out.append(argv)
-    return out
-
-
 def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list[str]) -> bool:
     """Return True iff a session_start's argv matches a transcript-visible
     python invocation's argv.
@@ -1527,7 +848,7 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             command = tool_input.get("command", "")
             if not isinstance(command, str):
                 continue
-            for argv in _extract_python_invocations_from_command(command):
+            for argv in parse_python_invocations(command):
                 if argv:
                     visible_invocations.append((command, argv))
 
@@ -1554,20 +875,30 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
 
 
 def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
-    """Return Bash commands containing a `-S` (or compact `-Sc`) flag,
-    inline `PATH=...` interpreter override, `env python`, or `./python`.
+    """Return Bash commands that contain a Python invocation paired with
+    any bypass primitive.
 
-    All of these forms can cause a Python interpreter to run without the
-    shim loading: `-S` disables `site.py`; `PATH=/usr/bin python3` resolves
-    to a non-per-arm-venv interpreter; `env python` resolves via PATH;
-    `./python` invokes a local binary that almost certainly isn't the per-
-    arm-venv interpreter.
+    Bypass primitives:
+    - ``-S`` (or compact ``-Sc``) flag on the Python interpreter; disables
+      site.py and skips sitecustomize.
+    - ``PATH=...`` env-prefix on the Python CommandNode; redirects which
+      interpreter resolves.
+    - ``PYTHON*`` env-prefix (PYTHONHOME, PYTHONPATH); changes site /
+      install root.
+    - ``.`` / ``source`` activation script preceding a Python CommandNode
+      in the same outer command; shell activation mutates env (often PATH).
 
-    Per-invocation attribution cannot recover from these because the
-    bypassed interpreter never writes `session_start`. Fail closed.
+    Per-invocation attribution alone cannot recover from these because
+    the bypassed interpreter never writes ``session_start``; fail closed.
 
-    Note: `-I` (isolated mode) is NOT a bypass; it implies `-E`, `-P`, and
-    lowercase `-s` — none of which disable sitecustomize.
+    Layer-1 analysis defers to ``harness.shell_parser`` which walks the
+    bashlex AST. Indeterminate command-words (variable expansion, command
+    substitution) propagate as ``ShellCommandIndeterminate``; bashlex
+    parse failures propagate as ``ShellCommandParseError``. Both are
+    fail-closed by design.
+
+    Note: ``-I`` (isolated mode) is NOT a bypass; it implies ``-E``,
+    ``-P``, and lowercase ``-s`` - none of which disable sitecustomize.
     """
     bypass_commands: list[str] = []
     for entry in entries:
@@ -1577,92 +908,12 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             tool_input = block.get("input") or block.get("tool_input")
             if not isinstance(tool_input, dict):
                 continue
-            raw_command = tool_input.get("command", "")
-            if not isinstance(raw_command, str):
+            command = tool_input.get("command", "")
+            if not isinstance(command, str) or not command:
                 continue
-            # Strip heredoc bodies first: text inside ``<<EOF ... EOF`` is
-            # data on the receiving command's stdin, not a python invocation,
-            # PATH override, or `-S` bypass even if the literal substrings
-            # appear in the body.
-            command = _strip_heredoc_bodies(raw_command)
-            # PATH mutation / activation script / env / ./python: any of
-            # these in a command containing a python invocation triggers
-            # fail-closed because the resolved interpreter may not be the
-            # per-arm-venv python.
-            has_python = bool(_PYTHON_INVOCATION_RE.search(command))
-            has_path_mutation = bool(_PATH_ASSIGNMENT_RE.search(command))
-            has_python_env_var = bool(_PYTHON_ENV_VAR_RE.search(command))
-            has_activation = bool(_SHELL_ACTIVATION_RE.search(command))
-            has_wrapper = bool(_PYTHON_WRAPPER_RE.search(command))
-            # Shell-wrapper bypass: `bash -c "python -S ..."`, `eval 'python -S ...'`,
-            # etc. The inner python token lives inside a quoted payload that
-            # _PYTHON_INVOCATION_RE does not visit. Only flag as bypass
-            # when there's actually a primitive bypass vector (-S, PATH=,
-            # source/activation) inside the wrapper - otherwise the
-            # unwrap+attribution path handles benign wrappers correctly.
-            has_shell_wrapper = bool(_SHELL_WRAPPER_RE.search(command))
-            has_eval_wrapper = bool(_EVAL_WRAPPER_RE.search(command))
-            has_python_literal = bool(_PYTHON_LITERAL_RE.search(command))
-            if (has_shell_wrapper or has_eval_wrapper) and has_python_literal:
-                # Require a primitive bypass marker (-S flag literal OR
-                # PATH= manipulation) in either the outer command or any
-                # unwrapped variant - a primitive hidden inside a `bash -c`
-                # quoted payload IS a bypass even if the outer regex
-                # doesn't see it. Without any primitive in any variant,
-                # fall through to unwrap+attribution.
-                variants = _unwrap_command_for_inspection(command)
-                if any(
-                    _BARE_BYPASS_FLAG_RE.search(v) or _PATH_ASSIGNMENT_RE.search(v)
-                    for v in variants
-                ):
-                    bypass_commands.append(command)
-                    continue
-            # Command modifier prefix bypass: `command python -S ...`,
-            # `time python -S ...`, `nohup python -S ...`, `timeout 30
-            # python -S ...`. The python token is not in command position
-            # (it's an arg to the modifier), so the extractor skips it; the
-            # `-S` then runs without producing any visible invocation.
-            # When the modifier-prefixed-python pattern is paired with a
-            # word-bounded `-S` flag literal, fail closed.
-            if _COMMAND_MODIFIER_BEFORE_PYTHON_RE.search(command) and _BARE_BYPASS_FLAG_RE.search(
-                command
-            ):
-                bypass_commands.append(command)
-                continue
-            if (
-                (has_path_mutation and has_python)
-                or (has_python_env_var and has_python)
-                or (has_activation and has_python)
-                or has_wrapper
-                or _ENV_BEFORE_PYTHON_RE.search(command)
-                or _DOT_PYTHON_RE.search(command)
-                or _PYTHON_COMMAND_SUBSTITUTION_RE.search(command)
-            ):
-                bypass_commands.append(command)
-                continue
-            # -S / -Sc / etc. as a python interpreter flag (NOT inside
-            # quoted code, NOT after the script argument). The argv-walking
-            # check operates on shlex-tokenized argv so a -S substring
-            # inside a quoted -c code argument cannot false-positive.
-            argv_walk_hit = False
-            for argv in _extract_python_invocations_from_command(command):
-                if _argv_contains_bypass_flag(argv[1:]):
-                    bypass_commands.append(command)
-                    argv_walk_hit = True
-                    break  # one bypass per command is enough to record
-            if argv_walk_hit:
-                continue
-            # Wrapper-aware unwrap: extract inner-command variants from
-            # known shell wrappers (modifiers, bash -c "...", brace groups,
-            # if/while/!, $(...), `...`) and check each variant for the
-            # python+`-S` primitive. Catches forms the regexes above missed
-            # because the wrapper hid the python invocation from outer
-            # scanning. The original command is element [0]; the regex
-            # checks above already handled that, so skip it here.
-            for variant in _unwrap_command_for_inspection(command)[1:]:
-                if _PYTHON_LITERAL_RE.search(variant) and _BARE_BYPASS_FLAG_RE.search(variant):
-                    bypass_commands.append(command)
-                    break
+            hits = find_python_bypass_invocations(command)
+            if hits:
+                bypass_commands.extend(hits)
     return bypass_commands
 
 
@@ -1696,8 +947,19 @@ def _count_python_invocations(stream_json_path: Path) -> int:
             if not isinstance(tool_input, dict):
                 continue
             command = tool_input.get("command", "")
-            if isinstance(command, str):
-                count += len(_PYTHON_INVOCATION_RE.findall(command))
+            if not isinstance(command, str) or not command:
+                continue
+            try:
+                count += len(parse_python_invocations(command))
+            except (ShellCommandIndeterminate, ShellCommandParseError):
+                # _count is a coarse cross-check used by _validate_shim_loaded;
+                # the actual fail-closed decisions on indeterminate / parse-
+                # failed commands live in _attribute_python_invocations and
+                # _validate_python_bash_results_non_error, which propagate
+                # the exception. Here we just skip - we know the command
+                # had SOMETHING undecidable; the validators above raise on
+                # it independently.
+                pass
     return count
 
 

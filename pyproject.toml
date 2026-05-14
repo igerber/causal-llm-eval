@@ -35,6 +35,10 @@ dependencies = [
     "pyarrow>=15.0.0",
     "duckdb>=0.10.0",
     "pyyaml>=6.0",
+    # bashlex parses Bash commands into an AST for layer-1 attestation.
+    # Pinned exactly because upstream is dormant (0.18 released 2023-01-18)
+    # and we don't want silent AST-shape drift breaking layer-1 parsing.
+    "bashlex==0.18",
 ]
 
 [project.optional-dependencies]
