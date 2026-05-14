@@ -129,6 +129,15 @@ from harness.shell_parser import (
             'command bash -c "python script.py"',
             [["python", "script.py"]],
         ),
+        # R29: compact env -S<payload> (no space)
+        (
+            "env -S'python -S script.py'",
+            [["python", "-S", "script.py"]],
+        ),
+        (
+            '/usr/bin/env -S"python -S script.py"',
+            [["python", "-S", "script.py"]],
+        ),
         # Multiple invocations
         (
             "python a.py && python b.py",

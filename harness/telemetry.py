@@ -333,6 +333,7 @@ def _read_events(path: Path) -> list[dict]:
 # zero out telemetry fields if accepted as-is. Reject at parse time.
 _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
     "session_start": ("argv",),
+    "session_end": ("pid",),
     "module_import": ("module",),
     "guide_file_read": (
         "via",
@@ -852,6 +853,9 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
                 if argv:
                     visible_invocations.append((command, argv))
 
+    session_end_pids: set = {
+        e.get("pid") for e in events if e.get("event") == "session_end" and e.get("pid") is not None
+    }
     for command, visible_argv in visible_invocations:
         matched_idx: int | None = None
         for idx in available_idx:
@@ -870,6 +874,23 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
                 f"either ran without sitecustomize, or its session was "
                 f"masked by an unrelated entry point (e.g. a pip "
                 f"console-script). Cold-start eval is invalid."
+            )
+        # Every attributed session_start must have a matching session_end
+        # by pid. Missing session_end signals a hard-exit (os._exit) that
+        # skipped the shim's atexit handler - typically because a hook
+        # write failed mid-run. The shim's stderr marker and the Bash
+        # is_error check may both be hidden by shell exit-status masking
+        # (`2>/dev/null || true`); session_end is the unmaskable signal.
+        matched_session = sessions[matched_idx]
+        session_pid = matched_session.get("pid")
+        if session_pid is not None and session_pid not in session_end_pids:
+            raise TelemetryMergeError(
+                f"python invocation argv={visible_argv!r} in command "
+                f"{command[:160]!r} matched session_start pid={session_pid} "
+                f"but no session_end was recorded for that pid. The shim "
+                f"hard-exited (typically via os._exit on event-write "
+                f"failure) before its atexit handler could fire, so the "
+                f"layer-2 event log may be silently incomplete."
             )
         available_idx.remove(matched_idx)
 

@@ -560,6 +560,42 @@ def test_merge_layers_diff_diff_duplicate_tool_use_id_across_bash_read_raises(tm
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_missing_session_end_raises(tmp_path):
+    """R29 P0: a session_start with a pid that has no matching session_end
+    in the event log signals that the shim hard-exited (os._exit) and
+    skipped its atexit handler. The agent can mask the Bash exit code
+    with ``2>/dev/null || true``, so neither stderr markers nor
+    is_error catch the failure; session_end is the unmaskable signal.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    # session_start with pid, but NO matching session_end - simulates a
+    # shim hard-exit that skipped atexit.
+    session_start = _session_start_event(argv=["python", "script.py"])
+    session_start["pid"] = 12345
+    _write_events_jsonl(events_path, [session_start])
+    _write_transcript(transcript, ["python script.py 2>/dev/null || true"])
+    with pytest.raises(TelemetryMergeError, match="no session_end was recorded for that pid"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_session_end_pairing_attributes(tmp_path):
+    """R29 positive case: when session_start.pid has a matching
+    session_end, the run merges cleanly. Ensures the new check doesn't
+    over-reject."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    session_start = _session_start_event(argv=["python", "script.py"])
+    session_start["pid"] = 12345
+    session_end = {
+        "event": "session_end",
+        "ts": "2026-05-12T00:00:01.000000+00:00",
+        "pid": 12345,
+    }
+    _write_events_jsonl(events_path, [session_start, session_end])
+    _write_transcript(transcript, ["python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
 def test_merge_layers_diff_diff_python_bash_is_error_raises(tmp_path):
     """R23 P0#1: a Bash tool_result with ``is_error=True`` for a command
     containing a Python invocation is rejected at merge time.

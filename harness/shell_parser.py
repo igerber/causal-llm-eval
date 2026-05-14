@@ -299,6 +299,16 @@ def _maybe_recurse_eval(command_node, depth: int) -> Iterator:
                     yield from _recurse_payload_str(payload_text, depth, "env --split-string=")
                     consumed = j - i + 1
                     break
+                # Compact short-option attached form: `env -S<payload>`
+                # with no space. POSIX short options allow this; bashlex
+                # tokenizes the whole `-S<payload>` as a single word.
+                # Excludes the bare `-S` (handled above) and `--split-`
+                # long forms (handled above).
+                if w2.word.startswith("-S") and len(w2.word) > 2 and not w2.word.startswith("--"):
+                    payload_text = w2.word[2:]
+                    yield from _recurse_payload_str(payload_text, depth, "env -S")
+                    consumed = j - i + 1
+                    break
             i += consumed
             continue
         i += 1

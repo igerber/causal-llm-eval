@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import builtins
 import functools
 import importlib.util
@@ -564,6 +565,41 @@ _write_event(
         "pid": os.getpid(),
     }
 )
+
+
+def _write_session_end() -> None:
+    """Record a ``session_end`` event paired by pid with this process's
+    ``session_start``.
+
+    Registered via ``atexit`` so it fires on normal interpreter
+    shutdown, sys.exit(), and unhandled exceptions. It does NOT fire on
+    ``os._exit()`` (the shim's hard-exit path on event-write failure)
+    or on SIGKILL - which is exactly what the merger uses to detect
+    that the run completed without the shim's full attestation. An
+    agent that masks shell exit status with ``2>/dev/null || true``
+    cannot synthesize a session_end because they cannot run code after
+    Python has exited via os._exit.
+
+    Best-effort: any write failure here is silent because os._exit-on-
+    failure during atexit would interfere with Python's own shutdown
+    cleanup, and a missing session_end is already the fail-closed
+    signal the merger requires.
+    """
+    try:
+        _write_event(
+            {
+                "event": "session_end",
+                "ts": _utc_iso_now(),
+                "pid": os.getpid(),
+            }
+        )
+    except OSError:
+        # Already in shutdown; missing session_end is the merger's
+        # fail-closed signal regardless of why it's missing.
+        pass
+
+
+atexit.register(_write_session_end)
 
 # Resolve the bundled guides directory WITHOUT importing diff_diff. The
 # open-hook below needs this to recognize Path/open reads of guide files;
