@@ -23,10 +23,37 @@ from harness.telemetry import (
 # ---------------------------------------------------------------------------
 
 
-def _write_events_jsonl(path: Path, events: list[dict]) -> None:
-    """Write a list of event dicts as one JSON object per line."""
+def _write_events_jsonl(
+    path: Path, events: list[dict], *, skip_auto_session_end: bool = False
+) -> None:
+    """Write a list of event dicts as one JSON object per line.
+
+    Unless ``skip_auto_session_end=True``, auto-emits a matching
+    ``session_end`` for every ``session_start.pid`` that doesn't already
+    have one in the provided list. The merger requires session_end
+    pairing for every session_start with a pid; most tests don't care
+    about that check directly, so the helper keeps existing test setups
+    working without per-test changes. Tests exercising the
+    session_end-missing fail-closed path pass ``skip_auto_session_end=True``
+    so the omission survives."""
+    if skip_auto_session_end:
+        augmented = events
+    else:
+        existing_end_pids = {
+            e["pid"] for e in events if e.get("event") == "session_end" and "pid" in e
+        }
+        needs_end_pids = {
+            e["pid"]
+            for e in events
+            if e.get("event") == "session_start"
+            and "pid" in e
+            and e["pid"] not in existing_end_pids
+        }
+        augmented = list(events)
+        for pid in sorted(needs_end_pids):
+            augmented.append(_session_end_event(pid=pid))
     with open(path, "w") as f:
-        for event in events:
+        for event in augmented:
             f.write(json.dumps(event) + "\n")
 
 
@@ -93,23 +120,46 @@ def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     events = tmp_path / "in_process_events.jsonl"
     transcript = tmp_path / "transcript.jsonl"
     stderr_log = tmp_path / "cli_stderr.log"
-    transcript.write_text('{"type": "result", "status": "ok"}\n')
+    transcript.write_text('{"type": "result", "subtype": "success"}\n')
     stderr_log.touch()
     return events, transcript, stderr_log
 
 
-def _session_start_event(sys_executable: str | None = None, argv: list | None = None) -> dict:
+_DEFAULT_PID = 11111
+
+
+def _session_start_event(
+    sys_executable: str | None = None,
+    argv: list | None = None,
+    pid: int | None = None,
+) -> dict:
     """Build a session_start event. ``argv`` defaults to a placeholder so
     schema validation passes; tests that need attribution against a
-    specific python invocation should pass an explicit ``argv``."""
+    specific python invocation should pass an explicit ``argv``.
+
+    ``pid`` defaults to ``_DEFAULT_PID`` so the merger's session_end
+    pairing check has a key to match against (the session_end helper
+    uses the same default). Tests exercising session_end pairing
+    failures should pass an explicit pid and omit the matching
+    session_end."""
     event: dict = {
         "event": "session_start",
         "ts": "2026-05-12T00:00:00.000000+00:00",
         "argv": argv if argv is not None else ["python", "-c", "pass"],
+        "pid": pid if pid is not None else _DEFAULT_PID,
     }
     if sys_executable is not None:
         event["sys_executable"] = sys_executable
     return event
+
+
+def _session_end_event(pid: int | None = None) -> dict:
+    """Build a session_end event paired with a session_start by pid."""
+    return {
+        "event": "session_end",
+        "ts": "2026-05-12T00:00:01.000000+00:00",
+        "pid": pid if pid is not None else _DEFAULT_PID,
+    }
 
 
 def _write_transcript_entries(path: Path, entries: list[dict]) -> None:
@@ -327,7 +377,7 @@ def test_merge_layers_diff_diff_accepts_empty_stderr_only(tmp_path):
     non-empty though, so provide a minimal entry."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
-    transcript.write_text('{"type": "result", "status": "ok"}\n')
+    transcript.write_text('{"type": "result", "subtype": "success"}\n')
     # stderr_log is 0-byte from _make_paths; that's fine.
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
@@ -570,11 +620,37 @@ def test_merge_layers_diff_diff_missing_session_end_raises(tmp_path):
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     # session_start with pid, but NO matching session_end - simulates a
     # shim hard-exit that skipped atexit.
-    session_start = _session_start_event(argv=["python", "script.py"])
-    session_start["pid"] = 12345
-    _write_events_jsonl(events_path, [session_start])
+    session_start = _session_start_event(argv=["python", "script.py"], pid=12345)
+    _write_events_jsonl(events_path, [session_start], skip_auto_session_end=True)
     _write_transcript(transcript, ["python script.py 2>/dev/null || true"])
-    with pytest.raises(TelemetryMergeError, match="no session_end was recorded for that pid"):
+    with pytest.raises(TelemetryMergeError, match="no matching session_end"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_surplus_child_missing_session_end_raises(tmp_path):
+    """R30 P0 #1: a child Python process invisible in the transcript can
+    emit session_start, drop a layer-2 event via shim hard-exit, and
+    skip session_end. Pre-R30 the merger's session_end check fired only
+    on attributed (transcript-visible) sessions; surplus sessions
+    bypassed the check.
+
+    Now every session_start with a pid must have a matching session_end,
+    including child processes the parent script spawned but the
+    transcript never sees as a Bash command."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    # Parent session: visible, properly paired with session_end.
+    parent_start = _session_start_event(argv=["python", "parent.py"], pid=11111)
+    parent_end = _session_end_event(pid=11111)
+    # Child session: NOT visible in transcript, NO session_end -
+    # simulates a child Python hard-exit.
+    child_start = _session_start_event(argv=["python", "child.py"], pid=22222)
+    _write_events_jsonl(
+        events_path,
+        [parent_start, parent_end, child_start],
+        skip_auto_session_end=True,
+    )
+    _write_transcript(transcript, ["python parent.py"])
+    with pytest.raises(TelemetryMergeError, match="no matching session_end"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -1563,7 +1639,9 @@ def test_merge_layers_diff_diff_raises_on_truncated_transcript_no_terminal_resul
             )
             + "\n"
         )
-    with pytest.raises(TelemetryMergeError, match="does not end with a successful"):
+    with pytest.raises(
+        TelemetryMergeError, match="does not end with a `type=result subtype=success`"
+    ):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -1575,7 +1653,9 @@ def test_merge_layers_diff_diff_raises_on_error_result_entry(tmp_path):
     transcript.write_text(
         json.dumps({"type": "result", "is_error": True, "subtype": "error_during_execution"}) + "\n"
     )
-    with pytest.raises(TelemetryMergeError, match="does not end with a successful"):
+    with pytest.raises(
+        TelemetryMergeError, match="does not end with a `type=result subtype=success`"
+    ):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 

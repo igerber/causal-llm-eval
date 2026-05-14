@@ -300,12 +300,22 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list
     # finished, and per-run evidence (Bash invocations, Read tool_results,
     # later guide accesses) may be silently missing.
     last = transcript_entries[-1]
-    if not (isinstance(last, dict) and last.get("type") == "result" and not last.get("is_error")):
+    # Require the explicit `subtype == "success"` shape rather than just
+    # "type == result and no is_error". Claude's stream-JSON can emit
+    # result frames with subtypes like ``error_max_turns``,
+    # ``error_during_execution``, etc. that do NOT set ``is_error=true``
+    # but also do not represent a clean run completion.
+    if not (
+        isinstance(last, dict)
+        and last.get("type") == "result"
+        and last.get("subtype") == "success"
+        and not last.get("is_error")
+    ):
         raise TelemetryMergeError(
             f"stream-JSON transcript at {stream_json_path} does not end "
-            f"with a successful `type=result` entry; capture is truncated "
-            f"or the run did not complete cleanly, and per-run telemetry "
-            f"cannot be treated as complete"
+            f"with a `type=result subtype=success` entry; capture is "
+            f"truncated, the run failed, or the result subtype is unknown, "
+            f"and per-run telemetry cannot be treated as complete"
         )
     return transcript_entries
 
@@ -1034,6 +1044,28 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
             "log was truncated, deleted-and-recreated, or fabricated. "
             "Cold-start eval is invalid."
         )
+    # R30 P0: every session_start with a pid must have a matching
+    # session_end - including SURPLUS sessions (child Python processes
+    # invisible in the transcript). The attributed-only check in
+    # _attribute_python_invocations protected transcript-visible
+    # invocations; this catches child processes a visible script spawned
+    # that hard-exited mid-run.
+    session_starts_with_pid = [
+        e for e in events if e.get("event") == "session_start" and "pid" in e
+    ]
+    session_end_pids = {e["pid"] for e in events if e.get("event") == "session_end" and "pid" in e}
+    for s in session_starts_with_pid:
+        pid = s.get("pid")
+        if pid not in session_end_pids:
+            argv = s.get("argv", "<unknown>")
+            raise TelemetryMergeError(
+                f"session_start pid={pid!r} (argv={argv!r}) has no "
+                f"matching session_end. The Python interpreter exited "
+                f"via os._exit (typically a shim hard-exit on event-write "
+                f"failure) or was killed by SIGKILL; atexit did not fire. "
+                f"Layer-2 events from that process may be silently "
+                f"incomplete."
+            )
     bypass_commands = _find_python_bypass_invocations_in_entries(transcript_entries)
     if bypass_commands:
         first = bypass_commands[0]
