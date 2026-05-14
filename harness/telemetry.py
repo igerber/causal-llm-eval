@@ -908,6 +908,56 @@ def _scan_grep_tool_guide_accesses_in_entries(
     return opened
 
 
+def _resolve_glob_to_guide_basename(
+    glob: str,
+    *,
+    path_at_guides_dir: bool,
+) -> str | None:
+    """Resolve a Grep ``glob`` parameter to a basename pattern that can
+    be fnmatched against bundled guide filenames, assuming the search
+    path is already scoped under ``diff_diff`` or ``diff_diff/guides``.
+
+    Returns the basename pattern (e.g. ``llms.txt``, ``llms*.txt``), or
+    ``None`` if the glob does not reduce to a guide-file pattern.
+
+    Recognized glob shapes (after path scoping by the caller):
+      - When ``path`` IS the guides directory: glob is a basename
+        pattern directly, OR a recursive form like ``**/<basename>``
+        (which still resolves to the basename under guides).
+      - When ``path`` is the diff_diff package root: glob must point
+        AT guides, so accept ``guides/<basename>``, ``./guides/<basename>``,
+        or recursive ``**/guides/<basename>``.
+
+    Bash ``**`` is glob-recursive and POSIX-bash needs ``globstar``
+    enabled, but Claude's Grep glob treats both ``**`` and ``*`` as
+    recursive-ish wildcards on its own; we accept both to mirror agent
+    usage patterns.
+    """
+    if path_at_guides_dir:
+        # path is already at guides; glob is a basename or
+        # ``**/<basename>`` / ``*/<basename>`` recursive form.
+        if "/" in glob:
+            # Strip recursive prefix and treat the last segment as the
+            # basename pattern.
+            last = glob.rsplit("/", 1)[-1]
+            if "/" in last:
+                return None
+            return last
+        return glob
+
+    # path is at diff_diff (one level up from guides). Glob must
+    # explicitly target the guides subdirectory.
+    for prefix in ("guides/", "./guides/", "**/guides/", "*/guides/"):
+        if glob.startswith(prefix):
+            rest = glob[len(prefix) :]
+            if "/" in rest:
+                # Further nesting like guides/sub/llms.txt - bundled
+                # layout has no subdirs under guides.
+                return None
+            return rest
+    return None
+
+
 def _classify_grep_target(
     grep_path: str,
     grep_glob: str,
@@ -940,29 +990,29 @@ def _classify_grep_target(
     path_at_diff_diff = p is not None and p.name == "diff_diff"
 
     if grep_glob:
-        # glob like `llms.txt`, `llms*.txt`, `guides/llms.txt`,
-        # `*/guides/llms.txt`. Strip a leading `guides/` if the path is
-        # diff_diff itself; resolve to basename-pattern matches against
-        # bundled guides.
-        glob = grep_glob
-        # Common prefix forms an agent might use.
-        for prefix in ("guides/", "diff_diff/guides/", "*/guides/"):
-            if glob.startswith(prefix):
-                glob = glob[len(prefix) :]
-                break
-        # If after stripping the glob still contains a path separator,
-        # it doesn't resolve to a guide-file pattern.
-        if "/" in glob:
+        # Glob attribution requires the path to be SCOPED under the
+        # bundled diff_diff package. Otherwise a glob like
+        # ``guides/llms.txt`` paired with ``path=/tmp`` would match
+        # files outside our bundled location and falsely flag a guide
+        # as opened (R34 P1).
+        if not (path_at_guides_dir or path_at_diff_diff):
+            return frozenset(), False
+
+        glob_pattern = _resolve_glob_to_guide_basename(
+            grep_glob, path_at_guides_dir=path_at_guides_dir
+        )
+        if glob_pattern is None:
+            # Glob doesn't resolve to a guide-file basename pattern
+            # under the scoped path. Not a guide search.
             return frozenset(), False
         matches: set[str] = set()
         for fname in known_filenames:
-            if fnmatch.fnmatchcase(fname, glob):
+            if fnmatch.fnmatchcase(fname, glob_pattern):
                 matches.add(fname)
-        if matches:
-            return frozenset(matches), False
-        # Glob is guide-shaped but doesn't match any known file
-        # (e.g. ``llms-future.txt``); treat as non-guide.
-        return frozenset(), False
+        # Empty matches set: glob is shaped like a guide pattern but
+        # doesn't match any bundled file (e.g. ``llms-future.txt``).
+        # Treat as non-guide rather than ambiguous.
+        return frozenset(matches), False
 
     # No glob; path-only.
     if path_at_guides_dir:

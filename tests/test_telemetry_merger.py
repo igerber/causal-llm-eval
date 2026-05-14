@@ -739,6 +739,56 @@ def test_merge_layers_diff_diff_grep_tool_glob_pattern_flips_matching(tmp_path):
     assert record.opened_llms_full is True
 
 
+def test_merge_layers_diff_diff_grep_tool_unscoped_path_no_attribution(tmp_path):
+    """R34 P1: glob attribution requires the path to be scoped under
+    bundled diff_diff. ``path=/tmp + glob=guides/llms.txt`` must NOT
+    flag llms.txt - the search is at /tmp, not under bundled guides."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/tmp", "guides/llms.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+
+
+def test_merge_layers_diff_diff_grep_tool_recursive_glob_scoped_attributes(tmp_path):
+    """R34 P1: recursive glob forms under scoped path are attributed.
+    ``path=/install/diff_diff + glob=**/guides/llms.txt`` resolves to
+    llms.txt under the bundled guides location."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/install/diff_diff", "**/guides/llms.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+
+
+def test_merge_layers_diff_diff_grep_tool_recursive_at_guides_dir(tmp_path):
+    """R34 P1: when path IS the guides directory, glob can be a basename
+    pattern directly or a recursive ``**/<basename>`` form."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/install/diff_diff/guides", "**/llms-practitioner.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_practitioner is True
+
+
 def test_merge_layers_diff_diff_grep_tool_glob_non_guide_not_flipped(tmp_path):
     """R33 P0 negative: a glob that's guide-shaped but doesn't match
     any bundled file leaves all flags False."""
