@@ -485,7 +485,9 @@ def parse_python_invocations(command: str) -> list[list[str]]:
     return out
 
 
-_REAL_INTERPRETER_BYPASS_RE = re.compile(r"\.pyruntime-real\b|\bpython(?:3(?:\.\d+)?)?-real\b")
+_REAL_INTERPRETER_BYPASS_RE = re.compile(
+    r"\.pyruntime-real\b|\bpython(?:3(?:\.\d+)?)?-real\b|\.actual-python\b"
+)
 
 
 def find_python_bypass_invocations(command: str) -> list[str]:

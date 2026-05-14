@@ -162,3 +162,47 @@ The pre-merge-check skill (Section 2.1) runs an AST-based scan for required cold
 | Operator cwd | Spawn site uses `cwd=<run tmpdir>`, not the harness repo; probe confirms `pwd` is the tmpdir |
 
 This file is updated when a new surface is identified that the probe should check.
+
+## Telemetry-bypass threat model (PR #5)
+
+The eval measures whether agents on causal-inference tasks discover and use library-level guidance surfaces. Telemetry completeness is a means to that end, not the eval's research question. This section delineates which bypass classes the merger must defeat (because they affect realistic measurement) and which are out-of-scope (because they require deliberate adversarial behavior we do not study).
+
+**In-scope (defended structurally):**
+
+1. **Direct invocation of a hidden interpreter via wrapper bypass**: any agent typing `python` / `python3` / `python3.X` is PATH-routed to the layer-1.5 wrapper at `${venv}/bin/python*`, which records `exec_python` and execs the strip-S shim at `${venv}/.pyruntime-real/python-real`.
+2. **`-S` flag bypass on the strip-S shim**: the shim removes `-S` (and compact forms `-Sc` / `-IS`) from pre-script argv before exec'ing the actual CPython binary at `${venv}/.pyruntime-real/.actual-python`. Sitecustomize loads regardless of how the shim was invoked.
+3. **Direct invocation of `python-real` or `.actual-python` (path-qualified)**: substring detection in `harness/shell_parser.py::find_python_bypass_invocations` flags any visible Bash command containing `.pyruntime-real`, `python*-real`, or `.actual-python` as a bypass primitive; the merger fails closed.
+4. **Delegated forms that name the bypass tokens** (`find venv -name python-real -exec {} -S \;`, `xargs -I {} {} -S`): same substring detection.
+5. **Reciprocal pid check**: every `session_start` MUST have a matching `exec_python` by pid and vice versa. An agent that bypasses the wrapper but reaches the strip-S shim still loads sitecustomize → session_start fires without exec_python → fail closed.
+
+**Out-of-scope (documented limitation):**
+
+A determined adversarial agent that constructs a wildcard delegated execution like
+
+```
+find venv -type f -perm -111 ! -path '*/bin/*' ! -path '*/.pyruntime-real/*' \
+    -exec {} -S script.py \;
+```
+
+could in principle find an executable file outside the substring-detection paths and execute it with `-S`. In our deployment, the only such file is `${venv}/.pyruntime-real/.actual-python`, and the `! -path '*/.pyruntime-real/*'` exclusion above would skip it. A more aggressive form
+
+```
+find / -type f -name '.actual-python' -exec {} -S script.py \;
+```
+
+contains the `.actual-python` substring and is caught by the existing detection. The residual bypass class is filesystem enumeration that targets the hidden binary by `-perm` or other characteristics that do not name the file. This requires:
+
+1. Deliberate adversarial intent (the agent is constructing obscure find patterns specifically to evade telemetry, not solving the eval task).
+2. Use of `-S` to suppress sitecustomize (otherwise sitecustomize loads and the reciprocal pid check catches the missing exec_python).
+3. Reaching `.actual-python` via a `find` form that does not lexically reference any of the bypass tokens.
+
+Realistic agents working on causal-inference tasks do not exhibit this behavior. Successful adversarial bypass produces an event log identical in shape to "agent did not invoke python at all" (no session_start, no exec_python beyond the build-time sentinel). Both populations produce a clean `TelemetryRecord` with `opened_llms_*=False` and `called_get_llm_guide=False`, which is the correct measurement for both: agents that did not engage with Python (or actively evaded measurement) did not discover Python-level guidance surfaces.
+
+The merger does not (and cannot) distinguish "agent did no python" from "agent ran python adversarially with -S via filesystem enumeration": these are observably equivalent under the layered defense. This is a property of measurement, not a defect: behaviors that produce no events cannot be observed. The eval's interpretation - "agent did not discover/use these surfaces" - is correct for both cases.
+
+**Out-of-scope structural defenses (deferred):**
+
+- OS-level mechanisms (setuid, namespaces, seccomp filters): would close the residual class but require privileged setup and platform-specific code.
+- Custom CPython build with site.py forcibly enabled: would eliminate `-S` as a bypass vector at the source but requires per-platform build infrastructure.
+
+Both are larger than the eval's research question warrants.

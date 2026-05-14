@@ -1115,7 +1115,12 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
-def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list[str]) -> bool:
+def _session_argv_matches_invocation(
+    session_argv: list[str],
+    visible_argv: list[str],
+    *,
+    venv_path: Path | None = None,
+) -> bool:
     """Return True iff a session_start's argv matches a transcript-visible
     python invocation's argv.
 
@@ -1125,13 +1130,13 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
     Interpreter argv[0] matching:
 
     - If the VISIBLE argv[0] contains any path separator (``/``), require
-      exact equality with the session's argv[0]. This covers absolute
-      paths (``/usr/bin/python3``) AND relative paths
-      (``./venv/bin/python``, ``../venv/bin/python``, ``venv/bin/python``).
-      Basename-only fallback for any of these would silently attribute an
-      off-venv interpreter to a same-args per-arm-venv session and lose
-      telemetry for the off-venv invocation. The visible path is
-      unambiguous and must identify the exact interpreter.
+      exact equality with the session's argv[0]. EXCEPTION (PR #5 R3 P1):
+      when ``venv_path`` is supplied AND both the session's argv[0] and
+      the visible argv[0] resolve to python-family executables under the
+      same venv root, treat them as equivalent. This bridges valid
+      ``${venv}/bin/python script.py`` invocations to their session
+      ``${venv}/.pyruntime-real/python-real script.py`` while still
+      rejecting off-venv absolute paths like ``/usr/bin/python``.
     - If the VISIBLE argv[0] is a bare token with no path separator
       (``python`` / ``python3`` / ``python3.11``), allow path-vs-basename
       fallback. The shell PATH-resolves the bare name to an absolute
@@ -1144,11 +1149,15 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
         return False
     if session_argv[0] == visible_argv[0]:
         return True
-    # Fallback ONLY when the visible argv[0] is a bare interpreter token
-    # (no path separators). Any path separator - leading, trailing, or
-    # embedded - implies the agent identified a specific interpreter and
-    # must match the session exactly.
     if "/" in visible_argv[0]:
+        # PR #5 R3 P1: bridge venv-internal path-qualified invocations.
+        # ``${venv}/bin/python script.py`` is the wrapper; the session's
+        # argv[0] is ``${venv}/.pyruntime-real/python-real script.py``.
+        # Both resolve under the same venv root; both are python-family.
+        if venv_path is not None and _both_under_same_venv_python(
+            session_argv[0], visible_argv[0], venv_path
+        ):
+            return True
         return False
     session_basename = Path(session_argv[0]).name
     visible_basename = Path(visible_argv[0]).name
@@ -1181,7 +1190,38 @@ def _is_python_family_basename(name: str) -> bool:
     return bool(_PYTHON_FAMILY_BASENAME_RE.match(name))
 
 
-def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
+def _both_under_same_venv_python(session_argv0: str, visible_argv0: str, venv_path: Path) -> bool:
+    """Return True iff both paths resolve to a python-family executable
+    under ``venv_path``.
+
+    Used by ``_session_argv_matches_invocation`` to bridge
+    ``${venv}/bin/python script.py`` (visible) to the session's
+    ``${venv}/.pyruntime-real/python-real script.py``. Both paths must
+    normalize to a location inside ``venv_path`` AND have a
+    python-family basename.
+    """
+    venv_root = os.path.normpath(str(venv_path))
+    sess_norm = os.path.normpath(session_argv0)
+    vis_norm = os.path.normpath(visible_argv0)
+    # Both paths must be under the venv root.
+    if not sess_norm.startswith(venv_root + os.sep):
+        return False
+    # Visible may be relative; if so, resolve it against venv_root's parent
+    # only when it starts with the venv directory name. Conservative: require
+    # absolute or already-normalized path prefix.
+    if not vis_norm.startswith(venv_root + os.sep):
+        return False
+    return _is_python_family_basename(Path(sess_norm).name) and _is_python_family_basename(
+        Path(vis_norm).name
+    )
+
+
+def _attribute_python_invocations(
+    transcript_entries: list[dict],
+    events: list[dict],
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Per-invocation cross-check by argv matching.
 
     Every transcript-visible python invocation must match an unused
@@ -1225,7 +1265,7 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             session_argv = sessions[idx].get("argv")
             if not isinstance(session_argv, list):
                 continue
-            if _session_argv_matches_invocation(session_argv, visible_argv):
+            if _session_argv_matches_invocation(session_argv, visible_argv, venv_path=venv_path):
                 matched_idx = idx
                 break
         if matched_idx is None:
@@ -1533,7 +1573,12 @@ def _count_python_invocations(stream_json_path: Path) -> int:
     return count
 
 
-def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) -> None:
+def _validate_shim_loaded(
+    events: list[dict],
+    transcript_entries: list[dict],
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Cross-layer fail-closed check before building the record.
 
     Cases:
@@ -1615,7 +1660,7 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
             f"and bypasses the in-process shim, leaving layer-2 silently "
             f"incomplete."
         )
-    _attribute_python_invocations(transcript_entries, events)
+    _attribute_python_invocations(transcript_entries, events, venv_path=venv_path)
 
 
 def _build_diff_diff_record(
@@ -1821,7 +1866,7 @@ def merge_layers(
             "incomplete"
         )
     events = _read_events(in_process_events_path, venv_path=venv_path)
-    _validate_shim_loaded(events, transcript_entries)
+    _validate_shim_loaded(events, transcript_entries, venv_path=venv_path)
     # PR #5: three-layer cross-check fires only when the runner has
     # supplied its pid (production path). Direct-call test fixtures that
     # don't supply runner_pid stay in legacy mode (layer-1 + layer-2 only).

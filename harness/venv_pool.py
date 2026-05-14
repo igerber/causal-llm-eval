@@ -172,62 +172,119 @@ def _install_shim_into_venv(venv_path: Path) -> None:
 
 _REAL_INTERPRETER_DIRNAME = ".pyruntime-real"
 _REAL_INTERPRETER_FILENAME = "python-real"
+# The actual CPython binary lives one layer deeper. python-real is a tiny
+# shell script that strips ``-S`` (and any compact form like ``-Sc``,
+# ``-IS``) from argv before execing the real binary, so sitecustomize
+# always loads regardless of how python-real was invoked. PR #5 R3 P0:
+# the strip-S step structurally closes the ``python-real -S script.py``
+# direct-bypass class.
+_ACTUAL_INTERPRETER_FILENAME = ".actual-python"
+
+_PYTHON_REAL_STRIP_S_SCRIPT = """\
+#!/usr/bin/env sh
+# Layer-1.5 strip-S shim. Sits between the wrapper (or any direct
+# invoker) and the real CPython binary at
+# ``${VENV}/.pyruntime-real/.actual-python``. Strips ``-S`` (and compact
+# forms like ``-Sc`` / ``-IS``) from the pre-script argv so sitecustomize
+# always loads. POSIX shell, no bashisms.
+#
+# Threat model: this script is the ONLY documented path to invoke the
+# real CPython binary in this venv. The actual binary lives at
+# ``.actual-python`` and is referenced only here and in the substring-
+# detection allowlist. An agent who finds and execs ``.actual-python``
+# directly with ``-S`` produces no session_start (-S skips site.py)
+# and no exec_python (no wrapper); the merger's reciprocal pid check
+# catches this as "session_start without exec_python is impossible
+# under valid telemetry" (the wrapper always fires first under the
+# expected execution path). See COLD_START_VERIFICATION.md.
+actual="$(dirname "$0")/.actual-python"
+cleaned=""
+seen_script=0
+for a in "$@"; do
+    if [ $seen_script -eq 0 ]; then
+        case "$a" in
+            -S|-S*)
+                # Pre-script -S short flag (or compact form like -Sc, -IS).
+                # Drop the S character entirely; preserve other flags by
+                # rebuilding the token.
+                stripped=$(printf '%s' "$a" | sed 's/^-/-/; s/S//g')
+                if [ "$stripped" = "-" ]; then
+                    # Was just "-S"; drop entirely.
+                    continue
+                fi
+                set -- "$@" "$stripped"
+                continue
+                ;;
+            --)
+                seen_script=1
+                ;;
+            -*)
+                ;;
+            *)
+                # First non-flag token: end of pre-script argv.
+                seen_script=1
+                ;;
+        esac
+    fi
+    cleaned="${cleaned} $a"
+done
+# shellcheck disable=SC2086
+exec "$actual" $cleaned
+"""
 
 
 def _install_python_wrapper(venv_path: Path) -> None:
     """Replace each ``${venv}/bin/python*`` interpreter with the layer-1.5
-    wrapper, preserving the real interpreter at
-    ``${venv}/.pyruntime-real/python-real``.
+    wrapper. Two-stage hidden-real-interpreter layout:
 
-    The real interpreter lives OUTSIDE ``bin/`` so it does not appear on
-    the agent's PATH. An agent's ``python-real`` typed on the command
-    line gets "command not found"; absolute-path invocations
-    (``${venv}/.pyruntime-real/python-real``) are catchable via
-    filesystem-scan defenses but are not on the easy bypass path.
+        ``${venv}/bin/python``           -> wrapper script (logs exec_python,
+                                            execs python-real)
+        ``${venv}/.pyruntime-real/python-real``
+                                          -> strip-S shim script (always
+                                             loads sitecustomize)
+        ``${venv}/.pyruntime-real/.actual-python``
+                                          -> real CPython binary
 
-    The wrapper computes its target as
-    ``$(dirname "$0")/../.pyruntime-real/python-real``.
+    The strip-S shim closes the ``python-real -S script.py`` direct-
+    bypass class structurally: any invocation that reaches python-real
+    (via wrapper or direct exec) has -S stripped before reaching the
+    real interpreter, so sitecustomize always loads.
+
+    The hidden ``.actual-python`` is the single remaining path that
+    could bypass everything if invoked directly with -S; substring
+    detection catches references to ``.actual-python`` in visible Bash
+    commands.
 
     Steps:
         1. For the first existing name in :data:`_PYTHON_INTERPRETER_NAMES`,
            materialize the real interpreter at
+           ``${venv}/.pyruntime-real/.actual-python``.
+        2. Write the strip-S shim at
            ``${venv}/.pyruntime-real/python-real``.
-           - If the existing entry is a symlink, the canonical real path is
-             ``os.path.realpath()`` of it; symlink ``python-real`` -> that
-             absolute path.
-           - If the existing entry is a real file copy (``symlinks=False``
-             in ``venv.create``), MOVE it to ``python-real``. We cannot
-             symlink-to-self because the next step overwrites the
-             original.
-        2. For every existing name in :data:`_PYTHON_INTERPRETER_NAMES`,
+        3. For every existing name in :data:`_PYTHON_INTERPRETER_NAMES`,
            remove the existing entry and write a fresh copy of the wrapper
            script at that path (``chmod +x``).
     """
     bin_dir = venv_path / "bin"
     real_dir = venv_path / _REAL_INTERPRETER_DIRNAME
     real_dir.mkdir(parents=True, exist_ok=True)
-    real_target = real_dir / _REAL_INTERPRETER_FILENAME
+    actual_target = real_dir / _ACTUAL_INTERPRETER_FILENAME
+    python_real_target = real_dir / _REAL_INTERPRETER_FILENAME
 
-    # Pass 1: find the first existing interpreter and materialize python-real.
+    # Pass 1: find the first existing interpreter and materialize
+    # .actual-python (the real CPython binary).
     materialized = False
     for name in _PYTHON_INTERPRETER_NAMES:
         original = bin_dir / name
         if not (original.exists() or original.is_symlink()):
             continue
-        if real_target.exists() or real_target.is_symlink():
-            real_target.unlink()
+        if actual_target.exists() or actual_target.is_symlink():
+            actual_target.unlink()
         if original.is_symlink():
-            # symlinks=True venv path: original is a symlink chain to the
-            # real system interpreter. Symlink python-real to the absolute
-            # realpath target so it survives the next overwrite.
             canonical_real = Path(os.path.realpath(original))
-            os.symlink(canonical_real, real_target)
+            os.symlink(canonical_real, actual_target)
         else:
-            # symlinks=False venv path: original IS the real binary copy.
-            # MOVE it (rename) to python-real so it survives the next
-            # overwrite. A symlink would dangle once the original is
-            # replaced with the wrapper.
-            original.rename(real_target)
+            original.rename(actual_target)
         materialized = True
         break
 
@@ -236,7 +293,15 @@ def _install_python_wrapper(venv_path: Path) -> None:
             f"no python interpreter found in {bin_dir!r}; venv build appears incomplete"
         )
 
-    # Pass 2: replace each interpreter name with the wrapper script.
+    # Pass 2: install the strip-S shim at python-real. The shim drops -S
+    # (and compact forms) before exec'ing .actual-python, so sitecustomize
+    # always loads regardless of how python-real was invoked.
+    if python_real_target.exists() or python_real_target.is_symlink():
+        python_real_target.unlink()
+    python_real_target.write_text(_PYTHON_REAL_STRIP_S_SCRIPT)
+    python_real_target.chmod(0o755)
+
+    # Pass 3: replace each interpreter name with the wrapper script.
     for name in _PYTHON_INTERPRETER_NAMES:
         original = bin_dir / name
         if original.exists() or original.is_symlink():

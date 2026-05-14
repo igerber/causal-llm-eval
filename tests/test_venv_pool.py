@@ -247,7 +247,7 @@ def test_wrapper_argv_with_newlines_fails_closed(shared_venv, tmp_path):
         capture_output=True,
     )
     assert result.returncode == 2
-    assert b"argv contains newline" in result.stderr
+    assert b"argv contains embedded newline" in result.stderr
 
 
 # ---------------------------------------------------------------------------

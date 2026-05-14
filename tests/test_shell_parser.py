@@ -437,3 +437,12 @@ def test_find_python_bypass_does_not_flag_python_in_other_strings():
     assert bypasses == []
     bypasses = find_python_bypass_invocations("apt show python-doc")
     assert bypasses == []
+
+
+def test_find_python_bypass_detects_actual_python_substring():
+    """R3 P0 follow-on: ``.actual-python`` is the hidden CPython binary
+    beneath python-real. Any visible reference is a bypass primitive.
+    """
+    cmd = r"find /tmp/venv -name .actual-python -exec {} -S script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]

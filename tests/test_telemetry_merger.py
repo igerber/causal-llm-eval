@@ -3618,3 +3618,85 @@ def test_merge_layers_python3X_visible_invocation_matches_python_real_session(tm
         venv_path=venv,
     )
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_path_qualified_venv_python_matches_session(tmp_path):
+    """R3 P1: ``${venv}/bin/python script.py`` (path-qualified visible)
+    must attribute to the session whose argv[0] is the venv's
+    ``.pyruntime-real/python-real``. Both paths resolve under the same
+    venv root and are python-family executables; the legacy matcher's
+    venv-aware bridge accepts the match.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    visible_python = str(venv / "bin" / "python")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345,
+                argv=["python", "script.py"],
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, [f"{visible_python} script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_path_qualified_off_venv_python_does_not_match(tmp_path):
+    """Off-venv path-qualified invocations like ``/usr/bin/python script.py``
+    MUST NOT silently attribute to a same-args venv session. The
+    venv-aware bridge accepts only paths under the SAME venv root.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["/usr/bin/python script.py"])
+    with pytest.raises((TelemetryMergeError, RunValidityError)):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_actual_python_substring_flagged_as_bypass(tmp_path):
+    """R3 P0 follow-on: any visible reference to ``.actual-python``
+    (the hidden CPython binary one layer beneath python-real) is also
+    flagged as a bypass primitive.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(events_path, _sentinel_events(executable=exe))
+    _write_transcript(transcript, [f"{venv}/.pyruntime-real/.actual-python -S script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
