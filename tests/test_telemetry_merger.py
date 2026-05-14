@@ -455,6 +455,135 @@ def test_merge_layers_diff_diff_read_tool_missing_result_raises(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_read_tool_guide_missing_id_raises(tmp_path):
+    """R22 P0: a guide-file Read tool_use without an ``id`` field fails
+    closed. Without an id the merger cannot match a tool_result; the read
+    might have succeeded but no evidence connects to a Read evidence flag.
+    Reciprocal of R21's Bash-tool_use missing-id check; same invariant,
+    different surface."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            # no "id" field
+                            "input": {"file_path": "/install/diff_diff/guides/llms.txt"},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="missing or has empty 'id'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_read_tool_guide_empty_id_raises(tmp_path):
+    """R22 P0: empty-string id is treated the same as missing id."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "id": "",
+                            "input": {"file_path": "/install/diff_diff/guides/llms.txt"},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="missing or has empty 'id'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_duplicate_tool_use_id_across_bash_read_raises(tmp_path):
+    """R22 P0: a tool_use_id reused between a Bash tool_use and a Read
+    tool_use silently cross-matches in the per-surface dicts, so a missing
+    tool_result on one block could be falsely "covered" by another
+    block's tool_result. Fail closed at merge time."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "id": "dup_1",
+                            "input": {"command": "echo hello"},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "dup_1",
+                            "is_error": False,
+                            "content": "hello",
+                        }
+                    ],
+                },
+            },
+            _read_tool_request("dup_1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("dup_1"),
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="appears on two tool_use blocks"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_duplicate_tool_use_id_within_read_raises(tmp_path):
+    """R22 P0: two guide-Read tool_uses sharing the same id are rejected
+    by the per-surface uniqueness check (raises before the cross-surface
+    check)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("r1"),
+            _read_tool_request("r1", "/install/diff_diff/guides/llms-practitioner.txt"),
+            _read_tool_result("r1"),
+        ],
+    )
+    # Either the per-surface "reuses tool_use_id" or the cross-surface
+    # "appears on two tool_use blocks" check may catch this depending on
+    # ordering; both are valid fail-closed outcomes.
+    with pytest.raises(
+        TelemetryMergeError,
+        match="(reuses tool_use_id|appears on two tool_use blocks)",
+    ):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_read_tool_ignores_non_guide_files(tmp_path):
     """Read tool on a non-guide path should not flip any flag."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)

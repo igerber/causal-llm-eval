@@ -822,6 +822,37 @@ def _validate_bash_tool_results_complete(entries: list[dict]) -> None:
         )
 
 
+def _validate_tool_use_ids_unique(entries: list[dict]) -> None:
+    """Raise ``TelemetryMergeError`` if any two ``tool_use`` blocks share
+    a tool_use ``id`` across the transcript.
+
+    Claude's tool-call flow assigns unique IDs to every tool_use. A
+    duplicate id - whether two Bash uses, two Read uses, or a Bash and a
+    Read sharing the same id - silently cross-matches in the id-keyed
+    dicts that ``_validate_bash_tool_results_complete`` and
+    ``_scan_read_tool_guide_accesses_in_entries`` build, so a missing
+    tool_result on one block could be falsely "covered" by another
+    block's tool_result. Fail closed at merge time.
+
+    Blocks without a string id are skipped here; the per-surface
+    validators (Bash and guide-Read) enforce id presence on the surfaces
+    that need them.
+    """
+    seen: set[str] = set()
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            tool_use_id = block.get("id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                continue
+            if tool_use_id in seen:
+                raise TelemetryMergeError(
+                    f"tool_use_id {tool_use_id!r} appears on two tool_use "
+                    f"blocks in the transcript; tool-use IDs must be unique "
+                    f"to avoid silent cross-tool result overwrites"
+                )
+            seen.add(tool_use_id)
+
+
 def _scan_read_tool_guide_accesses_in_entries(
     entries: list[dict],
 ) -> dict[str, bool]:
@@ -876,8 +907,20 @@ def _scan_read_tool_guide_accesses_in_entries(
             ):
                 continue
             tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str):
-                pending[tool_use_id] = p.name
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                raise TelemetryMergeError(
+                    f"Read tool_use targeting guide path {file_path!r} is "
+                    f"missing or has empty 'id' field; the transcript "
+                    f"cannot match its tool_result, so a silent drop of "
+                    f"layer-1 guide-discovery evidence cannot be ruled out"
+                )
+            if tool_use_id in pending:
+                raise TelemetryMergeError(
+                    f"Read tool_use for guide path {file_path!r} reuses "
+                    f"tool_use_id {tool_use_id!r}; transcript tool-use IDs "
+                    f"must be unique to avoid silent result overwrites"
+                )
+            pending[tool_use_id] = p.name
 
     if not pending:
         return {}
@@ -1672,12 +1715,16 @@ def merge_layers(
       (incomplete transcript / cannot determine success).
     - A Bash tool_use with no matching tool_result (subprocess stderr
       silently missing; could contain the shim event-write marker).
+    - A guide-file Read tool_use with a missing/empty/non-string id.
+    - Two tool_use blocks sharing the same id (would silently cross-match
+      tool_results across surfaces).
 
     The transcript is parsed exactly once (per-invocation attribution,
     guide-read scan, and bypass detection all consume the parsed entries).
     """
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     _validate_bash_tool_results_complete(transcript_entries)
+    _validate_tool_use_ids_unique(transcript_entries)
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(
             f"shim event-write failure marker present in {stderr_path}; "

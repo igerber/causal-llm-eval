@@ -161,6 +161,67 @@ def test_event_log_path_captured_at_import_resists_env_mutation(event_log, monke
     assert any(e.get("variant") == "practitioner" for e in guide_events), events
 
 
+def test_event_writes_resilient_to_log_path_unlinked(event_log):
+    """R22 P0: events must continue to land after an agent ``unlink``s the
+    event-log file. The shim opens a fd at startup and writes via that fd;
+    POSIX fd semantics keep the inode alive while the fd is open, so
+    subsequent writes still succeed (and the resurrected file is readable
+    via /proc/self/fd/N or by re-opening with the same inode). The
+    test verifies that a wrapper firing AFTER ``unlink`` of the path
+    still appends to the originally-opened fd.
+
+    Pre-R22 the shim re-opened the path on every write, so ``unlink`` of
+    the events file would cause subsequent writes to create a NEW empty
+    file on the path - leaving the in-tmpdir merger reading an
+    incomplete log."""
+    shim = _import_shim_fresh()
+    # session_start has already been written via the fd. Confirm the path
+    # is non-empty.
+    events_before = _read_events(event_log)
+    assert any(e.get("event") == "session_start" for e in events_before)
+
+    # Agent unlinks the event log. The fd remains valid.
+    event_log.unlink()
+    assert not event_log.exists()
+
+    # Fire a wrapper; the write must succeed via the held fd.
+    wrapped = shim._wrap_get_llm_guide(lambda variant="concise": variant)
+    wrapped("autonomous")
+
+    # POSIX: writes to an unlinked fd accumulate; the inode is freed once
+    # the fd is closed. Verify via fstat that the fd's inode is non-empty
+    # (we cannot re-read by path since unlink removed the directory entry).
+    import os as _os
+
+    stat = _os.fstat(shim._EVENT_LOG_FD)
+    assert stat.st_size > 0, "fd-backed inode has no content after wrapper fired"
+
+
+def test_event_log_open_failure_hard_exits(monkeypatch, restore_globals, capsys, tmp_path):
+    """R22 P0: when the event-log path cannot be opened at shim import
+    (parent dir missing / unwritable), the shim hard-exits with code 2.
+    Same fail-closed posture as the unset-env-var case: an agent's
+    Python subprocess must not run without telemetry capture."""
+    # Path under a non-existent parent directory.
+    bogus = tmp_path / "no_such_dir" / "events.jsonl"
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(bogus))
+    sys.modules.pop("harness.sitecustomize_template", None)
+
+    captured_exit_codes: list[int] = []
+
+    def fake_exit(code):
+        captured_exit_codes.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr("os._exit", fake_exit)
+    with pytest.raises(SystemExit):
+        importlib.import_module("harness.sitecustomize_template")
+    assert captured_exit_codes == [2]
+    captured = capsys.readouterr()
+    assert "[pyruntime]" in captured.err
+    assert "cannot open event log" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # Meta-path post-import hook
 # ---------------------------------------------------------------------------
@@ -379,9 +440,19 @@ def test_warning_hook_records_diff_diff_warning_with_stacklevel(event_log):
 # ---------------------------------------------------------------------------
 
 
-def test_wrapper_propagates_telemetry_write_failure_to_stderr_but_calls_original(
-    event_log, monkeypatch
-):
+def test_wrapper_hard_exits_on_telemetry_write_failure(event_log, monkeypatch):
+    """R22 P0: when a hook's ``_write_event`` raises OSError mid-run, the
+    wrapper must hard-exit the Python interpreter rather than silently
+    drop the event. The pre-R22 behavior was to catch and continue so a
+    transient telemetry failure would not abort the agent's run; the
+    reviewer flagged that as silently-incomplete-telemetry, because
+    ``python script.py 2>/dev/null`` would hide the stderr marker and the
+    merger would emit a clean-looking ``False`` for a dropped guide-read
+    / estimator / diagnostic event.
+
+    Hard exit + fd-based writes (resilient to chmod / rename / unlink of
+    the log path) is the R22 architecture. This test mocks ``os._exit``
+    to keep pytest alive."""
     del event_log
     shim = _import_shim_fresh()
     called = []
@@ -396,11 +467,24 @@ def test_wrapper_propagates_telemetry_write_failure_to_stderr_but_calls_original
         del event
         raise OSError("simulated disk full")
 
+    captured_exit_codes: list[int] = []
+
+    def fake_exit(code):
+        captured_exit_codes.append(code)
+        raise SystemExit(code)
+
     monkeypatch.setattr(shim, "_write_event", boom)
-    # Wrapper must STILL call original and return its value, even when
-    # _write_event raises.
-    result = wrapped(5)
-    assert result == 6
+    monkeypatch.setattr("os._exit", fake_exit)
+
+    # The wrapper calls original FIRST, then attempts to record. The
+    # original therefore completes; the failure is in the post-call
+    # event write, which triggers the hard-exit. Use SystemExit as the
+    # observable signal (mock turns _exit into a raised SystemExit).
+    with pytest.raises(SystemExit):
+        wrapped(5)
+
+    assert captured_exit_codes == [2]
+    # original was invoked exactly once (before the event-write attempt).
     assert called == [5]
 
 

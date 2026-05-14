@@ -65,28 +65,34 @@ _GUIDE_FILENAMES: tuple[str, ...] = (
 
 
 # Captured at module load (see top-level code below); ``_write_event`` uses
-# this rather than re-reading ``os.environ`` per call. Capturing once defends
-# against an agent that mutates or deletes ``_PYRUNTIME_EVENT_LOG`` after the
-# shim's session_start has fired: subsequent hook events would otherwise be
-# diverted to an attacker-chosen file (or dropped silently with no marker),
-# leaving the runner-owned log with only ``session_start`` while the merger
-# still emits a clean-looking record.
+# these rather than re-reading ``os.environ`` per call. Capturing the path
+# once defends against an agent that mutates or deletes
+# ``_PYRUNTIME_EVENT_LOG`` after the shim's session_start has fired:
+# subsequent hook events would otherwise be diverted to an attacker-chosen
+# file (or dropped silently with no marker), leaving the runner-owned log
+# with only ``session_start`` while the merger still emits a clean-looking
+# record. Holding a fd open from startup adds POSIX-level resilience: the
+# fd refers to the inode, not the path, so chmod / rename / unlink of the
+# original path do not break later appends.
 _EVENT_LOG_PATH: str = ""
+_EVENT_LOG_FD: int = -1
 
 
 def _write_event(event: dict) -> None:
     """Append a single JSON event to the captured per-run event log.
 
-    Raises OSError if the path is unwritable. At module load the OSError is
-    fatal (no events have fired yet); inside hook calls, callers catch
-    OSError and continue (see module docstring).
+    Writes via the fd held open at module load, not by re-opening the path,
+    so the write survives chmod / rename / unlink of ``_EVENT_LOG_PATH``.
+    Raises OSError if even the fd-level write fails (rare: out of space,
+    fd-table corruption, etc.); callers in hook paths re-raise to the
+    ``_safe_write`` hard-exit guard.
     """
+    payload = (json.dumps(event) + "\n").encode("utf-8")
     try:
-        with open(_EVENT_LOG_PATH, "a") as f:
-            f.write(json.dumps(event) + "\n")
+        os.write(_EVENT_LOG_FD, payload)
     except OSError as e:
         print(
-            f"[pyruntime] cannot write event to {_EVENT_LOG_PATH}: {e}",
+            f"[pyruntime] cannot write event to {_EVENT_LOG_PATH} " f"(fd={_EVENT_LOG_FD}): {e}",
             file=sys.stderr,
         )
         raise
@@ -103,11 +109,28 @@ def _utc_iso_now() -> str:
 
 
 def _safe_write(event: dict) -> None:
-    """Write an event, dropping on transient OSError so the caller proceeds."""
+    """Write an event. Hard-exit on write failure.
+
+    Pre-R22 this caught OSError and continued so a transient telemetry
+    failure would not abort the agent's run. The reviewer flagged that
+    behavior as silently-incomplete-telemetry: when the agent's command
+    redirects stderr (e.g. ``python script.py 2>/dev/null``), the
+    ``[pyruntime] cannot write event`` stderr marker disappears, the merger
+    has no signal to fail closed, and a dropped ``guide_file_read`` event
+    becomes a clean-looking ``opened_llms_*=False``.
+
+    R22 architecture: hold a startup-opened fd (resilient to chmod / rename
+    / unlink of the path), and on the remaining unreachable-write case
+    terminate the interpreter with ``os._exit(2)`` so the agent's python
+    subprocess fails visibly. The marker is still emitted to stderr first
+    (caught by cli_stderr.log + Bash tool_result content scans when stderr
+    is not redirected); the exit code is the second-line defense when
+    stderr suppression hides the marker.
+    """
     try:
         _write_event(event)
     except OSError:
-        pass
+        os._exit(2)
 
 
 def _wrap_get_llm_guide(original):
@@ -511,6 +534,25 @@ if not _initial_path:
     )
     os._exit(2)
 _EVENT_LOG_PATH = _initial_path
+
+# Open the event log fd ONCE at startup and hold it for the lifetime of
+# the interpreter. Resilient to chmod / rename / unlink of the path: the
+# fd refers to the inode, not the pathname, so the agent cannot break
+# later writes by mutating the filesystem entry. If even this initial
+# open fails (path unwritable / parent dir gone), hard-exit so the agent
+# subprocess fails visibly rather than running without telemetry.
+try:
+    _EVENT_LOG_FD = os.open(
+        _EVENT_LOG_PATH,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+        0o644,
+    )
+except OSError as _open_err:
+    print(
+        f"[pyruntime] cannot open event log {_EVENT_LOG_PATH}: {_open_err}",
+        file=sys.stderr,
+    )
+    os._exit(2)
 
 # Now record session_start with full identity.
 _write_event(
