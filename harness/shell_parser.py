@@ -186,18 +186,52 @@ def _walk_commands(nodes, depth: int = 0) -> Iterator:  # noqa: C901
 
 
 def _walk_command_substitutions_in_words(parts, depth: int = 0) -> Iterator:
-    """For each WordNode in ``parts``, walk into any ``commandsubstitution``
-    sub-parts and yield the embedded CommandNodes. Catches Python
-    invocations hidden inside ``$(...)`` or backtick command
-    substitution that the outer command word didn't reveal."""
+    """Walk every embedded substitution under ``parts`` and yield the
+    CommandNodes inside.
+
+    Recursively traverses each part looking for ``commandsubstitution``
+    (``$(...)``, backticks) and ``processsubstitution`` (``<(...)``,
+    ``>(...)``) nodes. The substitution can be hidden anywhere a Bash
+    command exposes word-like or wordlist-like content:
+
+    - WordNode args: ``echo $(python ...)``
+    - AssignmentNode values: ``OUT=$(python ...)``
+    - RedirectNode targets: ``echo ok > "$(python ...)"`` (the redirect's
+      .output / .input / .heredoc fields are WordNodes that can carry
+      substitutions)
+    - ProcessSubstitution: ``cat <(python ...)`` (its own node kind
+      mirroring commandsubstitution)
+
+    Without this coverage an agent could execute Python via a substitution
+    in any of these surfaces and the AST walker would miss the
+    invocation, allowing layer-2 loss to merge as a clean record.
+    """
     for p in parts:
-        if getattr(p, "kind", None) != "word":
+        yield from _yield_embedded_commands(p, depth)
+
+
+def _yield_embedded_commands(node, depth: int = 0) -> Iterator:
+    """Recursively visit ``node`` looking for command/process substitution
+    sub-parts and yield the CommandNodes inside. Generic over node kind
+    so the walker doesn't need to enumerate every container shape."""
+    if node is None:
+        return
+    kind = getattr(node, "kind", None)
+    if kind in ("commandsubstitution", "processsubstitution"):
+        inner = getattr(node, "command", None)
+        if inner is not None:
+            yield from _walk_commands(inner, depth)
+        return
+    # Recurse through every attribute that can hold sub-nodes.
+    for attr in ("parts", "list", "command", "input", "output", "heredoc"):
+        sub = getattr(node, attr, None)
+        if sub is None:
             continue
-        for sub in getattr(p, "parts", None) or []:
-            if getattr(sub, "kind", None) == "commandsubstitution":
-                inner = getattr(sub, "command", None)
-                if inner is not None:
-                    yield from _walk_commands(inner, depth)
+        if isinstance(sub, list):
+            for s in sub:
+                yield from _yield_embedded_commands(s, depth)
+        else:
+            yield from _yield_embedded_commands(sub, depth)
 
 
 def _maybe_recurse_eval(command_node, depth: int) -> Iterator:
@@ -406,7 +440,7 @@ def find_python_bypass_invocations(command: str) -> list[str]:
         # `env -u VAR python` removes VAR before exec. Detect before
         # walking the wrapper-prefix stripper (which would otherwise
         # treat env as a benign wrapper).
-        if _env_dash_u_wraps_python(cn):
+        if _env_wrapper_bypasses_python(cn):
             out.append(command)
             break
         argv = _extract_python_argv(cn)
@@ -475,11 +509,23 @@ def _is_assignment_only_path_or_python(command_node) -> bool:
     return has_target_assignment and not has_word
 
 
-def _env_dash_u_wraps_python(command_node) -> bool:
+def _env_wrapper_bypasses_python(command_node) -> bool:
     """For a CommandNode whose command-word is ``env``: True if it
-    carries a ``-u VAR`` flag followed by a Python invocation. The agent
-    can unset ``_PYRUNTIME_EVENT_LOG`` (or any env var) before exec,
-    blinding the shim's startup."""
+    carries any env-mutation primitive followed by a Python invocation.
+
+    Detected env primitives (all mirror the prefix/export bypass forms):
+
+    - ``-u VAR`` / ``-uVAR`` / ``--unset=VAR`` / ``--unset VAR``: remove
+      an env var (the agent can target ``_PYRUNTIME_EVENT_LOG`` directly).
+    - ``-i`` / ``--ignore-environment``: clear the entire env before
+      exec, dropping every shim env var.
+    - ``PATH=...`` arg: redirect interpreter resolution.
+    - ``PYTHON*=...`` arg (PYTHONHOME, PYTHONPATH, PYTHONSTARTUP, etc.):
+      change import resolution or run startup code.
+
+    Plain ``env python script.py`` (no primitive) is NOT a bypass; env
+    just inherits the existing environment and resolves python via PATH.
+    """
     words = [p for p in command_node.parts if getattr(p, "kind", None) == "word"]
     if not words:
         return False
@@ -488,19 +534,27 @@ def _env_dash_u_wraps_python(command_node) -> bool:
         return False
     if os.path.basename(first.word) != "env":
         return False
-    # Look for `-u` flag in args.
-    has_dash_u = any(
-        _is_literal_word(w) and (w.word == "-u" or w.word.startswith("-u")) for w in words[1:]
-    )
-    if not has_dash_u:
-        return False
-    # Confirm a python token follows somewhere in the args.
+    has_primitive = False
+    has_python = False
     for w in words[1:]:
         if not _is_literal_word(w):
             continue
-        if _is_python_basename(os.path.basename(w.word)):
-            return True
-    return False
+        tok = w.word
+        if tok in ("-i", "--ignore-environment"):
+            has_primitive = True
+            continue
+        if tok == "-u" or tok.startswith("-u") or tok.startswith("--unset"):
+            has_primitive = True
+            continue
+        if "=" in tok and not tok.startswith("-"):
+            k = tok.partition("=")[0]
+            if k == "PATH" or k.startswith("PYTHON"):
+                has_primitive = True
+            continue
+        if _is_python_basename(os.path.basename(tok)):
+            has_python = True
+            break
+    return has_primitive and has_python
 
 
 def argv_contains_bypass_flag(args_tokens: list[str]) -> bool:

@@ -86,6 +86,20 @@ from harness.shell_parser import (
             "echo `python -S script.py`",
             [["python", "-S", "script.py"]],
         ),
+        # R27: substitutions in assignment values, redirect targets,
+        # process substitution (not just word args)
+        (
+            "OUT=$(python -S a.py) true",
+            [["python", "-S", "a.py"]],
+        ),
+        (
+            'echo ok > "$(python -S b.py)"',
+            [["python", "-S", "b.py"]],
+        ),
+        (
+            "cat <(python -S c.py)",
+            [["python", "-S", "c.py"]],
+        ),
         # Multiple invocations
         (
             "python a.py && python b.py",
@@ -200,8 +214,15 @@ def test_parse_python_invocations_parse_error(command):
         "source venv/activate && python script.py",
         "conda activate myenv && python script.py",
         "pyenv shell myenv && python script.py",
-        # env -u
+        # env wrapper bypass primitives (R27 P1)
         "env -u _PYRUNTIME_EVENT_LOG python script.py",
+        "env -uVAR python script.py",
+        "env --unset=VAR python script.py",
+        "env -i python script.py",
+        "env --ignore-environment python script.py",
+        "env PATH=/usr/bin python script.py",
+        "env PYTHONPATH=/tmp python script.py",
+        "env PYTHONHOME=/x python script.py",
     ],
 )
 def test_find_python_bypass_invocations_positive(command):
