@@ -1751,6 +1751,64 @@ def test_merge_layers_diff_diff_raises_on_malformed_known_event(bad_event, tmp_p
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+@pytest.mark.parametrize(
+    "bad_event,match",
+    [
+        # session_start argv must be list[str].
+        (
+            {"event": "session_start", "ts": "x", "argv": "python script.py"},
+            "argv must be list",
+        ),
+        (
+            {"event": "session_start", "ts": "x", "argv": ["python", 123]},
+            "argv must be list",
+        ),
+        # guide_file_read with unknown variant.
+        (
+            {"event": "guide_file_read", "via": "get_llm_guide", "variant": "not-real"},
+            "unknown variant",
+        ),
+        # guide_file_read with non-string variant.
+        (
+            {"event": "guide_file_read", "via": "get_llm_guide", "variant": 42},
+            "variant must be str",
+        ),
+        # guide_file_read with unknown filename.
+        (
+            {"event": "guide_file_read", "via": "open", "filename": "not-a-guide.txt"},
+            "unknown filename",
+        ),
+        # guide_file_read with non-string filename.
+        (
+            {"event": "guide_file_read", "via": "open", "filename": ["llms.txt"]},
+            "filename must be str",
+        ),
+        # estimator_init with non-string class.
+        ({"event": "estimator_init", "class": 123}, "class must be str"),
+        # estimator_fit with non-string class.
+        ({"event": "estimator_fit", "class": None}, "class must be str"),
+        # diagnostic_call with non-string name.
+        ({"event": "diagnostic_call", "name": None}, "name must be str"),
+        # warning_emitted with non-string filename.
+        (
+            {"event": "warning_emitted", "filename": ["x"]},
+            "filename must be str",
+        ),
+        # module_import with non-string module.
+        ({"event": "module_import", "module": 99}, "module must be str"),
+    ],
+)
+def test_merge_layers_diff_diff_raises_on_malformed_value(bad_event, match, tmp_path):
+    """R19 P0: schema validation must check field TYPES and ENUM values,
+    not just presence. A present-but-malformed value (wrong type, unknown
+    enum member) silently zeros out telemetry under downstream
+    ``event.get(field, "")`` reads. Reject at parse time."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event(), bad_event])
+    with pytest.raises(TelemetryMergeError, match=match):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_unknown_event_type_ignored(tmp_path):
     """R18 P0 #2 negative: unknown event TYPES are ignored (forward
     compatibility - a future shim version may emit new event types and we

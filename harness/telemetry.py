@@ -645,18 +645,23 @@ _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
 def _validate_event_schemas(events: list[dict], path: Path) -> None:
     """Reject malformed known-event records.
 
-    A line that parses as a JSON object but is missing required fields for
-    its declared ``event`` type is silently lossy: downstream code reads
-    ``event.get("filename", "")`` and the empty default doesn't match any
-    bundled guide, so the event APPEARS in the log (passing the
-    ``_validate_shim_loaded`` non-empty / has-session_start check) but
-    contributes nothing to discoverability flags. The merger then emits a
-    valid-looking record with missing evidence. Fail closed instead.
+    Validates two layers per known event type:
+
+    1. **Required field presence**: missing required fields would silently
+       zero out telemetry under downstream ``event.get("field", "")``
+       reads.
+    2. **Required field type and enum**: a present-but-wrong-typed value
+       (e.g. ``argv="string"`` instead of ``list``) or an unknown enum
+       member (e.g. ``variant="not-real"``, ``filename="not-a-guide.txt"``)
+       would also silently zero out telemetry because the unknown value
+       doesn't match any bundled-guide check.
 
     Unknown event types are ignored (forward-compatibility: a future shim
     may emit new event types, and we don't want old mergers to reject
     them outright). Only KNOWN event types are schema-checked.
     """
+    valid_filenames = set(_VARIANT_TO_FILENAME.values())
+    valid_variants = set(_VARIANT_TO_FILENAME.keys())
     for i, event in enumerate(events):
         event_type = event.get("event")
         if not isinstance(event_type, str):
@@ -664,32 +669,65 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
         required = _EVENT_SCHEMA.get(event_type)
         if required is None:
             continue
+
+        def _bail(msg: str) -> None:
+            raise TelemetryMergeError(f"event log {path} entry {i} (event={event_type!r}): {msg}")
+
         for field in required:
             if field not in event:
-                raise TelemetryMergeError(
-                    f"event log {path} entry {i} (event={event_type!r}) is "
+                _bail(
                     f"missing required field {field!r}; the shim wrote a "
-                    f"malformed record and downstream telemetry would silently "
-                    f"omit this evidence"
+                    f"malformed record and downstream telemetry would "
+                    f"silently omit this evidence"
                 )
-        # via-specific required fields for guide_file_read.
-        if event_type == "guide_file_read":
+
+        # Per-event-type type and enum checks.
+        if event_type == "session_start":
+            argv = event["argv"]
+            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                _bail(f"argv must be list[str], got {type(argv).__name__}={argv!r}")
+        elif event_type == "module_import":
+            module = event["module"]
+            if not isinstance(module, str):
+                _bail(f"module must be str, got {type(module).__name__}={module!r}")
+        elif event_type == "guide_file_read":
             via = event.get("via")
-            if via == "get_llm_guide" and "variant" not in event:
-                raise TelemetryMergeError(
-                    f"event log {path} entry {i} (guide_file_read via='get_llm_guide') "
-                    f"is missing required 'variant' field"
-                )
-            if via == "open" and "filename" not in event:
-                raise TelemetryMergeError(
-                    f"event log {path} entry {i} (guide_file_read via='open') "
-                    f"is missing required 'filename' field"
-                )
             if via not in ("get_llm_guide", "open"):
-                raise TelemetryMergeError(
-                    f"event log {path} entry {i} (guide_file_read) has unknown "
-                    f"via={via!r}; recognized values: 'get_llm_guide', 'open'"
-                )
+                _bail(f"unknown via={via!r}; recognized values: " f"'get_llm_guide', 'open'")
+            if via == "get_llm_guide":
+                if "variant" not in event:
+                    _bail("missing required 'variant' field for via='get_llm_guide'")
+                variant = event["variant"]
+                if not isinstance(variant, str):
+                    _bail(f"variant must be str, got " f"{type(variant).__name__}={variant!r}")
+                if variant not in valid_variants:
+                    _bail(
+                        f"unknown variant={variant!r}; recognized values: "
+                        f"{sorted(valid_variants)!r}"
+                    )
+            elif via == "open":
+                if "filename" not in event:
+                    _bail("missing required 'filename' field for via='open'")
+                filename = event["filename"]
+                if not isinstance(filename, str):
+                    _bail(f"filename must be str, got " f"{type(filename).__name__}={filename!r}")
+                if filename not in valid_filenames:
+                    _bail(
+                        f"unknown filename={filename!r}; recognized values: "
+                        f"{sorted(valid_filenames)!r}"
+                    )
+        elif event_type in ("estimator_init", "estimator_fit"):
+            class_name = event["class"]
+            if not isinstance(class_name, str):
+                _bail(f"class must be str, got " f"{type(class_name).__name__}={class_name!r}")
+        elif event_type == "diagnostic_call":
+            name = event["name"]
+            if not isinstance(name, str):
+                _bail(f"name must be str, got {type(name).__name__}={name!r}")
+        elif event_type == "warning_emitted":
+            filename = event["filename"]
+            if not isinstance(filename, str):
+                _bail(f"filename must be str, got " f"{type(filename).__name__}={filename!r}")
 
 
 def _iter_tool_result_blocks(entry):

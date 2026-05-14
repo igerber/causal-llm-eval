@@ -256,7 +256,22 @@ def _install_open_hook() -> None:
     - `importlib.resources.files("diff_diff.guides").joinpath("llms.txt").read_text()`
       (which goes through pathlib for installed packages)
 
-    Low-level `os.read` on raw file descriptors is not caught.
+    NOT caught (known coverage gap, tracked in TODO under "Low-level
+    guide-read coverage"):
+
+    - ``os.open`` + ``os.read`` on raw file descriptors.
+    - ``pkgutil.get_data("diff_diff.guides", "llms.txt")`` (uses package
+      loader's ``get_data`` rather than ``open``).
+    - ``mmap.mmap`` + manual byte slicing.
+    - C-extension reads via ``ctypes``.
+
+    These vectors are uncommon in agent flows (no production library uses
+    them for reading documentation files), but a determined agent could
+    use them to read a bundled guide without producing a
+    ``guide_file_read`` event. The merger emits ``opened_llms_*=False``
+    in that case, which is misleading. Closing this gap is deferred to
+    PR #5+ when shim install moves to per-arm-venv site-packages and we
+    can revisit the fd-tracking architecture.
     """
     if getattr(builtins.open, "_pyruntime_wrapped", False):
         return
