@@ -8,6 +8,7 @@ flow without spawning live agents. Live tests are in test_runner_live.py
 from __future__ import annotations
 
 import subprocess
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,45 @@ from harness.runner import (
     clean_env,
     run_one,
 )
+
+
+@contextmanager
+def _mock_venv_setup():
+    """Patch build_arm_template + the build-time sentinel subprocess.run.
+
+    PR #5 added a per-arm venv build + sentinel invocation inside
+    ``run_one``. Unit tests that mock ``subprocess.Popen`` (to avoid
+    spawning ``claude --bare``) need to ALSO mock these new pieces so
+    the test doesn't try to pip-install diff-diff or invoke a real
+    venv python.
+
+    The mocked ``build_arm_template`` creates a minimal venv-shaped
+    directory at the requested path (so ``venv_path`` checks in
+    downstream merger code work) and returns it. The mocked
+    ``subprocess.run`` returns a completed process with exit code 0.
+    """
+    with ExitStack() as stack:
+
+        def fake_build(arm, library_version, template_dir):
+            del arm, library_version
+            template_dir = Path(template_dir)
+            (template_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (template_dir / "bin" / "python").touch()
+            (template_dir / "bin" / "python-real").touch()
+            return template_dir
+
+        def fake_run(cmd, **_kwargs):
+            del cmd
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = b""
+            result.stderr = b""
+            return result
+
+        stack.enter_context(patch("harness.runner.build_arm_template", fake_build))
+        stack.enter_context(patch("harness.runner.subprocess.run", fake_run))
+        yield
+
 
 # -- clean_env tests ----------------------------------------------------------
 
@@ -162,7 +202,7 @@ def test_run_one_creates_output_dir_and_in_process_events_stub(tmp_path):
     """run_one creates output_dir + an empty in_process_events.jsonl stub."""
     output_dir = tmp_path / "run_out"
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen") as mock_popen:
         proc = MagicMock()
         proc.wait.return_value = 0
         mock_popen.return_value = proc
@@ -204,7 +244,7 @@ def test_run_one_uses_absolute_event_log_path_with_relative_output_dir(tmp_path,
         proc.wait.return_value = 0
         return proc
 
-    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen):
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen", side_effect=fake_popen):
         result = run_one(_config(), "prompt", relative_output_dir)
 
     assert "_PYRUNTIME_EVENT_LOG" in captured_env
@@ -288,6 +328,7 @@ def test_run_one_on_timeout_returns_negative_exit_code_with_stderr_marker(tmp_pa
     config = _config(timeout=1)
 
     with (
+        _mock_venv_setup(),
         patch("harness.runner.subprocess.Popen") as mock_popen,
         patch("harness.runner.os.killpg") as mock_killpg,
     ):
@@ -314,7 +355,7 @@ def test_run_one_starts_subprocess_in_new_session(tmp_path):
     """R2 P2 fix: Popen called with start_new_session=True so killpg targets the whole tree."""
     output_dir = tmp_path / "run_out"
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen") as mock_popen:
         proc = MagicMock()
         proc.wait.return_value = 0
         mock_popen.return_value = proc
@@ -347,7 +388,10 @@ def test_run_one_writes_telemetry_missing_sentinel_when_event_log_disappears(tmp
         proc.wait.return_value = 0  # CLI itself exits clean
         return proc
 
-    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen_deletes_event_log):
+    with (
+        _mock_venv_setup(),
+        patch("harness.runner.subprocess.Popen", side_effect=fake_popen_deletes_event_log),
+    ):
         result = run_one(_config(), "prompt", output_dir)
 
     # Final event log exists with a fail-closed sentinel event, not empty.
@@ -376,7 +420,10 @@ def test_run_one_does_not_overwrite_real_telemetry_with_sentinel(tmp_path):
         proc.wait.return_value = 0
         return proc
 
-    with patch("harness.runner.subprocess.Popen", side_effect=fake_popen_writes_real_event):
+    with (
+        _mock_venv_setup(),
+        patch("harness.runner.subprocess.Popen", side_effect=fake_popen_writes_real_event),
+    ):
         result = run_one(_config(), "prompt", output_dir)
 
     final_log_text = result.in_process_events_path.read_text()
@@ -391,6 +438,7 @@ def test_run_one_on_timeout_handles_already_dead_process_group(tmp_path):
     config = _config(timeout=1)
 
     with (
+        _mock_venv_setup(),
         patch("harness.runner.subprocess.Popen") as mock_popen,
         patch("harness.runner.os.killpg", side_effect=ProcessLookupError),
     ):

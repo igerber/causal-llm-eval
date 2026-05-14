@@ -87,7 +87,7 @@ The merger validates Python invocations through three independent layers:
 
 ```
 Layer 1   (text):    AST walk of the agent's Bash command
-Layer 1.5 (exec):    per-arm-venv python wrapper           [PR #5]
+Layer 1.5 (exec):    per-arm-venv python wrapper
 Layer 2   (in-proc): sitecustomize event log
 ```
 
@@ -104,7 +104,39 @@ This architecture is principled rather than enumeration-based - the failure mode
 
 Both subclasses inherit from `RunValidityError`. Callers catching the parent unify fail-closed handling across layer-1 (parser-side) and layer-2/3 (`TelemetryMergeError`) failure modes. The parent name is neutral so methodology surfaces do not telegraph the specific check that fired.
 
-PR #5 will add Layer 1.5 (a per-arm-venv `python` wrapper that records exec-time invocations), giving the merger an independent attestation that the static parser can cross-check against.
+## Layer-1.5 attestation architecture
+
+Layer 1.5 is implemented as a POSIX shell wrapper (`harness/python_wrapper.sh`) installed in every per-arm venv by `harness.venv_pool._install_python_wrapper`. The original interpreter is preserved at `${venv}/bin/python-real`; each of `python`, `python3`, and `python3.X` becomes a copy of the wrapper script. Any `python` invocation in the venv routes through the wrapper before reaching the real interpreter.
+
+For every invocation, the wrapper:
+
+1. JSON-encodes the entire argv array via a single `awk` pass (handles `\b \f \n \r \t \" \\` control-char escapes; portable across mawk / gawk / busybox awk).
+2. Appends one JSONL `exec_python` event (`pid`, `ppid`, `ts`, `executable`, `argv`) to `${_PYRUNTIME_EVENT_LOG}` via `>>` (O_APPEND atomic for writes under PIPE_BUF, typically 4 KiB).
+3. `exec`s `${venv}/bin/python-real` with the original argv, transferring control to the real interpreter with no further wrapper overhead.
+
+Fail-closed semantics match the layer-2 shim: `exit 2` on append failure (unwritable log path), and the event-write step is skipped entirely when `_PYRUNTIME_EVENT_LOG` is unset (in which case layer-2 sitecustomize will independently hard-exit, so the spawned interpreter still fails closed). NUL bytes in argv cannot occur in POSIX argv by the `execve` contract; the wrapper does not implement awk-level NUL detection (BSD awk behavior is unreliable).
+
+The merger validates layer-1.5 events against the run's venv-root-anchored allowlist: `executable` MUST equal one of `${venv}/bin/python-real` / `python3-real` / `python3.X-real` (the rename set produced by `_install_python_wrapper`). Forged executables outside the venv root fail schema validation.
+
+## Build-time python sentinel
+
+After `build_arm_template` returns, `run_one` invokes a direct `subprocess.run([${venv}/bin/python, "-c", "pass"])` with `_PYRUNTIME_EVENT_LOG` set, BEFORE spawning the `claude --bare` agent subprocess. This sentinel:
+
+- Produces exactly one `exec_python` event (from the wrapper) plus one `session_start` event (from sitecustomize) in the event log, proving wrapper + shim are wired before any agent code runs.
+- Has `ppid == runner_pid` (the wrapper records the immediate parent, which is the runner's `subprocess.run`).
+
+The merger's three-layer cross-check uses `ppid == runner_pid` as a binary partition between sentinel and agent events. Sentinel events satisfy the "≥1 exec_python required" demand even for shell-only agent runs that never invoke python. Agent-spawned exec_python events (`ppid != runner_pid`) match layer-1 AST-extracted python invocations by `argv[1:]` equality (argv[0] differs by construction: wrapper records basename `python`, sitecustomize records `${venv}/bin/python-real`).
+
+## Per-arm venv build (PR #5)
+
+`harness.venv_pool.build_arm_template(arm, library_version, template_dir)` builds a fresh per-run venv:
+
+1. `venv.create(template_dir, with_pip=True)` materializes the venv with pip.
+2. `${venv}/bin/python -m pip install <arm-pkg>==<library_version>` installs the arm library at the pinned PyPI version (`diff-diff==3.3.2` today; `statsmodels` is deferred to PR #7).
+3. `_install_shim_into_venv` copies `harness/sitecustomize_template.py` into the venv's `site-packages` as `sitecustomize.py`. Python's site machinery auto-loads it on every interpreter start.
+4. `_install_python_wrapper` installs the layer-1.5 wrapper (see above).
+
+Phase 1 builds a fresh venv per run (~10-30s per build). Phase 2 (PR #6+) replaces this with `clone_for_run`: build the template once per pytest session / per cell, then clone-per-run cuts the cost to <1s.
 
 ## CI gate
 

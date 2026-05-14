@@ -20,13 +20,12 @@ spawned agent inherits operator state and the eval is invalid.
 
 Verified by `make smoke` running the inheritance probe.
 
-**Note:** PR #3 runs the spawned agent in whichever venv is active for the
-harness process (no per-arm venv pool yet). The per-arm venv pool — fresh
-venv per run with one library installed (diff-diff XOR statsmodels), with
-PATH prepended to the venv bin — lands in PR #5 (`harness.venv_pool`).
-Until then, `clean_env()` passes operator `PATH` verbatim. The cold-start
-isolation contract for tmpdir, HOME, env allowlist, and CLI flags is
-fully enforced in this PR; only the per-arm venv tier is deferred.
+PR #5 wires the per-arm venv pool: ``run_one()`` builds a fresh venv at
+``tmpdir/venv`` (Phase 1), installs the layer-1.5 ``python`` wrapper +
+sitecustomize shim into it, runs a build-time sentinel to attest wrapper
++ shim wiring, then prepends the venv's ``bin/`` to ``PATH`` so the
+agent's ``python`` resolves to the wrapper. Phase 2 (template-and-clone
+per run) lands in PR #6+ when eval volume justifies the optimization.
 """
 
 from __future__ import annotations
@@ -41,6 +40,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+from harness.shell_parser import RunValidityError
+from harness.venv_pool import build_arm_template
 
 _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "PATH",
@@ -93,7 +95,12 @@ class RunConfig:
 
 @dataclass
 class RunResult:
-    """Outcome of a single agent run."""
+    """Outcome of a single agent run.
+
+    PR #5 added ``venv_path`` and ``runner_pid`` so the merger can validate
+    layer-1.5 events against the run's actual venv root and partition
+    sentinel-vs-agent events by ppid.
+    """
 
     run_id: str
     arm: str
@@ -105,6 +112,8 @@ class RunResult:
     final_code_path: Path | None
     wall_clock_seconds: float
     exit_code: int
+    venv_path: Path | None = None
+    runner_pid: int | None = None
 
 
 @dataclass
@@ -255,7 +264,41 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     agent_event_log_path.parent.mkdir(parents=True, exist_ok=True)
     agent_event_log_path.touch()
 
+    # PR #5: build a per-arm venv with the layer-1.5 wrapper + sitecustomize
+    # shim installed. This is the per-run cost of Phase 1 (~10-30s); Phase 2
+    # (PR #6+) replaces this with a clone-from-template.
+    venv_dir = tmpdir / "venv"
+    build_arm_template(config.arm, config.library_version, venv_dir)
+
+    # Build-time python sentinel: prove the wrapper + shim are wired before
+    # the agent ever runs. Closes the implicit-trigger zero-python gap (a
+    # shell-only agent produces zero exec_python events; without this
+    # sentinel the merger cannot distinguish "agent did no python" from
+    # "agent neutered the wrapper"). The sentinel runs WITH
+    # _PYRUNTIME_EVENT_LOG set so the wrapper emits exactly one exec_python
+    # event and sitecustomize emits one session_start + session_end into
+    # the runner's event log, BEFORE the agent subprocess starts. The
+    # merger keys on RunResult.runner_pid to distinguish the sentinel
+    # (ppid == runner_pid) from agent-spawned events (ppid != runner_pid).
+    sentinel_result = subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "pass"],
+        env={
+            "PATH": str(venv_dir / "bin"),
+            "_PYRUNTIME_EVENT_LOG": str(agent_event_log_path),
+        },
+        capture_output=True,
+        timeout=30,
+    )
+    if sentinel_result.returncode != 0:
+        raise RunValidityError(
+            f"build-time sentinel failed (exit={sentinel_result.returncode}): "
+            f"wrapper or shim not wired correctly; stderr={sentinel_result.stderr!r}"
+        )
+
     env = clean_env(tmpdir, agent_event_log_path)
+    # Prepend the venv's bin/ to PATH so the agent's `python` resolves to
+    # the wrapper, not the operator's interpreter.
+    env["PATH"] = f"{venv_dir / 'bin'}{os.pathsep}{env.get('PATH', '')}"
     cmd = _build_command(prompt, tmpdir, config.model)
 
     start = time.monotonic()
@@ -331,4 +374,6 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         final_code_path=None,
         wall_clock_seconds=wall_clock_seconds,
         exit_code=exit_code,
+        venv_path=venv_dir,
+        runner_pid=os.getpid(),
     )

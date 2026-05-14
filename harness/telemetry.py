@@ -320,12 +320,16 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list
     return transcript_entries
 
 
-def _read_events(path: Path) -> list[dict]:
+def _read_events(path: Path, *, venv_path: Path | None = None) -> list[dict]:
     """Parse the in-process event log into a list of dicts.
 
     Raises ``TelemetryMergeError`` if the file is missing or contains a
     non-JSON line. An empty (0-byte) file is permitted and returns ``[]``;
     the validity check is the caller's responsibility.
+
+    PR #5: ``venv_path`` is forwarded to ``_validate_event_schemas`` so
+    that ``exec_python`` events can be checked against the run's
+    venv-root-anchored ``executable`` allowlist.
     """
     if not path.exists():
         raise TelemetryMergeError(
@@ -333,7 +337,7 @@ def _read_events(path: Path) -> list[dict]:
             f"the runner should have written a telemetry_missing sentinel"
         )
     events = _parse_jsonl_strict(path, "event log")
-    _validate_event_schemas(events, path)
+    _validate_event_schemas(events, path, venv_path=venv_path)
     return events
 
 
@@ -352,13 +356,42 @@ _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
     "estimator_fit": ("class",),
     "diagnostic_call": ("name",),
     "warning_emitted": ("filename",),
+    # PR #5: layer-1.5 wrapper-emitted exec_python event. Required fields per
+    # the wrapper script + venv-root-anchored executable check applied when
+    # ``venv_path`` is supplied to ``merge_layers``.
+    "exec_python": ("pid", "ppid", "ts", "executable", "argv"),
     # telemetry_missing sentinel has no required fields; the merger raises on
     # its presence regardless of payload.
     "telemetry_missing": (),
 }
 
 
-def _validate_event_schemas(events: list[dict], path: Path) -> None:
+def _expected_exec_python_executables(venv_path: Path) -> set[str]:
+    """The set of valid ``executable`` values for an ``exec_python`` event
+    given a known venv root.
+
+    Mirrors the rename set produced by
+    :func:`harness.venv_pool._install_python_wrapper`. Used by the merger to
+    structurally reject agent-forged ``exec_python`` events whose
+    ``executable`` field points anywhere outside the run's venv root.
+    """
+    bin_dir = venv_path / "bin"
+    return {
+        str(bin_dir / "python-real"),
+        str(bin_dir / "python3-real"),
+    } | {
+        # Cover any python3.X-real alias the venv produced.
+        str(p)
+        for p in bin_dir.glob("python3.*-real")
+    }
+
+
+def _validate_event_schemas(
+    events: list[dict],
+    path: Path,
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Reject malformed known-event records.
 
     Validates two layers per known event type:
@@ -375,6 +408,13 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
     Unknown event types are ignored (forward-compatibility: a future shim
     may emit new event types, and we don't want old mergers to reject
     them outright). Only KNOWN event types are schema-checked.
+
+    PR #5: when ``venv_path`` is supplied, ``exec_python`` events are
+    additionally validated against the run's venv-root-anchored allowlist
+    (mirrors the rename set produced by ``harness.venv_pool._install_python_wrapper``).
+    Forged executables outside the venv root fail validation. When
+    ``venv_path`` is None (legacy fixture mode), only the type checks
+    apply.
     """
     valid_filenames = set(_VARIANT_TO_FILENAME.values())
     valid_variants = set(_VARIANT_TO_FILENAME.keys())
@@ -453,6 +493,34 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
             filename = event["filename"]
             if not isinstance(filename, str):
                 _bail(f"filename must be str, got " f"{type(filename).__name__}={filename!r}")
+        elif event_type == "exec_python":
+            pid = event["pid"]
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                _bail(f"pid must be int, got {type(pid).__name__}={pid!r}")
+            ppid = event["ppid"]
+            if not isinstance(ppid, int) or isinstance(ppid, bool):
+                _bail(f"ppid must be int, got {type(ppid).__name__}={ppid!r}")
+            ts = event["ts"]
+            if not isinstance(ts, str):
+                _bail(f"ts must be str, got {type(ts).__name__}={ts!r}")
+            executable = event["executable"]
+            if not isinstance(executable, str):
+                _bail(f"executable must be str, got " f"{type(executable).__name__}={executable!r}")
+            argv = event["argv"]
+            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                _bail(f"argv must be list[str], got {type(argv).__name__}={argv!r}")
+            # Venv-root-anchored allowlist (PR #5): structurally rejects
+            # agent-forged exec_python events whose `executable` points
+            # outside the run's venv root. Skipped when venv_path is None
+            # (legacy fixture mode).
+            if venv_path is not None:
+                allowed = _expected_exec_python_executables(venv_path)
+                if executable not in allowed:
+                    _bail(
+                        f"executable {executable!r} is not within the run's "
+                        f"venv root {venv_path}; expected one of {sorted(allowed)!r}. "
+                        f"This guards against agent-forged exec_python events."
+                    )
 
 
 def _iter_tool_result_blocks(entry):
@@ -1148,6 +1216,134 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
         available_idx.remove(matched_idx)
 
 
+def _partition_exec_python_events(
+    events: list[dict], runner_pid: int
+) -> tuple[list[dict], list[dict]]:
+    """Split ``exec_python`` events into ``(sentinel, agent)`` lists by ppid.
+
+    The wrapper records ``ppid`` as the parent of the wrapper invocation:
+        - The build-time sentinel runs as a direct child of the runner
+          process (``subprocess.run`` from ``run_one``), so its ppid equals
+          ``runner_pid``.
+        - Agent-spawned python invocations run under the ``claude --bare``
+          subprocess tree (``ppid != runner_pid``).
+
+    Binary partition by ``ppid == runner_pid`` - no process-tree
+    introspection needed.
+    """
+    sentinels: list[dict] = []
+    agents: list[dict] = []
+    for event in events:
+        if event.get("event") != "exec_python":
+            continue
+        if event.get("ppid") == runner_pid:
+            sentinels.append(event)
+        else:
+            agents.append(event)
+    return sentinels, agents
+
+
+def _validate_three_layer_consistency(
+    transcript_entries: list[dict],
+    events: list[dict],
+    runner_pid: int,
+) -> None:
+    """Three-layer cross-check: AST ↔ wrapper ↔ sitecustomize.
+
+    Rules (PR #5):
+
+    1. **Build-time sentinel demand**: the merged log MUST contain ≥1
+       sentinel ``exec_python`` event (``ppid == runner_pid``). Zero
+       sentinel events → ``RunValidityError``. Closes the shell-only-agent
+       gap: even a run with no agent-invoked python passes attestation if
+       the sentinel proves the wrapper was correctly wired before agent
+       spawn.
+
+    2. **Cardinality**: for each layer-1 invocation extracted by the AST
+       parser, require AT LEAST ONE matching agent ``exec_python`` event
+       AND AT LEAST ONE matching ``session_start`` event. (Agent events
+       only; sentinel events are excluded from cardinality match.) Surplus
+       runtime events are allowed (xargs/find/parallel spawn N children;
+       ``subprocess.Popen`` from a parent python spawns surplus).
+
+    3. **Match key**: ``argv[1:]`` equality. argv[0] differs by construction
+       (wrapper records ``argv[0] = "python"`` resolved by PATH; layer-2's
+       ``sys.orig_argv[0]`` is ``${venv}/bin/python-real`` after the
+       wrapper's ``exec``). The load-bearing tokens for attribution are
+       the script path + flags, not the interpreter.
+
+    4. **Failure messages** quote the failing layer name so audits can
+       grep by class.
+
+    5. **Bypass priority**: callers run bypass detection BEFORE this check
+       (see ``merge_layers`` orchestration). If layer-1 flags a bypass
+       invocation, the merger fails-closed on the bypass first; this
+       function does not get a chance to emit a "missing layer-1.5"
+       duplicate error.
+    """
+    sentinels, agent_exec_events = _partition_exec_python_events(events, runner_pid)
+    if not sentinels:
+        raise RunValidityError(
+            f"build-time sentinel missing: zero exec_python events with "
+            f"ppid={runner_pid} found in event log. Either the wrapper was "
+            f"not installed in the venv, the shim was not installed, or the "
+            f"sentinel subprocess failed silently. The cold-start eval is "
+            f"invalid."
+        )
+
+    visible_invocations: list[tuple[str, list[str]]] = []
+    for entry in transcript_entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                continue
+            try:
+                argvs = parse_python_invocations(command)
+            except (ShellCommandIndeterminate, ShellCommandParseError):
+                # Indeterminate or parse-failure commands are caught at the
+                # bypass / shell-parser layer; not our problem here.
+                continue
+            for argv in argvs:
+                if argv:
+                    visible_invocations.append((command, argv))
+
+    sessions: list[dict] = [e for e in events if e.get("event") == "session_start"]
+
+    for command, visible_argv in visible_invocations:
+        # argv[1:] match against agent exec_python events.
+        wanted_argv_tail = visible_argv[1:]
+        layer15_match = any(
+            isinstance(e.get("argv"), list) and e["argv"][1:] == wanted_argv_tail
+            for e in agent_exec_events
+        )
+        if not layer15_match:
+            raise RunValidityError(
+                f"layer-1.5 attestation missing for layer-1 invocation: "
+                f"argv[1:]={wanted_argv_tail!r} in command {command[:160]!r}. "
+                f"The AST parser saw a python invocation but no agent "
+                f"exec_python event matched argv[1:]. Either the wrapper "
+                f"was bypassed (e.g., direct exec of python-real) or the "
+                f"event log was truncated."
+            )
+        # argv[1:] match against session_start events.
+        layer2_match = any(
+            isinstance(s.get("argv"), list) and s["argv"][1:] == wanted_argv_tail for s in sessions
+        )
+        if not layer2_match:
+            raise RunValidityError(
+                f"layer-2 attestation missing for layer-1 invocation: "
+                f"argv[1:]={wanted_argv_tail!r} in command {command[:160]!r}. "
+                f"The AST parser saw a python invocation but no session_start "
+                f"event matched argv[1:]. Sitecustomize did not load for this "
+                f"invocation."
+            )
+
+
 def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
     """Return Bash commands that contain a Python invocation paired with
     any bypass primitive.
@@ -1434,6 +1630,9 @@ def merge_layers(
     stream_json_path: Path,
     in_process_events_path: Path,
     stderr_path: Path,
+    *,
+    runner_pid: int | None = None,
+    venv_path: Path | None = None,
 ) -> TelemetryRecord:
     """Merge the three telemetry layers into a single record.
 
@@ -1523,8 +1722,13 @@ def merge_layers(
             "was dropped mid-run and the per-run record may be silently "
             "incomplete"
         )
-    events = _read_events(in_process_events_path)
+    events = _read_events(in_process_events_path, venv_path=venv_path)
     _validate_shim_loaded(events, transcript_entries)
+    # PR #5: three-layer cross-check fires only when the runner has
+    # supplied its pid (production path). Direct-call test fixtures that
+    # don't supply runner_pid stay in legacy mode (layer-1 + layer-2 only).
+    if runner_pid is not None:
+        _validate_three_layer_consistency(transcript_entries, events, runner_pid)
     if arm == "diff_diff":
         return _build_diff_diff_record(
             events,

@@ -162,6 +162,64 @@ def _session_end_event(pid: int | None = None) -> dict:
     }
 
 
+# PR #5: layer-1.5 exec_python event fixtures.
+#
+# ``merge_layers`` now accepts optional ``runner_pid`` + ``venv_path``
+# kwargs. When BOTH are provided (production runner path) the merger
+# enforces the three-layer cross-check: every layer-1 invocation must
+# match at least one agent exec_python event by ``argv[1:]`` AND at least
+# one ``session_start`` event by ``argv[1:]``; the log must also contain
+# at least one sentinel exec_python event (``ppid == runner_pid``). When
+# ``runner_pid`` is None (legacy fixture mode) the three-layer check is
+# skipped; the existing 138 fixtures stay valid unchanged.
+
+_DEFAULT_RUNNER_PID = 99999
+
+
+def _exec_python_event(
+    pid: int,
+    argv: list[str],
+    *,
+    ppid: int = _DEFAULT_RUNNER_PID,
+    ts: str = "2026-05-12T00:00:00Z",
+    executable: str | None = None,
+) -> dict:
+    """Build a layer-1.5 ``exec_python`` event.
+
+    Default ``ppid`` matches the default sentinel ppid so a hand-built
+    event without an explicit ppid reads as a sentinel. Tests that need
+    an *agent* exec_python event pass an explicit ``ppid`` distinct from
+    the runner pid they pass to ``merge_layers``.
+    """
+    return {
+        "event": "exec_python",
+        "pid": pid,
+        "ppid": ppid,
+        "ts": ts,
+        "executable": executable if executable is not None else "/tmp/venv/bin/python-real",
+        "argv": argv,
+    }
+
+
+def _sentinel_exec_python_event(
+    runner_pid: int = _DEFAULT_RUNNER_PID,
+    *,
+    executable: str | None = None,
+) -> dict:
+    """Build a sentinel exec_python event (``ppid == runner_pid``).
+
+    Mirrors what ``run_one``'s build-time sentinel produces. Tests that
+    pass ``runner_pid`` to ``merge_layers`` need at least one of these in
+    the event log to pass the sentinel-demand rule.
+    """
+    return _exec_python_event(
+        pid=runner_pid + 1,
+        argv=["-c", "pass"],
+        ppid=runner_pid,
+        executable=executable,
+    )
+
+
 def _write_transcript_entries(path: Path, entries: list[dict]) -> None:
     """Write a list of stream-JSON entries to `path`, appending a terminal
     `result` entry so the merger's completeness check passes. Tests
@@ -3007,3 +3065,317 @@ def test_telemetry_record_is_dataclass_with_arm_field():
     )
     assert rec.arm == "statsmodels"
     assert rec.opened_llms_txt is None
+
+
+# ---------------------------------------------------------------------------
+# PR #5: three-layer cross-check (layer-1 AST ↔ layer-1.5 wrapper ↔ layer-2 shim)
+# ---------------------------------------------------------------------------
+
+
+def _make_paths_with_venv(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Variant of ``_make_paths`` that also returns a venv-shaped directory.
+
+    The venv directory has the expected ``bin/python-real`` structure so the
+    venv-root-anchored ``executable`` schema check accepts it. Used by PR #5
+    three-layer tests that pass ``venv_path`` to ``merge_layers``.
+    """
+    events, transcript, stderr_log = _make_paths(tmp_path)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    (venv / "bin" / "python-real").touch()
+    return events, transcript, stderr_log, venv
+
+
+def test_merge_layers_three_layer_consistent_attribution(tmp_path):
+    """layer-1 + layer-1.5 + layer-2 all present with matching argv[1:] and
+    matching pid → clean TelemetryRecord.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            _sentinel_exec_python_event(executable=exe),
+            _session_start_event(argv=["python", "script.py"], pid=12345),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_zero_agent_exec_python_with_sentinel_passes(tmp_path):
+    """Shell-only agent (no python invocations); only sentinel exec_python
+    present → clean. The sentinel proves wiring, the AST sees no python
+    invocations, the three-layer check has nothing to enforce."""
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [_sentinel_exec_python_event(executable=exe)],
+    )
+    _write_transcript(transcript, ["ls -la"])  # no python in transcript
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_zero_exec_python_events_fails_sentinel_demand(tmp_path):
+    """No sentinel, no agent exec_python events → RunValidityError on
+    sentinel demand. Uses skip_auto_session_end=False (default) so the
+    session_start has a paired session_end, isolating the sentinel
+    failure mode."""
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, [])
+    with pytest.raises(RunValidityError, match="build-time sentinel missing"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_forged_executable_outside_venv_root_raises(tmp_path):
+    """An exec_python event whose ``executable`` points outside the run's
+    venv root fails schema validation (the structural defense against
+    agent-forged events).
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _exec_python_event(
+                pid=12345,
+                argv=["-c", "pass"],
+                ppid=_DEFAULT_RUNNER_PID,
+                executable="/tmp/forged/python-real",
+            ),
+        ],
+    )
+    _write_transcript(transcript, [])
+    with pytest.raises(TelemetryMergeError, match="not within the run's venv root"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_layer1_invocation_with_no_layer15_event_raises(tmp_path):
+    """An AST-visible python invocation with no matching agent exec_python
+    event raises ``RunValidityError("layer-1.5 attestation missing")``.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            _sentinel_exec_python_event(executable=exe),
+            _session_start_event(argv=["python", "script.py"], pid=12345),
+            # No agent exec_python event.
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(RunValidityError, match="layer-1.5 attestation missing"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_layer1_invocation_with_no_session_start_raises(tmp_path):
+    """An AST-visible python invocation with an agent exec_python event but
+    no matching session_start raises ``RunValidityError("layer-2
+    attestation missing")``.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            _sentinel_exec_python_event(executable=exe),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+            # No session_start with matching argv.
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    # The merger reaches argv attribution before three-layer-check; this
+    # produces a "no matching session_start" failure from the existing
+    # _attribute_python_invocations check, NOT the new layer-2-missing
+    # message. Either failure mode is fine - the run is invalid; the test
+    # asserts on the RunValidityError parent class.
+    with pytest.raises(RunValidityError):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_exec_python_argv1plus_must_match(tmp_path):
+    """``argv[1:]`` mismatch between layer-1.5 and layer-1 → fail-closed.
+    argv[0] divergence (wrapper="python", sitecustomize=".../python-real")
+    is allowed; argv[1:] mismatch is not.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            _sentinel_exec_python_event(executable=exe),
+            _session_start_event(argv=["python", "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345,
+                argv=["python", "different_script.py"],  # argv[1:] mismatch
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(RunValidityError, match="layer-1.5 attestation missing"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_xargs_one_layer1_invocation_matches_multiple_exec_python_events(
+    tmp_path,
+):
+    """N-to-many cardinality: one layer-1 invocation can match multiple
+    agent exec_python events (xargs/find/parallel spawn N children).
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    # Build 3 agent exec_python events with the same argv[1:] (simulating
+    # xargs spawning 3 python children).
+    _write_events_jsonl(
+        events_path,
+        [
+            _sentinel_exec_python_event(executable=exe),
+            _session_start_event(argv=["python", "worker.py"], pid=12345),
+            _session_start_event(argv=["python", "worker.py"], pid=12346),
+            _session_start_event(argv=["python", "worker.py"], pid=12347),
+            _exec_python_event(pid=12345, argv=["python", "worker.py"], ppid=22222, executable=exe),
+            _exec_python_event(pid=12346, argv=["python", "worker.py"], ppid=22222, executable=exe),
+            _exec_python_event(pid=12347, argv=["python", "worker.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["python worker.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_schema_rejects_malformed_exec_python_event(tmp_path):
+    """Schema validation rejects an exec_python event missing required
+    fields (e.g., argv).
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    malformed = {
+        "event": "exec_python",
+        "pid": 12345,
+        "ppid": _DEFAULT_RUNNER_PID,
+        "ts": "2026-05-12T00:00:00Z",
+        "executable": str(venv / "bin" / "python-real"),
+        # missing "argv"
+    }
+    with open(events_path, "w") as f:
+        f.write(json.dumps(malformed) + "\n")
+    _write_transcript(transcript, [])
+    with pytest.raises(TelemetryMergeError, match="missing required field 'argv'"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_schema_rejects_exec_python_executable_not_in_venv(tmp_path):
+    """Specifically: executable with the right name but wrong venv root
+    fails schema validation. /usr/bin/python-real is structurally different
+    from ${venv}/bin/python-real.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _exec_python_event(
+                pid=12345,
+                argv=["-c", "pass"],
+                ppid=_DEFAULT_RUNNER_PID,
+                executable="/usr/bin/python-real",  # right name, wrong root
+            ),
+        ],
+    )
+    _write_transcript(transcript, [])
+    with pytest.raises(TelemetryMergeError, match="not within the run's venv root"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_legacy_mode_skips_three_layer_check(tmp_path):
+    """When ``runner_pid`` is None (legacy fixture mode), the three-layer
+    check is skipped entirely. The existing 138 merger fixtures pass
+    unchanged.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    # No exec_python events at all; no sentinel; transcript has a python
+    # invocation that would fail the three-layer check if it fired.
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"], pid=12345)],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    # No runner_pid passed → three-layer check skipped → merger uses only
+    # the existing layer-1↔layer-2 attribution which succeeds here.
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"

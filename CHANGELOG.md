@@ -7,6 +7,109 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `harness/venv_pool.py::build_arm_template` (was a Phase 0 stub):
+  builds a fresh per-run venv at `tmpdir/venv`, pip-installs the arm
+  library at the pinned version, copies `harness/sitecustomize_template.py`
+  into the venv's `site-packages` as `sitecustomize.py`, and installs the
+  layer-1.5 `python` wrapper at every interpreter alias (`python`,
+  `python3`, `python3.X`) with the original interpreter preserved at
+  `python-real`. Closes the PR #4-deferred "no per-arm venv pool" gap.
+- `harness/python_wrapper.sh`: layer-1.5 exec-time wrapper around the
+  per-arm venv's `python`. POSIX shell (no bashisms; tested with
+  dash / busybox sh / macOS bash 3.2 in POSIX mode). Appends a single
+  JSONL `exec_python` event (pid, ppid, ts, executable, argv) to
+  `_PYRUNTIME_EVENT_LOG` then `exec`s the real interpreter at
+  `${VENV}/bin/python-real`. Fail-closed (exit 2) on write failure.
+- `exec_python` event type in the layer-2 event log schema.
+  `harness/telemetry.py` validates required fields (pid, ppid, ts,
+  executable, argv) and, when `merge_layers` is called with `venv_path`,
+  enforces a venv-root-anchored allowlist on `executable` so an agent
+  cannot forge events pointing at arbitrary binaries.
+- Three-layer cross-check (`_validate_three_layer_consistency`) in the
+  merger: when `merge_layers` is called with `runner_pid`, every layer-1
+  AST-extracted python invocation must have at least one matching agent
+  `exec_python` event AND at least one matching `session_start` event by
+  `argv[1:]`. Cardinality is N-to-many on the runtime side (xargs / find /
+  parallel can spawn N python children for one layer-1 invocation).
+  argv[0] is excluded from the match key (wrapper records basename
+  `python`; sitecustomize records `${venv}/bin/python-real` after exec).
+- Build-time python sentinel in `harness.runner.run_one`: a direct
+  `subprocess.run([${venv}/bin/python, "-c", "pass"])` runs BEFORE the
+  `claude --bare` subprocess, with `_PYRUNTIME_EVENT_LOG` set, so the
+  wrapper + shim always produce at least one `exec_python` +
+  `session_start` event in the log. The merger demands at least one
+  sentinel event (`ppid == runner_pid`) and uses ppid to partition
+  sentinel-vs-agent events. Closes the shell-only-agent gap (a run with
+  no agent-invoked python is still attestable via the sentinel).
+- `if __name__ == "sitecustomize"` gate in
+  `harness/sitecustomize_template.py`. Production load (Python's site
+  machinery loads the file as `sitecustomize` from the venv's
+  site-packages) fires the existing top-level side effects unchanged;
+  test / docs imports as `harness.sitecustomize_template` skip the
+  gate. Closes the PR #4-deferred "import side-effects" TODO row.
+- `tests/test_telemetry_live.py`: first end-to-end live test of the
+  three-layer attestation chain. Spawns a real `claude --bare`
+  subprocess, asserts the build-time sentinel + a `session_start` event
+  both fire, and asserts `merge_layers` validates the run successfully
+  with `runner_pid` + `venv_path`. Cost: roughly one short Claude
+  invocation worth of API spend per CI cycle (gated by
+  `@pytest.mark.live`).
+- `tests/test_venv_pool.py`: 13 tests for `build_arm_template` using a
+  session-scoped venv fixture (one ~30s build shared across 11 tests; 2
+  tests need no venv). Marked `slow` at file level.
+- 12 new three-layer cross-check tests in `tests/test_telemetry_merger.py`
+  covering: consistent attribution, shell-only-agent + sentinel,
+  missing-sentinel failure mode, forged-executable rejection,
+  layer-1.5/layer-2-missing detection, argv[1:] match strictness,
+  N-to-many xargs cardinality, malformed-event schema rejection,
+  legacy-mode (no runner_pid) backward compatibility.
+- 3 new gate tests in `tests/test_sitecustomize.py` covering the
+  `__name__` gate behavior (no side effects on plain importlib import,
+  side effects via `runpy.run_path(run_name="sitecustomize")`,
+  defensive other-name skip).
+
+### Changed
+- `harness.runner.run_one` now builds a per-arm venv at `tmpdir/venv`
+  on every run, prepends the venv's `bin/` to the spawned process's
+  PATH so the agent's `python` resolves to the wrapper, and records
+  `venv_path` + `runner_pid` on `RunResult` for the merger.
+- `harness.runner.RunResult` gained two optional fields: `venv_path`
+  (passed to `merge_layers` for the venv-root-anchored `executable`
+  check) and `runner_pid` (passed for the sentinel-vs-agent ppid
+  partition).
+- `harness.telemetry.merge_layers` accepts two new keyword-only
+  arguments: `runner_pid` (enables the three-layer cross-check when
+  provided) and `venv_path` (enables the venv-root-anchored `executable`
+  schema check). Backward-compatible: existing 138 merger fixtures
+  continue to pass without supplying either.
+- `tests/test_sitecustomize.py::_import_shim_fresh()` now uses a
+  dual-path approach: `runpy.run_path(template, run_name="sitecustomize")`
+  fires the gated side effects, then `importlib.import_module(...)`
+  returns the module object for attribute access. Gate-populated state
+  (`_EVENT_LOG_FD`, `_EVENT_LOG_PATH`, `_initial_path`) is bridged onto
+  the module via setattr so the existing 18 attribute-accessing tests
+  continue to work unchanged.
+- `harness.probe.run_probe` now passes `library_version="3.3.2"` to
+  `RunConfig` so `build_arm_template` has a real PyPI version to
+  install. Previously `library_version="n/a"` was a placeholder valid
+  only because no per-arm venv was built.
+- `tests/test_runner_live.py::test_run_one_spawns_real_agent_with_trivial_prompt`
+  similarly bumped to `library_version="3.3.2"` and `timeout_seconds=300`
+  (venv build adds ~10-30s to the cold-start path).
+
+### Removed
+- TODO row "Command-delegating exec forms (`find -exec python`,
+  `xargs python`, `parallel python`)" - layer-1.5 exec wrapper closes
+  this class structurally (any python invocation hits the wrapper
+  regardless of the parent shell form).
+- TODO row "`harness/sitecustomize_template.py` runs top-level side
+  effects on import" - the `if __name__ == "sitecustomize"` gate
+  closes this.
+- TODO row "End-to-end live test of the shim firing inside a
+  `claude --bare` subprocess" - `tests/test_telemetry_live.py` closes
+  this now that per-arm venv install is wired.
+
+### Added (PR #4)
 - `harness/shell_parser.py`: bashlex-AST-based Bash command parser for
   layer-1 attestation. Public surface: `parse_python_invocations`,
   `find_python_bypass_invocations`, `argv_contains_bypass_flag`.
