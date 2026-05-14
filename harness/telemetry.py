@@ -24,6 +24,7 @@ The merger (`merge_layers`) parses layers 1+2 and emits a per-run
 from __future__ import annotations
 
 import json
+import os.path
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -924,6 +925,39 @@ def _validate_tool_use_ids_unique(entries: list[dict]) -> None:
             seen.add(tool_use_id)
 
 
+def _validate_tool_result_ids_unique(entries: list[dict]) -> None:
+    """Raise ``TelemetryMergeError`` if any two ``tool_result`` blocks share
+    a ``tool_use_id`` value across the transcript.
+
+    Mirror of ``_validate_tool_use_ids_unique`` on the result side.
+    Claude's tool-call flow assigns exactly one ``tool_result`` per
+    ``tool_use``. A duplicate ``tool_use_id`` across results silently
+    overwrites a prior result in the id-keyed dicts built by
+    ``_validate_python_bash_results_non_error`` and
+    ``_scan_read_tool_guide_accesses_in_entries``: a first result with
+    ``is_error=True`` can be hidden by a second result with
+    ``is_error=False``, reopening the hard-exit observability hole that
+    R23 closed.
+
+    Results without a string ``tool_use_id`` are skipped; matching them
+    to a tool_use is already impossible regardless of uniqueness.
+    """
+    seen: set[str] = set()
+    for entry in entries:
+        for block in _iter_tool_result_blocks(entry):
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                continue
+            if tool_use_id in seen:
+                raise TelemetryMergeError(
+                    f"tool_use_id {tool_use_id!r} appears on two tool_result "
+                    f"blocks in the transcript; results must be unique per "
+                    f"tool_use to avoid masking is_error=True with a later "
+                    f"is_error=False (or vice versa for layer-1 guide reads)"
+                )
+            seen.add(tool_use_id)
+
+
 def _scan_read_tool_guide_accesses_in_entries(
     entries: list[dict],
 ) -> dict[str, bool]:
@@ -970,7 +1004,21 @@ def _scan_read_tool_guide_accesses_in_entries(
             file_path = tool_input.get("file_path", "")
             if not isinstance(file_path, str) or not file_path:
                 continue
-            p = Path(file_path)
+            # Lex-normalize before adjacent-part matching so paths with
+            # ``.`` / ``..`` / duplicate separators resolve to their
+            # canonical form. ``Path(file_path).parent`` does not
+            # normalize, so a successful Read of
+            # ``/install/diff_diff/guides/../guides/llms.txt`` would
+            # otherwise have ``p.parent.parent.name == '..'`` and miss
+            # the check (R24 P1#2). ``os.path.normpath`` is purely
+            # lexical (no filesystem access); we cannot use
+            # ``Path.resolve()`` since the transcript path is from the
+            # agent's environment, not ours. Mirror of
+            # ``_path_is_diff_diff_guide`` in sitecustomize_template
+            # which uses ``Path.resolve()`` (the resolution there IS
+            # filesystem-backed because the shim runs in the agent's
+            # process).
+            p = Path(os.path.normpath(file_path))
             if not (
                 p.name in known_filenames
                 and p.parent.name == "guides"
@@ -1797,6 +1845,9 @@ def merge_layers(
     - All ``tool_use`` IDs are unique across surfaces (would otherwise
       silently cross-match a tool_result between a Bash use and a Read
       use).
+    - All ``tool_result.tool_use_id`` values are unique (mirror on the
+      result side; otherwise a later ``is_error=False`` could mask an
+      earlier ``is_error=True`` in dict-keyed validators; R24 P1#1).
 
     **Failure-marker propagation**:
     - No ``[pyruntime] cannot write event`` marker in
@@ -1837,8 +1888,9 @@ def merge_layers(
     """
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     _validate_bash_tool_results_complete(transcript_entries)
-    _validate_python_bash_results_non_error(transcript_entries)
     _validate_tool_use_ids_unique(transcript_entries)
+    _validate_tool_result_ids_unique(transcript_entries)
+    _validate_python_bash_results_non_error(transcript_entries)
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(
             f"shim event-write failure marker present in {stderr_path}; "

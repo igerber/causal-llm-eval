@@ -38,8 +38,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   including HonestDiD, PreTrendsPower, and LinearRegression), diagnostic
   function calls (5 functions), `session_start` event written at shim load.
   All hooks use `functools.wraps` and `_pyruntime_wrapped` idempotency
-  markers; wrappers fail-open on transient `OSError` from the event log so
-  the agent's run is not aborted by telemetry hiccups.
+  markers. The shim opens the event-log fd once at startup
+  (POSIX-resilient to chmod / rename / unlink of the path) and hard-exits
+  the Python interpreter with `os._exit(2)` on event-write failure; the
+  merger fails closed on shim markers in stderr, on `[pyruntime]` markers
+  in Bash tool_result content, and on Bash `is_error=True` for any
+  command containing a Python invocation. This closes the chain "shim
+  fails -> merger detects" even when the agent suppresses stderr via
+  `2>/dev/null`.
 - `harness.telemetry.merge_layers()` real implementation: parses
   `in_process_events.jsonl` plus a layer-1 (`transcript.jsonl`)
   python-invocation count cross-check; raises new `TelemetryMergeError` on

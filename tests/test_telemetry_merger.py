@@ -673,6 +673,138 @@ def test_merge_layers_diff_diff_non_python_bash_is_error_passes(tmp_path):
     assert record.arm == "diff_diff"
 
 
+def test_merge_layers_diff_diff_duplicate_tool_result_id_masks_is_error_raises(tmp_path):
+    """R24 P1#1: a transcript with two tool_result blocks sharing the
+    same tool_use_id (first is_error=True, second is_error=False) must
+    fail closed. Otherwise the dict-keyed lookup in
+    _validate_python_bash_results_non_error sees only the later
+    (False) result and the hard-exit observability is_error chain
+    closes silently.
+
+    Reciprocal of R22's _validate_tool_use_ids_unique check; same
+    invariant, applied to the tool_result side."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event(argv=["python", "script.py"])])
+    with open(transcript, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "id": "bash_1",
+                                "input": {"command": "python script.py 2>/dev/null"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        # First result: error (would normally trigger fail-closed).
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "bash_1",
+                                "is_error": True,
+                                "content": "",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        # Second result with same id: masks the first in any dict-keyed
+        # validator. The merger must reject the duplicate id rather than
+        # silently overwrite.
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "bash_1",
+                                "is_error": False,
+                                "content": "fake recovery",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
+    with pytest.raises(TelemetryMergeError, match="two tool_result blocks"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_duplicate_tool_result_id_for_guide_read_raises(tmp_path):
+    """R24 P1#1: same uniqueness check applies to Read tool_results.
+    Two results for the same guide-Read tool_use_id (first is_error=True
+    masking layer-1 evidence, second False inserting fake evidence)
+    fails closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("r1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("r1", is_error=True),
+            _read_tool_result("r1", is_error=False),
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="two tool_result blocks"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+@pytest.mark.parametrize(
+    "guide_path",
+    [
+        "/install/diff_diff/guides/../guides/llms.txt",
+        "/install/diff_diff/guides/./llms.txt",
+        "/install/./diff_diff/guides/llms.txt",
+        "/install//diff_diff/guides/llms.txt",
+        "/install/diff_diff/foo/../guides/llms.txt",
+    ],
+)
+def test_merge_layers_diff_diff_read_tool_normalizes_guide_path(tmp_path, guide_path):
+    """R24 P1#2: Read tool paths with ``.`` / ``..`` / duplicate separators
+    that lex-normalize to a bundled guide location must be counted as
+    successful guide discoveries. Pre-R24 the raw
+    ``Path(file_path).parent.name`` segment check missed these forms.
+
+    All five variants normalize to ``/install/diff_diff/guides/llms.txt``;
+    the merger flips ``opened_llms_txt=True`` after lex-normalizing via
+    ``os.path.normpath``. ``Path.resolve()`` would require filesystem
+    access (the path is from the agent's environment, not ours), so a
+    purely lexical normalization is used instead."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _read_tool_request("r1", guide_path),
+            _read_tool_result("r1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+
+
 def test_merge_layers_diff_diff_python_bash_compound_command_is_error_raises(tmp_path):
     """R23: a compound command like ``pip install foo && python script.py``
     with ``is_error=True`` triggers the validator. The bash command
