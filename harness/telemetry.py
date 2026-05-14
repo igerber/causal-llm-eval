@@ -265,23 +265,37 @@ _COMMAND_MODIFIER_NAMES = (
 def _strip_command_modifier_prefix(command: str) -> list[str]:
     """If ``command`` starts with a recognized modifier word (``command``,
     ``time``, ``nohup``, ``nice``, ``timeout``, ``env``, ``xargs``,
-    ``exec``, etc.), strip JUST the modifier word and return the rest.
+    ``exec``, etc.), generate progressive-strip variants and return them.
 
-    Option/arg structure is intentionally NOT parsed: the bypass
-    detector iterating over variants is content-based (looks for
-    ``python`` literal AND ``-S`` literal anywhere in the variant),
-    so leaving option tokens like ``-n 10`` or ``--signal=KILL 30`` in
-    the variant is harmless. They don't match python+``-S`` themselves
-    and they don't suppress the match downstream.
+    Generates multiple variants by progressively stripping the modifier
+    word, then the modifier + 1 leading token, then + 2 tokens, etc.,
+    stopping at the first variant whose remainder begins with a python
+    invocation. This catches modifier-with-args forms like ``nice -n 10
+    python ...`` and ``timeout --signal=KILL 30 python ...`` without
+    requiring per-modifier knowledge of which options take values: the
+    extractor sees the python-prefixed variant and pulls the
+    invocation, while the in-between variants are no-ops.
 
     Returns ``[]`` if no modifier is present.
     """
     s = command.lstrip()
     for mod in _COMMAND_MODIFIER_NAMES:
         if s.startswith(mod + " ") or s.startswith(mod + "\t"):
-            rest = s[len(mod) :].lstrip()
-            if rest and rest != s:
-                return [rest]
+            after_mod = s[len(mod) :].lstrip()
+            if not after_mod:
+                return []
+            results = [after_mod]
+            tokens = after_mod.split()
+            for i in range(1, len(tokens)):
+                rest = " ".join(tokens[i:])
+                if not rest:
+                    continue
+                results.append(rest)
+                # Stop once we've reached a python-prefixed remainder; further
+                # stripping would just re-traverse what extraction already covers.
+                if re.match(r"python(?:3(?:\.\d+)?)?(?:\s|$)", rest):
+                    break
+            return results
     return []
 
 
@@ -744,19 +758,26 @@ def _strip_heredoc_bodies(command: str) -> str:
         if close_match is None:
             # No closing tag: drop body to end.
             break
-        # Skip the body and the closing tag; resume after.
+        # Skip the body and the closing tag; resume after. Insert a synthetic
+        # ``\n`` separator so any post-heredoc command (``cat <<EOF\n...\nEOF\n
+        # python script.py``) is not glued onto the heredoc opener and lost
+        # to the python-invocation regex. The synthetic newline is a real
+        # shell command separator and is honored by ``_PYTHON_INVOCATION_RE``,
+        # ``_is_in_command_position``, and ``_find_unquoted_separator``.
+        out_parts.append("\n")
         pos = close_match.end()
     return "".join(out_parts)
 
 
 def _find_unquoted_separator(s: str) -> int | None:
     """Return the position of the first unquoted shell separator (``;``,
-    ``&``, ``|``, ``)``) in ``s``, or ``None`` if every such char is inside
-    a single- or double-quoted region.
+    ``&``, ``|``, ``)``, ``\\n``) in ``s``, or ``None`` if every such char
+    is inside a single- or double-quoted region.
 
-    Includes ``)`` in the separator set so that ``(python script.py)``
-    truncates correctly: without it, the closing paren would attach to
-    the last argv token (``script.py)``) and break attribution.
+    Includes ``)`` so that ``(python script.py)`` truncates correctly
+    without the closing paren attaching to the last argv token, and
+    includes ``\\n`` because newline is a shell command separator (a
+    multiline Bash command's ``cmd1\\ncmd2`` is two commands).
 
     Tracks shell quoting state so that the inline ``;`` in
     ``python -c 'import os; print(1)'`` does not falsely terminate the
@@ -772,7 +793,7 @@ def _find_unquoted_separator(s: str) -> int | None:
         if quote_char is None:
             if c in ("'", '"'):
                 quote_char = c
-            elif c in (";", "&", "|", ")"):
+            elif c in (";", "&", "|", ")", "\n"):
                 return i
         else:
             if quote_char == '"' and c == "\\" and i + 1 < len(s):
@@ -879,22 +900,11 @@ def _truncate_at_redirection(tokens: list[str]) -> list[str]:
     return result
 
 
-def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
-    """Return a list of argv-shaped token lists for each python invocation.
-
-    Each entry is the full argv slice: `[interpreter, *args]` matching
-    what the Python process would see in ``sys.orig_argv``. Args run up
-    to the next shell separator (``;``, ``&``, ``|``, end-of-string), with
-    quoting handled by `shlex.split`, and any I/O redirection tokens
-    (``>``, ``<``, ``<<``, ``2>&1``, etc.) are stripped because shell
-    redirection is not part of the Python program's argv. The interpreter
-    token preserves any absolute path prefix (e.g. `/usr/bin/python3`).
-
-    Heredoc bodies are stripped before scanning so that text inside
-    ``cat <<'EOF' ... EOF`` (a common agent file-creation pattern) is
-    not falsely matched as a python invocation.
+def _extract_python_invocations_from_segment(command: str) -> list[list[str]]:
+    """Return argv-shaped token lists for each python invocation in a single
+    pre-stripped, pre-unwrapped command segment. Used by
+    ``_extract_python_invocations_from_command`` per shell variant.
     """
-    command = _strip_heredoc_bodies(command)
     invocations: list[list[str]] = []
     for m in _PYTHON_INVOCATION_RE.finditer(command):
         match_start = m.start()
@@ -913,6 +923,7 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
             while i > 0 and command[i - 1] not in (
                 " ",
                 "\t",
+                "\n",
                 ";",
                 "&",
                 "|",
@@ -924,8 +935,10 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
             ):
                 i -= 1
             interp_start = i
-        elif boundary_char in (" ", "\t", ";", "&", "|", "(", ")"):
+        elif boundary_char in (" ", "\t", "\n", ";", "&", "|", "(", ")"):
             # Boundary char is a separator; interpreter starts after it.
+            # ``\n`` is included so post-heredoc / multiline-Bash python
+            # invocations on a fresh line are extracted.
             interp_start = match_start + 1
         else:
             # ``^`` start-of-command boundary (zero-width); m.start() is
@@ -958,6 +971,42 @@ def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
         args_tokens = _truncate_at_redirection(args_tokens)
         invocations.append([interpreter, *args_tokens])
     return invocations
+
+
+def _extract_python_invocations_from_command(command: str) -> list[list[str]]:
+    """Return argv-shaped token lists for every python invocation visible in
+    ``command``, INCLUDING those hidden inside shell wrappers.
+
+    Pipeline:
+
+    1. Strip heredoc bodies (so script content inside ``<<EOF ... EOF`` is
+       not falsely matched as an invocation).
+    2. Recursively unwrap known shell wrappers (modifiers, ``bash -c``,
+       brace groups, ``if/while/!``, ``$()``, backticks) via
+       ``_unwrap_command_for_inspection``.
+    3. Run the per-segment regex extractor on each variant.
+    4. Deduplicate argv lists (different unwrap paths often surface the
+       same inner invocation).
+
+    Each entry is the full argv slice ``[interpreter, *args]`` matching
+    what the Python process would see in ``sys.orig_argv``. Args run up
+    to the next unquoted shell separator (``;``, ``&``, ``|``, ``)``,
+    ``\\n``, end-of-string), with quoting handled by ``shlex.split``,
+    and any I/O redirection tokens (``>``, ``<``, ``<<``, ``2>&1``,
+    etc.) are stripped because shell redirection is not part of the
+    Python program's argv.
+    """
+    command = _strip_heredoc_bodies(command)
+    seen_argvs: set[tuple[str, ...]] = set()
+    out: list[list[str]] = []
+    for variant in _unwrap_command_for_inspection(command):
+        for argv in _extract_python_invocations_from_segment(variant):
+            key = tuple(argv)
+            if key in seen_argvs:
+                continue
+            seen_argvs.add(key)
+            out.append(argv)
+    return out
 
 
 def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list[str]) -> bool:

@@ -1598,6 +1598,101 @@ def test_merge_layers_diff_diff_unwrap_does_not_overflag_safe_wrappers(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# R17 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_post_heredoc_python_extracted(tmp_path):
+    """R17 P0: ``cat > script.py <<'PY'\\n...\\nPY\\npython script.py`` is
+    a common agent pattern (heredoc-create a script, then run it). Pre-R17
+    the heredoc strip consumed the trailing newline and glued the post-
+    heredoc command onto the opener (``...PY'python script.py``), hiding
+    the python invocation from extraction. Post-R17 a synthetic
+    separator preserves the post-heredoc command for attribution."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(
+        transcript,
+        ["cat > script.py <<'PY'\nimport os\nprint('hi')\nPY\npython script.py"],
+    )
+    # No session_start matches `python script.py`, so attribution fails closed.
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_post_heredoc_python_attributes_with_session(tmp_path):
+    """R17 positive: heredoc-create then run, with a matching session_start,
+    attributes normally."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "script.py"])],
+    )
+    _write_transcript(
+        transcript,
+        ["cat > script.py <<'PY'\nimport os\nPY\npython script.py"],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_post_heredoc_absolute_python(tmp_path):
+    """R17 P0 variant: ``...heredoc...\\n/usr/bin/python script.py``,
+    absolute interpreter after heredoc. Attribution requires an
+    absolute-path session_start (no basename fallback for absolute);
+    none is present, so fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(
+        transcript,
+        ["cat > script.py <<'PY'\nx = 1\nPY\n/usr/bin/python script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_post_heredoc_python_dash_S(tmp_path):
+    """R17 P0 variant: heredoc + ``python -S script.py`` after. Either
+    the bypass detector or attribution catches the post-heredoc python
+    -S; both are fail-closed and either error is correct."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(
+        transcript,
+        ["cat > script.py <<'PY'\nx = 1\nPY\npython -S script.py"],
+    )
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "time python script.py",
+        "command python script.py",
+        "nice -n 10 python script.py",
+        "timeout 30 python script.py",
+        "{ python script.py; }",
+        "if python script.py; then echo ok; fi",
+        "! python script.py",
+        "echo `python script.py`",
+        "time /usr/bin/python script.py",
+    ],
+)
+def test_merge_layers_diff_diff_wrapped_python_requires_session(command, tmp_path):
+    """R17 P0: even WITHOUT ``-S``, a python invocation hidden inside any
+    recognized shell wrapper must be extracted and attributed. Pre-R17
+    the unwrapper only checked variants for python+``-S``; benign-shape
+    wrapped invocations were not extracted, so an absent session_start
+    didn't fail closed and the merger could emit all-false discoverability."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])  # no session
+    _write_transcript(transcript, [command])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+# ---------------------------------------------------------------------------
 # Arm validation
 # ---------------------------------------------------------------------------
 
