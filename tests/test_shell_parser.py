@@ -403,3 +403,37 @@ def test_find_python_bypass_python3X_real_direct_flagged():
     """python3-real and python3.X-real variants are also bypass primitives."""
     bypasses = find_python_bypass_invocations("/tmp/venv/bin/python3.11-real -c 'pass'")
     assert bypasses == ["/tmp/venv/bin/python3.11-real -c 'pass'"]
+
+
+def test_find_python_bypass_detects_find_exec_python_real_delegation():
+    r"""R2 P0 #1: delegated forms like
+    ``find venv -name python-real -exec {} -S script.py \;``
+    don't have python as a CommandNode but reference the real-interpreter
+    location. The substring check fails closed.
+    """
+    cmd = r"find /tmp/venv -name python-real -exec {} -S script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_real_in_xargs():
+    """xargs invoking the real interpreter via .pyruntime-real path."""
+    cmd = "echo /tmp/venv/.pyruntime-real/python-real | xargs -I {} {} -S script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_real_substring():
+    """Any visible reference to .pyruntime-real flags as bypass."""
+    bypasses = find_python_bypass_invocations("ls /tmp/venv/.pyruntime-real/")
+    assert bypasses == ["ls /tmp/venv/.pyruntime-real/"]
+
+
+def test_find_python_bypass_does_not_flag_python_in_other_strings():
+    """``python_setup.sh`` or ``python-doc`` should NOT trigger the
+    word-boundary regex (they aren't python-real).
+    """
+    bypasses = find_python_bypass_invocations("ls /etc/python_setup.sh")
+    assert bypasses == []
+    bypasses = find_python_bypass_invocations("apt show python-doc")
+    assert bypasses == []

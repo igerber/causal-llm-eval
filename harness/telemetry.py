@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os.path
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1151,15 +1152,33 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
         return False
     session_basename = Path(session_argv[0]).name
     visible_basename = Path(visible_argv[0]).name
-    # PR #5 R1: after the wrapper's ``exec "$real" "$@"`` the real python
-    # records ``sys.orig_argv[0]`` as the path to ``python-real``, so its
-    # basename is e.g. ``python-real``. A visible bare-token invocation
-    # like ``python script.py`` should still match the session created
-    # by routing through the wrapper. Strip the ``-real`` suffix on the
-    # session side before comparing basenames.
-    if session_basename.endswith("-real"):
-        session_basename = session_basename[: -len("-real")]
+    # PR #5 R2: after the wrapper's ``exec "$real" "$@"`` the real python
+    # records ``sys.orig_argv[0]`` as the path to ``python-real``,
+    # regardless of which alias (``python`` / ``python3`` / ``python3.X``)
+    # the agent originally typed. The merger uses pid-keyed matching as
+    # the canonical bridge (see _validate_three_layer_consistency), but
+    # the legacy attribution still runs first. Treat any python-family
+    # basename (``python``, ``python3``, ``python3.X``, plus the
+    # ``-real`` variants) as equivalent for argv[0] matching: a visible
+    # ``python3 script.py`` should attribute to the session
+    # ``${venv}/.pyruntime-real/python-real script.py`` because the
+    # wrapper routed the invocation.
+    if _is_python_family_basename(session_basename) and _is_python_family_basename(
+        visible_basename
+    ):
+        return True
     return session_basename == visible_basename
+
+
+_PYTHON_FAMILY_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?(?:-real)?$")
+
+
+def _is_python_family_basename(name: str) -> bool:
+    """Return True if ``name`` is any python interpreter alias the
+    venv may produce: ``python``, ``python3``, ``python3.11``,
+    ``python-real``, ``python3-real``, ``python3.11-real``.
+    """
+    return bool(_PYTHON_FAMILY_BASENAME_RE.match(name))
 
 
 def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:

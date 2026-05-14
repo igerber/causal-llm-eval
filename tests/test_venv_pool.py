@@ -7,7 +7,8 @@ tests assert the four installation steps fire correctly:
     2. Arm library pip-installed at the pinned version.
     3. ``sitecustomize.py`` copied into ``site-packages``.
     4. Layer-1.5 ``python_wrapper.sh`` installed as ``python`` / ``python3``
-       / ``python3.X``; original interpreter preserved at ``python-real``.
+       / ``python3.X``; original interpreter moved to
+       ``${venv}/.pyruntime-real/python-real`` (off PATH).
 
 The file is marked ``slow`` because each test session pays one ~30s venv
 build cost (cached via the ``shared_venv`` session-scoped fixture). The 11
@@ -59,7 +60,7 @@ def _site_packages(venv_path: Path) -> Path:
     """Return the venv's site-packages directory."""
     probe = subprocess.run(
         [
-            str(venv_path / "bin" / "python-real"),
+            str(venv_path / ".pyruntime-real" / "python-real"),
             "-c",
             "import sysconfig; print(sysconfig.get_paths()['purelib'])",
         ],
@@ -77,13 +78,13 @@ def _site_packages(venv_path: Path) -> Path:
 
 def test_build_arm_template_creates_venv_with_python_executable(shared_venv):
     assert (shared_venv / "bin" / "python").exists()
-    assert (shared_venv / "bin" / "python-real").exists()
+    assert (shared_venv / ".pyruntime-real" / "python-real").exists()
 
 
 def test_build_arm_template_installs_correct_library_version(shared_venv):
     probe = subprocess.run(
         [
-            str(shared_venv / "bin" / "python-real"),
+            str(shared_venv / ".pyruntime-real" / "python-real"),
             "-c",
             "import diff_diff; print(diff_diff.__version__)",
         ],
@@ -153,7 +154,11 @@ def test_build_arm_template_wrapper_emits_exec_python_event(shared_venv, tmp_pat
     # ["-c", "pass"], so argv = ["python", "-c", "pass"]. The argv[1:]
     # tokens are the load-bearing match key the merger uses.
     assert evt["argv"] == ["python", "-c", "pass"]
-    assert evt["executable"] == str(shared_venv / "bin" / "python-real")
+    # Wrapper records ``$(dirname "$0")/../.pyruntime-real/python-real``
+    # which has an embedded ``/..``; normalize before comparing.
+    assert os.path.normpath(evt["executable"]) == str(
+        shared_venv / ".pyruntime-real" / "python-real"
+    )
     assert isinstance(evt["pid"], int)
     assert isinstance(evt["ppid"], int)
 

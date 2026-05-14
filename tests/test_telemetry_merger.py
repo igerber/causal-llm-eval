@@ -3550,3 +3550,71 @@ def test_merge_layers_session_start_without_matching_exec_python_raises(tmp_path
             runner_pid=_DEFAULT_RUNNER_PID,
             venv_path=venv,
         )
+
+
+def test_merge_layers_python3_visible_invocation_matches_python_real_session(tmp_path):
+    """R2 P1 #2: `python3 script.py` is invoked via the wrapper which
+    execs python-real. The wrapper records argv[0]="python3" but the
+    sitecustomize records argv[0]=".../python-real". The merger's
+    python-family basename matcher accepts any python alias for argv[0]
+    so this attributes correctly.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            # session_start records argv[0] as the path to python-real.
+            _session_start_event(
+                argv=[exe, "script.py"],
+                pid=12345,
+            ),
+            # exec_python records argv[0] as basename of $0 = "python3".
+            _exec_python_event(
+                pid=12345,
+                argv=["python3", "script.py"],
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, ["python3 script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_python3X_visible_invocation_matches_python_real_session(tmp_path):
+    """Same as above but for ``python3.11 script.py``."""
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345,
+                argv=["python3.11", "script.py"],
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, ["python3.11 script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"

@@ -106,17 +106,17 @@ Both subclasses inherit from `RunValidityError`. Callers catching the parent uni
 
 ## Layer-1.5 attestation architecture
 
-Layer 1.5 is implemented as a POSIX shell wrapper (`harness/python_wrapper.sh`) installed in every per-arm venv by `harness.venv_pool._install_python_wrapper`. The original interpreter is preserved at `${venv}/bin/python-real`; each of `python`, `python3`, and `python3.X` becomes a copy of the wrapper script. Any `python` invocation in the venv routes through the wrapper before reaching the real interpreter.
+Layer 1.5 is implemented as a POSIX shell wrapper (`harness/python_wrapper.sh`) installed in every per-arm venv by `harness.venv_pool._install_python_wrapper`. The original interpreter is moved to `${venv}/.pyruntime-real/python-real` - a non-PATH location outside `bin/` so an agent cannot type `python-real` to bypass the wrapper. Each of `python`, `python3`, and `python3.X` in `bin/` becomes a copy of the wrapper script. Any `python` invocation in the venv routes through the wrapper before reaching the real interpreter at `${venv}/.pyruntime-real/python-real`.
 
 For every invocation, the wrapper:
 
 1. JSON-encodes the entire argv array via a single `awk` pass (handles `\b \f \n \r \t \" \\` control-char escapes; portable across mawk / gawk / busybox awk).
 2. Appends one JSONL `exec_python` event (`pid`, `ppid`, `ts`, `executable`, `argv`) to `${_PYRUNTIME_EVENT_LOG}` via `>>` (O_APPEND atomic for writes under PIPE_BUF, typically 4 KiB).
-3. `exec`s `${venv}/bin/python-real` with the original argv, transferring control to the real interpreter with no further wrapper overhead.
+3. `exec`s `${venv}/.pyruntime-real/python-real` with the original argv, transferring control to the real interpreter with no further wrapper overhead.
 
 Fail-closed semantics match the layer-2 shim: `exit 2` on append failure (unwritable log path), and the event-write step is skipped entirely when `_PYRUNTIME_EVENT_LOG` is unset (in which case layer-2 sitecustomize will independently hard-exit, so the spawned interpreter still fails closed). NUL bytes in argv cannot occur in POSIX argv by the `execve` contract; the wrapper does not implement awk-level NUL detection (BSD awk behavior is unreliable).
 
-The merger validates layer-1.5 events against the run's venv-root-anchored allowlist: `executable` MUST equal one of `${venv}/bin/python-real` / `python3-real` / `python3.X-real` (the rename set produced by `_install_python_wrapper`). Forged executables outside the venv root fail schema validation.
+The merger validates layer-1.5 events against the run's venv-root-anchored allowlist: `executable` MUST equal `${venv}/.pyruntime-real/python-real` (normalized via `os.path.normpath` to handle the wrapper's literal `bin/../.pyruntime-real/python-real` form). Forged executables outside the run's venv root fail schema validation. Additionally, any visible Bash command that references `.pyruntime-real` or a `python*-real` token by name is flagged as a bypass primitive (catches `find venv -name python-real -exec {} -S script.py \;` and similar delegated forms the AST walker cannot model).
 
 ## Build-time python sentinel
 
@@ -125,7 +125,7 @@ After `build_arm_template` returns, `run_one` invokes a direct `subprocess.run([
 - Produces exactly one `exec_python` event (from the wrapper) plus one `session_start` event (from sitecustomize) in the event log, proving wrapper + shim are wired before any agent code runs.
 - Has `ppid == runner_pid` (the wrapper records the immediate parent, which is the runner's `subprocess.run`).
 
-The merger's three-layer cross-check uses `ppid == runner_pid` as a binary partition between sentinel and agent events. Sentinel events satisfy the "≥1 exec_python required" demand even for shell-only agent runs that never invoke python. Agent-spawned exec_python events (`ppid != runner_pid`) match layer-1 AST-extracted python invocations by `argv[1:]` equality (argv[0] differs by construction: wrapper records basename `python`, sitecustomize records `${venv}/bin/python-real`).
+The merger's three-layer cross-check uses `ppid == runner_pid` as a binary partition between sentinel and agent events. Sentinel events satisfy the "≥1 exec_python required" demand even for shell-only agent runs that never invoke python. Agent-spawned exec_python events (`ppid != runner_pid`) match layer-1 AST-extracted python invocations by `argv[1:]` equality (argv[0] differs by construction: wrapper records basename `python`, sitecustomize records `${venv}/.pyruntime-real/python-real`). A reciprocal pid check ensures every session_start has a matching exec_python and vice versa, so an agent that directly executes the real interpreter (bypassing the wrapper) leaves a session_start with no exec_python pair and fails closed.
 
 ## Per-arm venv build (PR #5)
 

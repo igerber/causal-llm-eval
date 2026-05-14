@@ -485,6 +485,9 @@ def parse_python_invocations(command: str) -> list[list[str]]:
     return out
 
 
+_REAL_INTERPRETER_BYPASS_RE = re.compile(r"\.pyruntime-real\b|\bpython(?:3(?:\.\d+)?)?-real\b")
+
+
 def find_python_bypass_invocations(command: str) -> list[str]:
     """Return ``[command]`` if it contains any Python bypass primitive,
     else ``[]``.
@@ -502,10 +505,25 @@ def find_python_bypass_invocations(command: str) -> list[str]:
       - ``.``, ``source``, ``conda activate``, ``pyenv shell`` activation
         command appearing in the same outer command before a Python
         CommandNode: shell activation mutates env (often PATH).
+      - **Any occurrence of ``.pyruntime-real`` or ``python-real`` /
+        ``python3-real`` / ``python3.X-real`` in the visible Bash command**:
+        these tokens reference the layer-1.5 wrapper's hidden real
+        interpreter location. Direct command-word invocation is caught by
+        the AST walker; delegated forms like
+        ``find venv -name python-real -exec {} -S script.py \\;`` keep
+        the token inside a non-CommandNode argv but still trigger this
+        substring check. The merger fails closed regardless of how the
+        agent threaded the reference. (PR #5 R2 P0 #1.)
 
     Raises ShellCommandIndeterminate / ShellCommandParseError per the
     parser's normal contract.
     """
+    # Cheap pre-pass: any reference to the real-interpreter location or
+    # its basename in the visible command is a bypass primitive, even if
+    # the token sits inside a delegated execution argv (find -exec,
+    # xargs, fd -x, parallel) that the AST walker cannot model.
+    if _REAL_INTERPRETER_BYPASS_RE.search(command):
+        return [command]
     nodes = _parse(command)
     has_activation = False
     has_path_mutation = False
