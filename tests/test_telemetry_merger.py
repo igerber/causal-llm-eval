@@ -662,9 +662,12 @@ def test_merge_layers_diff_diff_grep_tool_guide_access_flips_flag(tmp_path):
     assert record.opened_llms_txt is True
 
 
-def test_merge_layers_diff_diff_grep_tool_guides_dir_flips_all_flags(tmp_path):
-    """R32 P0: a Grep against the guides directory itself (no narrower
-    target) sees every bundled file's content; flag all four."""
+def test_merge_layers_diff_diff_grep_tool_guides_dir_no_glob_fails_closed(tmp_path):
+    """R33 P0: a Grep against the guides directory itself with NO glob
+    is ambiguous - we cannot statically attribute which guide files
+    were searched. Fail closed rather than flag-all-four (the previous
+    R32 behavior was unsafe because the agent may have used the
+    output_mode=files_with_matches without seeing any content)."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [_session_start_event()])
     _write_transcript_entries(
@@ -674,11 +677,82 @@ def test_merge_layers_diff_diff_grep_tool_guides_dir_flips_all_flags(tmp_path):
             _read_tool_result("g1"),
         ],
     )
+    with pytest.raises(
+        TelemetryMergeError,
+        match="cannot be attributed to specific guide files",
+    ):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def _grep_request_with_glob(tool_use_id: str, path: str, glob: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Grep",
+                    "input": {"path": path, "pattern": "foo", "glob": glob},
+                }
+            ],
+        },
+    }
+
+
+def test_merge_layers_diff_diff_grep_tool_glob_specific_file_flips_one(tmp_path):
+    """R33 P0: Grep with ``path=diff_diff, glob=guides/llms.txt`` is
+    attributable to llms.txt only."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/install/diff_diff", "guides/llms.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+    assert record.opened_llms_practitioner is False
+    assert record.opened_llms_autonomous is False
+    assert record.opened_llms_full is False
+
+
+def test_merge_layers_diff_diff_grep_tool_glob_pattern_flips_matching(tmp_path):
+    """R33 P0: Grep with ``glob=guides/llms*.txt`` matches all four
+    bundled guides by fnmatch; each is flagged."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/install/diff_diff", "guides/llms*.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.opened_llms_txt is True
     assert record.opened_llms_practitioner is True
     assert record.opened_llms_autonomous is True
     assert record.opened_llms_full is True
+
+
+def test_merge_layers_diff_diff_grep_tool_glob_non_guide_not_flipped(tmp_path):
+    """R33 P0 negative: a glob that's guide-shaped but doesn't match
+    any bundled file leaves all flags False."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_request_with_glob("g1", "/install/diff_diff", "guides/llms-future.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
 
 
 def test_merge_layers_diff_diff_grep_tool_failed_does_not_flip(tmp_path):

@@ -786,25 +786,33 @@ def _scan_grep_tool_guide_accesses_in_entries(
     accessed via Claude's Grep tool in the transcript.
 
     Mirror of ``_scan_read_tool_guide_accesses_in_entries`` for the
-    Grep tool surface (R32 P0). Grep reads file content while searching;
-    a successful Grep against a bundled guide path exposes the content
-    to the agent the same way Read does.
+    Grep tool surface (R32 P0; R33 P0 extended with glob handling).
+    Grep reads file content while searching; a successful Grep that
+    can be attributed to one or more bundled guide files exposes that
+    content to the agent the same way Read does.
 
     Grep input shape (Claude's Grep tool):
     - ``path``: file or directory to search.
-    - ``glob`` / ``pattern``: search terms.
+    - ``glob``: file-pattern filter applied to files under ``path``.
+    - ``pattern``: search regex (content; not relevant to guide attribution).
 
-    Path-matching:
-    - If ``path`` (lex-normalized) is a specific bundled guide file
-      (e.g. ``/.../diff_diff/guides/llms.txt``), flag that file.
-    - If ``path`` is the ``diff_diff/guides`` directory itself (with no
-      narrower glob), flag ALL four bundled files: the agent saw each
-      guide's content during the search.
+    Attribution rules:
+    - ``path`` is a specific bundled guide file: flag that one file.
+    - ``glob`` resolves (under ``path``) to specific bundled guide
+      file(s): flag each matching file by ``fnmatch``. Glob expansion
+      is lex-only (we can't list the agent's filesystem); we match the
+      glob against the known bundled-guide basenames.
+    - Ambiguous searches (``path`` is the guides directory and ``glob``
+      does NOT narrow to specific files): fail closed. We cannot
+      attribute which guide files the agent saw without parsing
+      ``tool_result.content``, which would be fragile across Grep
+      output modes. Refusing to attest is the safe default.
 
     Same id-presence and tool_result-matching contract as the Read scanner."""
     known_filenames = set(_VARIANT_TO_FILENAME.values())
 
     pending: dict[str, frozenset[str]] = {}
+    ambiguous: dict[str, str] = {}  # tool_use_id -> source path-or-glob for error msg
     for entry in entries:
         for block in _iter_tool_use_blocks(entry):
             if block.get("name") != "Grep":
@@ -813,65 +821,162 @@ def _scan_grep_tool_guide_accesses_in_entries(
             if not isinstance(tool_input, dict):
                 continue
             grep_path = tool_input.get("path", "")
-            if not isinstance(grep_path, str) or not grep_path:
+            grep_glob = tool_input.get("glob", "")
+            if not isinstance(grep_path, str):
+                grep_path = ""
+            if not isinstance(grep_glob, str):
+                grep_glob = ""
+            if not grep_path and not grep_glob:
                 continue
-            p = Path(os.path.normpath(grep_path))
-            # Direct guide-file target.
-            if (
-                p.name in known_filenames
-                and p.parent.name == "guides"
-                and p.parent.parent.name == "diff_diff"
-            ):
-                matched_files: frozenset[str] = frozenset({p.name})
-            # Guides directory target: the agent saw every guide.
-            elif p.name == "guides" and p.parent.name == "diff_diff":
-                matched_files = frozenset(known_filenames)
-            else:
+            matched_files, is_ambiguous = _classify_grep_target(
+                grep_path, grep_glob, known_filenames
+            )
+            if not matched_files and not is_ambiguous:
                 continue
             tool_use_id = block.get("id")
             if not isinstance(tool_use_id, str) or not tool_use_id:
                 raise TelemetryMergeError(
-                    f"Grep tool_use targeting guide path {grep_path!r} is "
-                    f"missing or has empty 'id' field; the transcript "
-                    f"cannot match its tool_result, so a silent drop of "
-                    f"layer-1 guide-discovery evidence cannot be ruled out"
+                    f"Grep tool_use targeting guide-related path "
+                    f"{grep_path!r} (glob={grep_glob!r}) is missing or "
+                    f"has empty 'id' field; the transcript cannot match "
+                    f"its tool_result, so a silent drop of layer-1 "
+                    f"guide-discovery evidence cannot be ruled out"
                 )
-            if tool_use_id in pending:
+            if tool_use_id in pending or tool_use_id in ambiguous:
                 raise TelemetryMergeError(
-                    f"Grep tool_use for guide path {grep_path!r} reuses "
-                    f"tool_use_id {tool_use_id!r}; transcript tool-use IDs "
-                    f"must be unique to avoid silent result overwrites"
+                    f"Grep tool_use for guide-related path {grep_path!r} "
+                    f"reuses tool_use_id {tool_use_id!r}; transcript "
+                    f"tool-use IDs must be unique to avoid silent result "
+                    f"overwrites"
                 )
-            pending[tool_use_id] = matched_files
+            if is_ambiguous:
+                ambiguous[tool_use_id] = f"path={grep_path!r} glob={grep_glob!r}"
+            else:
+                pending[tool_use_id] = matched_files
 
-    if not pending:
+    if not pending and not ambiguous:
         return {}
 
+    # Match tool_results to both attributed (pending) and ambiguous
+    # Greps. An ambiguous Grep with a NON-ERROR result raises fail-
+    # closed: we cannot attest a record where the agent searched
+    # guide-related territory and we don't know which files matched.
+    # An ambiguous Grep with is_error=True is benign (the search
+    # failed; no content exposed).
     opened: dict[str, bool] = {}
     matched_ids: set[str] = set()
+    ambiguous_succeeded: list[str] = []
     for entry in entries:
         for result in _iter_tool_result_blocks(entry):
             tool_use_id = result.get("tool_use_id")
             if not isinstance(tool_use_id, str):
                 continue
-            files = pending.get(tool_use_id)
-            if files is None:
-                continue
-            matched_ids.add(tool_use_id)
-            if not result.get("is_error", False):
-                for fname in files:
-                    opened[fname] = True
+            is_err = result.get("is_error", False)
+            if tool_use_id in pending:
+                matched_ids.add(tool_use_id)
+                if not is_err:
+                    for fname in pending[tool_use_id]:
+                        opened[fname] = True
+            elif tool_use_id in ambiguous:
+                matched_ids.add(tool_use_id)
+                if not is_err:
+                    ambiguous_succeeded.append(ambiguous[tool_use_id])
 
-    unmatched_ids = set(pending) - matched_ids
-    if unmatched_ids:
-        unmatched_files = sorted({f for tid in unmatched_ids for f in pending[tid]})
+    if ambiguous_succeeded:
         raise TelemetryMergeError(
-            f"Grep tool_use for bundled guide file(s) {unmatched_files!r} "
+            f"Grep tool_use over guide-related territory cannot be "
+            f"attributed to specific guide files; the search succeeded "
+            f"but we don't know which guides the agent saw. Sources: "
+            f"{ambiguous_succeeded!r}. Either narrow the search with a "
+            f"file-specific glob or wait for PR #5's exec-time wrapper "
+            f"to provide independent attestation."
+        )
+
+    unmatched_ids = (set(pending) | set(ambiguous)) - matched_ids
+    if unmatched_ids:
+        sources = [
+            f"path={p!r}"
+            for tid in unmatched_ids
+            for p in [next(iter(pending.get(tid, frozenset())), ambiguous.get(tid, "?"))]
+        ]
+        raise TelemetryMergeError(
+            f"Grep tool_use for guide-related target(s) {sources!r} "
             f"has no matching tool_result in the transcript (tool_use_ids: "
             f"{sorted(unmatched_ids)!r}). Transcript is incomplete; the "
             f"per-run record cannot be trusted to reflect guide-discovery state."
         )
     return opened
+
+
+def _classify_grep_target(
+    grep_path: str,
+    grep_glob: str,
+    known_filenames: set,
+) -> tuple[frozenset[str], bool]:
+    """Return (attributed_files, is_ambiguous) for a Grep input.
+
+    - attributed_files: the bundled guide filenames the Grep can be
+      proved to have searched. Empty if the Grep is not guide-related.
+    - is_ambiguous: True if the Grep IS guide-related but cannot be
+      attributed to specific guide files. The caller fails closed when
+      this is True (so the merger refuses to attest a clean record for
+      a search whose target file set we can't enumerate).
+    """
+    import fnmatch
+
+    p = Path(os.path.normpath(grep_path)) if grep_path else None
+
+    # Direct guide-file path.
+    if (
+        p is not None
+        and p.name in known_filenames
+        and p.parent.name == "guides"
+        and p.parent.parent.name == "diff_diff"
+    ):
+        return frozenset({p.name}), False
+
+    # path under or at the guides directory.
+    path_at_guides_dir = p is not None and p.name == "guides" and p.parent.name == "diff_diff"
+    path_at_diff_diff = p is not None and p.name == "diff_diff"
+
+    if grep_glob:
+        # glob like `llms.txt`, `llms*.txt`, `guides/llms.txt`,
+        # `*/guides/llms.txt`. Strip a leading `guides/` if the path is
+        # diff_diff itself; resolve to basename-pattern matches against
+        # bundled guides.
+        glob = grep_glob
+        # Common prefix forms an agent might use.
+        for prefix in ("guides/", "diff_diff/guides/", "*/guides/"):
+            if glob.startswith(prefix):
+                glob = glob[len(prefix) :]
+                break
+        # If after stripping the glob still contains a path separator,
+        # it doesn't resolve to a guide-file pattern.
+        if "/" in glob:
+            return frozenset(), False
+        matches: set[str] = set()
+        for fname in known_filenames:
+            if fnmatch.fnmatchcase(fname, glob):
+                matches.add(fname)
+        if matches:
+            return frozenset(matches), False
+        # Glob is guide-shaped but doesn't match any known file
+        # (e.g. ``llms-future.txt``); treat as non-guide.
+        return frozenset(), False
+
+    # No glob; path-only.
+    if path_at_guides_dir:
+        # Ambiguous: agent grep'd the whole guides directory. We
+        # cannot statically know which files matched without parsing
+        # tool_result.content. Fail closed.
+        return frozenset(), True
+    if path_at_diff_diff:
+        # Grep on the package root with no glob. The agent may or may
+        # not have seen guides depending on Grep's recursion. Fail
+        # closed.
+        return frozenset(), True
+
+    return frozenset(), False
 
 
 def _iter_tool_use_blocks(entry):
