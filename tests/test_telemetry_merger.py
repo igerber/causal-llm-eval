@@ -201,6 +201,9 @@ def _exec_python_event(
     }
 
 
+_SENTINEL_PID = _DEFAULT_RUNNER_PID + 1
+
+
 def _sentinel_exec_python_event(
     runner_pid: int = _DEFAULT_RUNNER_PID,
     *,
@@ -213,11 +216,29 @@ def _sentinel_exec_python_event(
     the event log to pass the sentinel-demand rule.
     """
     return _exec_python_event(
-        pid=runner_pid + 1,
-        argv=["-c", "pass"],
+        pid=_SENTINEL_PID,
+        argv=["python", "-c", "pass"],
         ppid=runner_pid,
         executable=executable,
     )
+
+
+def _sentinel_events(
+    runner_pid: int = _DEFAULT_RUNNER_PID,
+    *,
+    executable: str | None = None,
+) -> list[dict]:
+    """Build the full sentinel event triple (exec_python + session_start
+    + session_end) with matching pid.
+
+    PR #5 reciprocal check: every exec_python event (including the
+    sentinel) must have a matching session_start by pid. Tests that
+    construct a sentinel need all three to pass merger validation.
+    """
+    return [
+        _sentinel_exec_python_event(runner_pid=runner_pid, executable=executable),
+        _session_start_event(argv=["python", "-c", "pass"], pid=_SENTINEL_PID),
+    ]
 
 
 def _write_transcript_entries(path: Path, entries: list[dict]) -> None:
@@ -3095,7 +3116,7 @@ def test_merge_layers_three_layer_consistent_attribution(tmp_path):
     _write_events_jsonl(
         events_path,
         [
-            _sentinel_exec_python_event(executable=exe),
+            *_sentinel_events(executable=exe),
             _session_start_event(argv=["python", "script.py"], pid=12345),
             _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
         ],
@@ -3120,7 +3141,7 @@ def test_merge_layers_zero_agent_exec_python_with_sentinel_passes(tmp_path):
     exe = str(venv / "bin" / "python-real")
     _write_events_jsonl(
         events_path,
-        [_sentinel_exec_python_event(executable=exe)],
+        _sentinel_events(executable=exe),
     )
     _write_transcript(transcript, ["ls -la"])  # no python in transcript
     record = merge_layers(
@@ -3191,7 +3212,7 @@ def test_merge_layers_layer1_invocation_with_no_layer15_event_raises(tmp_path):
     _write_events_jsonl(
         events_path,
         [
-            _sentinel_exec_python_event(executable=exe),
+            *_sentinel_events(executable=exe),
             _session_start_event(argv=["python", "script.py"], pid=12345),
             # No agent exec_python event.
         ],
@@ -3218,7 +3239,7 @@ def test_merge_layers_layer1_invocation_with_no_session_start_raises(tmp_path):
     _write_events_jsonl(
         events_path,
         [
-            _sentinel_exec_python_event(executable=exe),
+            *_sentinel_events(executable=exe),
             _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
             # No session_start with matching argv.
         ],
@@ -3250,7 +3271,7 @@ def test_merge_layers_exec_python_argv1plus_must_match(tmp_path):
     _write_events_jsonl(
         events_path,
         [
-            _sentinel_exec_python_event(executable=exe),
+            *_sentinel_events(executable=exe),
             _session_start_event(argv=["python", "script.py"], pid=12345),
             _exec_python_event(
                 pid=12345,
@@ -3285,7 +3306,7 @@ def test_merge_layers_xargs_one_layer1_invocation_matches_multiple_exec_python_e
     _write_events_jsonl(
         events_path,
         [
-            _sentinel_exec_python_event(executable=exe),
+            *_sentinel_events(executable=exe),
             _session_start_event(argv=["python", "worker.py"], pid=12345),
             _session_start_event(argv=["python", "worker.py"], pid=12346),
             _session_start_event(argv=["python", "worker.py"], pid=12347),
@@ -3379,3 +3400,119 @@ def test_merge_layers_legacy_mode_skips_three_layer_check(tmp_path):
     # the existing layer-1↔layer-2 attribution which succeeds here.
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
+
+
+# ---------------------------------------------------------------------------
+# PR #5 R0 regressions: reciprocal exec_python ↔ session_start, python-real
+# bypass, -S flag in delegated exec.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_sentinel_exec_python_without_matching_session_start_raises(tmp_path):
+    """R0 P0 #2: every exec_python (including the sentinel) MUST have a
+    matching session_start by pid. If sitecustomize fails to load for the
+    sentinel invocation, no session_start is emitted -> fail closed.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            # Sentinel exec_python without matching session_start.
+            _sentinel_exec_python_event(executable=exe),
+        ],
+    )
+    _write_transcript(transcript, [])
+    with pytest.raises(RunValidityError, match="sentinel exec_python pid"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_agent_exec_python_without_matching_session_start_raises(tmp_path):
+    """R0 P0 #2: an agent exec_python without a matching session_start
+    by pid is a sitecustomize-failure signal (e.g., -S flag bypass). Fail
+    closed even when layer-1 didn't extract the invocation.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            # Agent exec_python WITHOUT matching session_start.
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, [])  # AST sees nothing.
+    with pytest.raises(RunValidityError, match="agent exec_python pid"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_agent_exec_python_with_dash_S_flag_raises(tmp_path):
+    """R0 P0 #2: an exec_python event whose argv contains -S (or compact
+    -Sc / -IS) fails closed even when sitecustomize somehow emitted a
+    matching session_start. -S skips site.py import; treating any -S
+    invocation as bypass closes the find-exec / xargs delegated-form
+    bypass class.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=["python", "-S", "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345,
+                argv=["python", "-S", "script.py"],
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, [])  # AST doesn't see the invocation (delegated form).
+    with pytest.raises(RunValidityError, match="layer-1.5 bypass detected"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )
+
+
+def test_merge_layers_python_real_direct_invocation_flagged_as_bypass(tmp_path):
+    """R0 P0 #1: a transcript-visible direct invocation of python-real
+    (which bypasses the layer-1.5 wrapper) is flagged by the shell_parser
+    bypass detector. The merger fails closed before reaching three-layer
+    checks.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / "bin" / "python-real")
+    # Provide events that would otherwise validate; the bypass check
+    # should fire FIRST.
+    _write_events_jsonl(events_path, _sentinel_events(executable=exe))
+    _write_transcript(transcript, [f"{venv}/bin/python-real script.py"])
+    with pytest.raises(TelemetryMergeError, match="bypass"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            venv_path=venv,
+        )

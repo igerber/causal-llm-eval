@@ -28,26 +28,37 @@ real="$(dirname "$0")/python-real"
 
 log="${_PYRUNTIME_EVENT_LOG:-}"
 if [ -n "$log" ]; then
-    # JSON-encode argv via a single awk invocation. awk's gsub handles all
-    # required JSON control-char escapes (\b \f \n \r \t \" \\) uniformly.
-    # POSIX.1 awk is portable across mawk / gawk / nawk / busybox awk for
-    # printf %s, gsub, and ASCII control codes.
-    #
-    # NUL bytes cannot legally appear in POSIX argv (execve contract), so the
-    # wrapper trusts the kernel-provided argv and does not attempt awk-level
-    # NUL detection. (Earlier `/\000/` checks were unreliable across awk
-    # variants — macOS BSD awk treats `\000` as zero-width / always-match.)
-    # Upstream argv sanitization at the merger remains the primary defense
-    # for any pathological inputs.
-    args_json=$(printf '%s\n' "$@" | awk '
+    # Fail closed on newline/CR in any argv element BEFORE encoding. The
+    # line-oriented awk encoder cannot preserve embedded newlines (one
+    # element with a newline would split into two records, so the JSON
+    # array no longer matches the real argv). POSIX argv may legally
+    # contain newlines but realistic agent invocations never do; the
+    # wrapper fails closed rather than emit corrupted attestation.
+    nl=$(printf '\n')
+    cr=$(printf '\r')
+    for a in "$@"; do
+        case "$a" in
+            *"$nl"* | *"$cr"*)
+                printf '[pyruntime-wrapper] argv contains newline/CR; cannot attest\n' >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    # JSON-encode argv via a single awk invocation. The recorded argv is
+    # ``[basename($0), $@]`` so the merger can match on ``argv[1:]``
+    # against the layer-1 AST extraction (which produces
+    # ``[interpreter, *args]``) and against layer-2's ``sys.orig_argv[1:]``
+    # (which the real python records post-exec). All three layers'
+    # ``argv[1:]`` = the script + flags.
+    arg0_basename=$(basename "$0")
+    args_json=$(printf '%s\n' "$arg0_basename" "$@" | awk '
         BEGIN { first = 1; printf "[" }
         {
             gsub(/\\/, "\\\\")
             gsub(/"/, "\\\"")
             gsub(/\010/, "\\b")
             gsub(/\014/, "\\f")
-            gsub(/\n/, "\\n")
-            gsub(/\r/, "\\r")
             gsub(/\t/, "\\t")
             if (first) { first = 0 } else { printf "," }
             printf "\"%s\"", $0

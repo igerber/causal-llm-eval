@@ -76,6 +76,14 @@ _INLINE_PARSER_NAMES = frozenset({"eval"})
 _DASH_C_PARSER_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 
 _PYTHON_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+# PR #5: any ``*-real`` basename matching a python interpreter alias
+# (``python-real``, ``python3-real``, ``python3.11-real``) is treated as a
+# python invocation AND a bypass primitive. The layer-1.5 wrapper renames
+# the venv's real interpreter to ``python-real``; any direct invocation
+# of that name (e.g., ``${venv}/bin/python-real script.py``) skips the
+# wrapper, so the merger has no layer-1.5 attestation for the run. Adding
+# it to bypass detection makes the merger fail closed.
+_PYTHON_REAL_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?-real$")
 
 
 def _preprocess(command: str) -> str:
@@ -116,6 +124,21 @@ def _is_python_basename(name: str) -> bool:
     """Match ``python``, ``python3``, ``python3.x``; reject ``pythonw``,
     ``python2``, ``python-config``."""
     return bool(_PYTHON_BASENAME_RE.match(name))
+
+
+def _is_python_real_basename(name: str) -> bool:
+    """Match ``python-real``, ``python3-real``, ``python3.x-real``.
+
+    PR #5: the layer-1.5 wrapper renames the venv's real interpreter to
+    ``python-real`` so the wrapper at ``${venv}/bin/python`` can find it
+    via ``$(dirname "$0")/python-real``. Direct invocation of the real
+    interpreter (e.g., ``${venv}/bin/python-real script.py``) skips the
+    wrapper entirely - no exec_python event fires - which would let an
+    agent bypass layer-1.5 attestation. The parser treats this as both
+    a python invocation (so the AST walker yields it) AND a bypass
+    primitive (so ``find_python_bypass_invocations`` flags the run).
+    """
+    return bool(_PYTHON_REAL_BASENAME_RE.match(name))
 
 
 def _is_literal_word(node) -> bool:
@@ -390,7 +413,7 @@ def _extract_python_argv(command_node) -> Optional[list[str]]:
         w = words[i]
         _assert_literal(w, "command-word" if not after_wrapper else "argv")
         basename = os.path.basename(w.word)
-        if _is_python_basename(basename):
+        if _is_python_basename(basename) or _is_python_real_basename(basename):
             args: list[str] = []
             for p in words[i + 1 :]:
                 _assert_literal(p, "argv")
@@ -514,6 +537,15 @@ def find_python_bypass_invocations(command: str) -> list[str]:
         argv = _extract_python_argv(cn)
         if argv is None:
             continue
+        # PR #5: any direct invocation of ``python-real`` /
+        # ``python3-real`` / ``python3.X-real`` is a bypass primitive
+        # (skips the layer-1.5 wrapper and the wrapper's exec_python
+        # event emission). The argv[0] is the path the agent invoked;
+        # the basename check catches both ``python-real`` and
+        # ``${venv}/bin/python-real``.
+        if _is_python_real_basename(os.path.basename(argv[0])):
+            out.append(command)
+            break
         if argv_contains_bypass_flag(argv[1:]):
             out.append(command)
             break
@@ -619,7 +651,8 @@ def _env_wrapper_bypasses_python(command_node) -> bool:
             if k == "PATH" or k.startswith("PYTHON"):
                 has_primitive = True
             continue
-        if _is_python_basename(os.path.basename(tok)):
+        bn = os.path.basename(tok)
+        if _is_python_basename(bn) or _is_python_real_basename(bn):
             has_python = True
             break
     return has_primitive and has_python

@@ -139,7 +139,7 @@ def test_build_arm_template_wrapper_emits_exec_python_event(shared_venv, tmp_pat
         [str(shared_venv / "bin" / "python"), "-c", "pass"],
         check=True,
         env={
-            "PATH": str(shared_venv / "bin"),
+            "PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin",
             "_PYRUNTIME_EVENT_LOG": str(log_path),
         },
         capture_output=True,
@@ -148,7 +148,11 @@ def test_build_arm_template_wrapper_emits_exec_python_event(shared_venv, tmp_pat
     exec_events = [e for e in events if e.get("event") == "exec_python"]
     assert len(exec_events) == 1, events
     evt = exec_events[0]
-    assert evt["argv"] == ["-c", "pass"]
+    # Wrapper records ``argv = [basename($0), $@]``. When invoked as
+    # ``${venv}/bin/python -c "pass"``, basename($0) is "python" and $@ is
+    # ["-c", "pass"], so argv = ["python", "-c", "pass"]. The argv[1:]
+    # tokens are the load-bearing match key the merger uses.
+    assert evt["argv"] == ["python", "-c", "pass"]
     assert evt["executable"] == str(shared_venv / "bin" / "python-real")
     assert isinstance(evt["pid"], int)
     assert isinstance(evt["ppid"], int)
@@ -158,7 +162,7 @@ def test_build_arm_template_wrapper_skips_when_env_unset(shared_venv, tmp_path):
     """When ``_PYRUNTIME_EVENT_LOG`` is unset, the wrapper skips its event
     write but still execs the real interpreter. (Note: sitecustomize ALSO
     fires on the exec'd interpreter, and it WILL hard-exit if the env var
-    is unset — so this test asserts the wrapper-level skip, expecting the
+    is unset, so this test asserts the wrapper-level skip, expecting the
     overall invocation to fail with exit code 2 from sitecustomize.)
     """
     log_path = tmp_path / "events.jsonl"
@@ -166,7 +170,7 @@ def test_build_arm_template_wrapper_skips_when_env_unset(shared_venv, tmp_path):
     # hard-exits with code 2.
     result = subprocess.run(
         [str(shared_venv / "bin" / "python"), "-c", "pass"],
-        env={"PATH": str(shared_venv / "bin")},
+        env={"PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin"},
         capture_output=True,
     )
     # Wrapper skipped its write; log was never created.
@@ -190,7 +194,7 @@ def test_build_arm_template_wrapper_hard_exits_on_unwritable_log(shared_venv, tm
         result = subprocess.run(
             [str(shared_venv / "bin" / "python"), "-c", "pass"],
             env={
-                "PATH": str(shared_venv / "bin"),
+                "PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin",
                 "_PYRUNTIME_EVENT_LOG": str(log_path),
             },
             capture_output=True,
@@ -209,7 +213,7 @@ def test_wrapper_argv_with_special_chars(shared_venv, tmp_path):
         [str(shared_venv / "bin" / "python"), "-c", "import sys; sys.exit(0)", weird],
         check=True,
         env={
-            "PATH": str(shared_venv / "bin"),
+            "PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin",
             "_PYRUNTIME_EVENT_LOG": str(log_path),
         },
         capture_output=True,
@@ -217,51 +221,28 @@ def test_wrapper_argv_with_special_chars(shared_venv, tmp_path):
     events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
     exec_events = [e for e in events if e.get("event") == "exec_python"]
     assert len(exec_events) == 1
-    assert exec_events[0]["argv"] == ["-c", "import sys; sys.exit(0)", weird]
+    # argv[0] is basename($0) == "python"; remaining elements are $@.
+    assert exec_events[0]["argv"] == ["python", "-c", "import sys; sys.exit(0)", weird]
 
 
-def test_wrapper_argv_with_newlines_and_CR(shared_venv, tmp_path):
-    """Newlines and carriage returns in argv are JSON-escaped to ``\\n`` /
-    ``\\r`` and the emitted event stays a single JSONL line.
+def test_wrapper_argv_with_newlines_fails_closed(shared_venv, tmp_path):
+    """PR #5 R0 P2 #7: the line-oriented awk encoder cannot preserve
+    embedded newlines in argv, so the wrapper fails closed (exit 2)
+    rather than emit corrupted attestation. POSIX argv may legally
+    contain newlines but realistic agent invocations never do.
     """
     log_path = tmp_path / "events.jsonl"
-    multiline = "line1\nline2\r\nline3"
-    subprocess.run(
+    multiline = "line1\nline2"
+    result = subprocess.run(
         [str(shared_venv / "bin" / "python"), "-c", "pass", multiline],
-        check=True,
         env={
-            "PATH": str(shared_venv / "bin"),
+            "PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin",
             "_PYRUNTIME_EVENT_LOG": str(log_path),
         },
         capture_output=True,
     )
-    raw_lines = log_path.read_text().splitlines()
-    assert len(raw_lines) == 1, raw_lines
-    evt = json.loads(raw_lines[0])
-    assert evt["argv"] == ["-c", "pass", multiline]
-
-
-def test_wrapper_event_is_one_line(shared_venv, tmp_path):
-    """Every wrapper invocation produces exactly one JSONL line, even
-    when argv looks multi-line.
-    """
-    log_path = tmp_path / "events.jsonl"
-    subprocess.run(
-        [
-            str(shared_venv / "bin" / "python"),
-            "-c",
-            "pass",
-            "with\nembedded\nnewlines",
-        ],
-        check=True,
-        env={
-            "PATH": str(shared_venv / "bin"),
-            "_PYRUNTIME_EVENT_LOG": str(log_path),
-        },
-        capture_output=True,
-    )
-    raw_lines = log_path.read_text().splitlines()
-    assert len(raw_lines) == 1
+    assert result.returncode == 2
+    assert b"argv contains newline" in result.stderr
 
 
 # ---------------------------------------------------------------------------

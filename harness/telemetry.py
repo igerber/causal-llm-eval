@@ -32,6 +32,7 @@ from harness.shell_parser import (
     RunValidityError,
     ShellCommandIndeterminate,
     ShellCommandParseError,
+    argv_contains_bypass_flag,
     find_python_bypass_invocations,
     parse_python_invocations,
 )
@@ -1291,6 +1292,47 @@ def _validate_three_layer_consistency(
             f"invalid."
         )
 
+    sessions: list[dict] = [e for e in events if e.get("event") == "session_start"]
+    sessions_by_pid: dict[int, list[dict]] = {}
+    for s in sessions:
+        pid = s.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            sessions_by_pid.setdefault(pid, []).append(s)
+
+    # Reciprocal check (R0 P0 #2): every exec_python event - sentinel and
+    # agent alike - MUST have a matching session_start by pid. The wrapper
+    # exec's into the real python, which loads sitecustomize and emits
+    # session_start with the SAME pid. A missing session_start means
+    # sitecustomize failed to load (e.g., the agent invoked the real
+    # python with ``-S`` which skips ``site.py`` import).
+    for evt in sentinels + agent_exec_events:
+        pid = evt.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if pid not in sessions_by_pid:
+            label = "sentinel" if evt in sentinels else "agent"
+            raise RunValidityError(
+                f"layer-2 attestation missing for {label} exec_python "
+                f"pid={pid}: no session_start event with matching pid. "
+                f"The wrapper recorded a python invocation but sitecustomize "
+                f"did not load (likely a ``-S`` flag or otherwise neutered "
+                f"site.py import). Cold-start eval is invalid."
+            )
+
+    # Reciprocal check: any exec_python.argv containing ``-S`` (or compact
+    # ``-Sc`` / ``-IS``) fails closed regardless of whether layer-1 saw the
+    # invocation. Catches ``find -exec python -S script.py \\;`` and other
+    # delegated forms the AST parser cannot model.
+    for evt in agent_exec_events:
+        argv = evt.get("argv")
+        if isinstance(argv, list) and argv_contains_bypass_flag(argv[1:]):
+            raise RunValidityError(
+                f"layer-1.5 bypass detected: agent exec_python argv={argv!r} "
+                f"contains ``-S`` (sitecustomize-disabling flag). The wrapper "
+                f"recorded the invocation but sitecustomize would not have "
+                f"loaded. Cold-start eval is invalid."
+            )
+
     visible_invocations: list[tuple[str, list[str]]] = []
     for entry in transcript_entries:
         for block in _iter_tool_use_blocks(entry):
@@ -1311,8 +1353,6 @@ def _validate_three_layer_consistency(
             for argv in argvs:
                 if argv:
                     visible_invocations.append((command, argv))
-
-    sessions: list[dict] = [e for e in events if e.get("event") == "session_start"]
 
     for command, visible_argv in visible_invocations:
         # argv[1:] match against agent exec_python events.

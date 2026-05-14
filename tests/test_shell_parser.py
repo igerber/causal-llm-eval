@@ -368,3 +368,38 @@ def test_run_validity_error_catches_both_subclasses():
         parse_python_invocations("${PY} script.py")
     with pytest.raises(RunValidityError):
         parse_python_invocations("case x in y) python;; esac")
+
+
+# ---------------------------------------------------------------------------
+# PR #5 R0: python-real / *-real basename detection.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_python_invocations_python_real_treated_as_python():
+    """python-real is the per-arm venv's real interpreter (the wrapper
+    renames the original to python-real). Direct invocation must be
+    parsed as a python invocation so the merger has a hook to fail
+    closed.
+    """
+    argvs = parse_python_invocations("/tmp/venv/bin/python-real script.py")
+    assert argvs == [["/tmp/venv/bin/python-real", "script.py"]]
+
+
+def test_parse_python_invocations_python3X_real_treated_as_python():
+    """python3.11-real (and any python3.X-real) follow the same rule."""
+    argvs = parse_python_invocations("/tmp/venv/bin/python3.11-real script.py")
+    assert argvs == [["/tmp/venv/bin/python3.11-real", "script.py"]]
+
+
+def test_find_python_bypass_python_real_direct_flagged():
+    """Direct invocation of python-real is a bypass primitive: it skips
+    the layer-1.5 wrapper and the wrapper's exec_python event emission.
+    """
+    bypasses = find_python_bypass_invocations("/tmp/venv/bin/python-real script.py")
+    assert bypasses == ["/tmp/venv/bin/python-real script.py"]
+
+
+def test_find_python_bypass_python3X_real_direct_flagged():
+    """python3-real and python3.X-real variants are also bypass primitives."""
+    bypasses = find_python_bypass_invocations("/tmp/venv/bin/python3.11-real -c 'pass'")
+    assert bypasses == ["/tmp/venv/bin/python3.11-real -c 'pass'"]

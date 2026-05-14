@@ -90,8 +90,22 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
     template_dir = Path(template_dir)
     template_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    venv.create(str(template_dir), with_pip=True, clear=False, symlinks=True)
+    # symlinks=False: copy the interpreter rather than symlinking. Closes the
+    # operator-home exposure vector where a symlinked ``python-real`` would
+    # resolve to ``/opt/homebrew/Cellar/...`` / ``~/.pyenv/...`` / etc.,
+    # leaking the operator's interpreter location to the agent.
+    venv.create(str(template_dir), with_pip=True, clear=False, symlinks=False)
 
+    # Scrubbed env for pip install: strip operator-set PIP_* / PYTHON*
+    # / HOME so the install is reproducible regardless of operator
+    # configuration. PIP_CONFIG_FILE=os.devnull disables operator pip
+    # config; PIP_DISABLE_PIP_VERSION_CHECK silences the version notice.
+    pip_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "HOME": str(template_dir),
+    }
     pip_package = _ARM_TO_PIP_PACKAGE[arm]
     subprocess.run(
         [
@@ -104,6 +118,7 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
         ],
         check=True,
         capture_output=True,
+        env=pip_env,
     )
 
     _install_shim_into_venv(template_dir)
