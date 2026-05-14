@@ -241,50 +241,90 @@ def _maybe_recurse_eval(command_node, depth: int) -> Iterator:
     word_parts = [p for p in command_node.parts if getattr(p, "kind", None) == "word"]
     if not word_parts:
         return
-    cmd_word = word_parts[0]
-    if not _is_literal_word(cmd_word):
-        # Indeterminate command word; handled by _extract_command_word.
-        return
-    basename = os.path.basename(cmd_word.word)
+    # Scan ALL word positions (not just the command-word) looking for
+    # shell-payload wrappers. R28 P0: forms like `timeout 30 bash -c
+    # "python ..."`, `sudo bash -c "..."`, `nice sh -c "..."`, and
+    # `env -S "..."` hide a shell payload behind a recognized wrapper;
+    # the previous "only if first word is bash/sh/eval" check missed
+    # them.
+    i = 0
+    while i < len(word_parts):
+        w = word_parts[i]
+        if not _is_literal_word(w):
+            i += 1
+            continue
+        basename = os.path.basename(w.word)
 
-    if basename in _INLINE_PARSER_NAMES:
-        if len(word_parts) >= 2:
-            payload = word_parts[1]
-            if not _is_literal_word(payload):
-                raise ShellCommandIndeterminate(
-                    f"eval payload is non-literal: {payload.word!r}. " f"Run cannot be validated."
-                )
-            if depth >= _MAX_EVAL_RECURSION:
-                raise ShellCommandParseError(
-                    f"eval recursion depth exceeded {_MAX_EVAL_RECURSION}: "
-                    f"nested wrapper chain too deep"
-                )
-            inner = _parse(payload.word)
-            yield from _walk_commands(inner, depth + 1)
-    elif basename in _DASH_C_PARSER_NAMES:
-        for i, w in enumerate(word_parts[1:], start=1):
-            if not _is_literal_word(w):
-                continue
-            # Match -c, -lc, -ic, -Cc, etc. - any short-flag bundle
-            # containing 'c'. Excludes long flags (--config) and the
-            # bareword 'c'.
-            if w.word.startswith("-") and not w.word.startswith("--") and "c" in w.word[1:]:
-                if i + 1 < len(word_parts):
-                    payload = word_parts[i + 1]
-                    if not _is_literal_word(payload):
-                        raise ShellCommandIndeterminate(
-                            f"{basename} -c payload is non-literal: "
-                            f"{payload.word!r}. Run cannot be validated."
-                        )
-                    if depth >= _MAX_EVAL_RECURSION:
-                        raise ShellCommandParseError(
-                            f"sh -c recursion depth exceeded "
-                            f"{_MAX_EVAL_RECURSION}: nested wrapper "
-                            f"chain too deep"
-                        )
-                    inner = _parse(payload.word)
-                    yield from _walk_commands(inner, depth + 1)
-                break
+        if basename in _INLINE_PARSER_NAMES:
+            if i + 1 < len(word_parts):
+                payload = word_parts[i + 1]
+                yield from _recurse_payload(payload, depth, "eval")
+            i += 2
+            continue
+        if basename in _DASH_C_PARSER_NAMES:
+            # Look for -c (or compact -lc/-ic) flag anywhere after this
+            # shell-wrapper word. The lazy `-o pipefail -c "..."`
+            # shape is supported because the inner scan skips non-c
+            # short-flag bundles.
+            consumed = 1
+            for j in range(i + 1, len(word_parts)):
+                w2 = word_parts[j]
+                if not _is_literal_word(w2):
+                    continue
+                if w2.word.startswith("-") and not w2.word.startswith("--") and "c" in w2.word[1:]:
+                    if j + 1 < len(word_parts):
+                        payload = word_parts[j + 1]
+                        yield from _recurse_payload(payload, depth, f"{basename} -c")
+                    consumed = j - i + 2
+                    break
+            i += consumed
+            continue
+        if basename == "env":
+            # `env -S PAYLOAD` and `env --split-string=PAYLOAD` carry an
+            # inline shell command string. `env --split-string PAYLOAD`
+            # (separate arg) also valid. Recurse the same way as `sh -c`.
+            consumed = 1
+            for j in range(i + 1, len(word_parts)):
+                w2 = word_parts[j]
+                if not _is_literal_word(w2):
+                    continue
+                if w2.word in ("-S", "--split-string"):
+                    if j + 1 < len(word_parts):
+                        payload = word_parts[j + 1]
+                        yield from _recurse_payload(payload, depth, "env -S")
+                    consumed = j - i + 2
+                    break
+                if w2.word.startswith("--split-string="):
+                    payload_text = w2.word[len("--split-string=") :]
+                    yield from _recurse_payload_str(payload_text, depth, "env --split-string=")
+                    consumed = j - i + 1
+                    break
+            i += consumed
+            continue
+        i += 1
+
+
+def _recurse_payload(payload_node, depth: int, label: str) -> Iterator:
+    """Recursively bashlex-parse a literal WordNode payload and yield
+    its CommandNodes. Raises if the payload is non-literal or recursion
+    depth would exceed the bound."""
+    if not _is_literal_word(payload_node):
+        raise ShellCommandIndeterminate(
+            f"{label} payload is non-literal: " f"{payload_node.word!r}. Run cannot be validated."
+        )
+    yield from _recurse_payload_str(payload_node.word, depth, label)
+
+
+def _recurse_payload_str(payload_text: str, depth: int, label: str) -> Iterator:
+    """Recursively bashlex-parse a literal payload string and yield its
+    CommandNodes."""
+    if depth >= _MAX_EVAL_RECURSION:
+        raise ShellCommandParseError(
+            f"{label} recursion depth exceeded {_MAX_EVAL_RECURSION}: "
+            f"nested wrapper chain too deep"
+        )
+    inner = _parse(payload_text)
+    yield from _walk_commands(inner, depth + 1)
 
 
 def _extract_python_argv(command_node) -> Optional[list[str]]:

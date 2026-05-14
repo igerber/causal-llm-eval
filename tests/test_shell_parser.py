@@ -100,6 +100,35 @@ from harness.shell_parser import (
             "cat <(python -S c.py)",
             [["python", "-S", "c.py"]],
         ),
+        # R28: wrapper-prefixed shell-payload forms
+        (
+            'timeout 30 bash -c "python -S read_guide.py"',
+            [["python", "-S", "read_guide.py"]],
+        ),
+        (
+            'sudo bash -c "python script.py"',
+            [["python", "script.py"]],
+        ),
+        (
+            "nice sh -c 'python -S script.py'",
+            [["python", "-S", "script.py"]],
+        ),
+        (
+            'env -S "python -S script.py"',
+            [["python", "-S", "script.py"]],
+        ),
+        (
+            'env --split-string="python script.py"',
+            [["python", "script.py"]],
+        ),
+        (
+            'env --split-string "python script.py"',
+            [["python", "script.py"]],
+        ),
+        (
+            'command bash -c "python script.py"',
+            [["python", "script.py"]],
+        ),
         # Multiple invocations
         (
             "python a.py && python b.py",
@@ -223,6 +252,12 @@ def test_parse_python_invocations_parse_error(command):
         "env PATH=/usr/bin python script.py",
         "env PYTHONPATH=/tmp python script.py",
         "env PYTHONHOME=/x python script.py",
+        # R28: wrapper-prefixed shell-payload forms with bypass
+        # primitives inside the payload
+        'timeout 30 bash -c "python -S read_guide.py"',
+        'sudo bash -c "PATH=/usr/bin python script.py"',
+        "nice sh -c 'python -S script.py'",
+        'env -S "python -S script.py"',
     ],
 )
 def test_find_python_bypass_invocations_positive(command):
