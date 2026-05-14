@@ -183,8 +183,24 @@ _SHELL_ACTIVATION_RE = re.compile(
 # The launched Python may not have sitecustomize installed (uv/poetry use
 # their own venv; conda run / pyenv exec use the named env).
 _PYTHON_WRAPPER_RE = re.compile(r"(?:^|[\s;&|])(?:uv\s+run|poetry\s+run|conda\s+run|pyenv\s+exec)")
-_ENV_BEFORE_PYTHON_RE = re.compile(r"(?:^|[\s;&|])env\s+(?:-\S+\s+)*python")
+# env wrapper: bare ``env``, ``/usr/bin/env``, ``/bin/env``, ``/usr/local/bin/env``,
+# all followed by optional flags (e.g. ``env -S python``, ``env -u VAR python``)
+# and then the python token. The path-prefix variants resolve to the same
+# binary as bare ``env`` and bypass PATH-based interpreter resolution the
+# same way.
+_ENV_BEFORE_PYTHON_RE = re.compile(
+    r"(?:^|[\s;&|()])(?:/(?:usr/(?:local/)?)?bin/)?env" r"(?:\s+-\S+(?:\s+\S+)?)*\s+python"
+)
 _DOT_PYTHON_RE = re.compile(r"(?:^|[\s;&|])\./python")
+# Command-substitution that resolves to a python interpreter path:
+# ``$(which python)``, ``$(command -v python)``, ``$(type -p python)``, and
+# backtick equivalents. The substitution resolves at shell-eval time to a
+# path we cannot predict, so any python invocation through this form is
+# fail-closed (no session_start argv can be matched against an opaque
+# substitution).
+_PYTHON_COMMAND_SUBSTITUTION_RE = re.compile(
+    r"(?:\$\(|`)\s*(?:which|command\s+-v|type\s+-p)\s+python(?:3(?:\.\d+)?)?\s*(?:\)|`)"
+)
 # Shell wrappers that take a quoted code payload (``bash -c``, ``sh -c``,
 # ``zsh -c``, ``bash -lc``, etc. plus ``eval`` and ``exec``). When such a
 # wrapper appears AND the command also contains a ``python``-shaped token
@@ -1329,6 +1345,7 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
                 or has_wrapper
                 or _ENV_BEFORE_PYTHON_RE.search(command)
                 or _DOT_PYTHON_RE.search(command)
+                or _PYTHON_COMMAND_SUBSTITUTION_RE.search(command)
             ):
                 bypass_commands.append(command)
                 continue

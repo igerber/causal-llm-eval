@@ -1809,6 +1809,41 @@ def test_merge_layers_diff_diff_raises_on_malformed_value(bad_event, match, tmp_
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+# ---------------------------------------------------------------------------
+# R20 regressions: absolute env + command-substitution python launches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Absolute env path (R20 finding 1, examples 1-2)
+        "/usr/bin/env python -S script.py",
+        "/bin/env python -S script.py",
+        "/usr/local/bin/env python script.py",
+        # env -S form (R20 finding 1, example 3)
+        "/usr/bin/env -S python -S script.py",
+        # Command substitution forms (R20 finding 1, examples 4-5)
+        "$(which python) -S script.py",
+        "`which python` -S script.py",
+        "$(command -v python) script.py",
+        "`type -p python3` script.py",
+    ],
+)
+def test_merge_layers_diff_diff_env_wrapper_and_command_substitution(command, tmp_path):
+    """R20 P0: absolute env wrappers (/usr/bin/env, /bin/env,
+    /usr/local/bin/env), env -S forms, and command-substitution python
+    launches (``$(which python)``, ``\\`which python\\```, ``$(command -v
+    python)``) all fail closed. Pre-R20 the env_before_python regex only
+    matched bare ``env``, and command-substitution argv0 forms were
+    invisible to the extractor."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, [command])
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_unknown_event_type_ignored(tmp_path):
     """R18 P0 #2 negative: unknown event TYPES are ignored (forward
     compatibility - a future shim version may emit new event types and we
