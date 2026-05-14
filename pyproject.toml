@@ -35,6 +35,10 @@ dependencies = [
     "pyarrow>=15.0.0",
     "duckdb>=0.10.0",
     "pyyaml>=6.0",
+    # bashlex parses Bash commands into an AST for layer-1 attestation.
+    # Pinned exactly because upstream is dormant (0.18 released 2023-01-18)
+    # and we don't want silent AST-shape drift breaking layer-1 parsing.
+    "bashlex==0.18",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +48,15 @@ dev = [
     "black>=24.0",
     "ruff>=0.5",
     "mypy>=1.8",
+    # diff-diff is the agent-under-test library for arm 1. Required at test
+    # time so the bidirectional regression tests (`test_sitecustomize.py` and
+    # `test_telemetry_merger.py`) can verify `_ESTIMATOR_CLASS_NAMES`,
+    # `_DIAGNOSTIC_FUNCTION_NAMES`, and `_VARIANT_TO_FILENAME` against the
+    # actual diff_diff exports. Pinned exactly so a future diff-diff release
+    # changing exports cannot make CI drift relative to what this PR
+    # validated against. PR #5 (per-arm venv pool) will manage the eval-time
+    # pin separately.
+    "diff-diff==3.3.2",
 ]
 
 [tool.setuptools.packages.find]

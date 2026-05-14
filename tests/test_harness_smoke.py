@@ -8,19 +8,48 @@ module surface stays stable.
 from __future__ import annotations
 
 
-def test_harness_imports():
-    """Harness package imports without error and exposes expected modules."""
-    import harness  # noqa: F401
-    from harness import (  # noqa: F401
-        extractor,
-        runner,
-        scheduler,
-        sitecustomize_template,
-        telemetry,
-        venv_pool,
-    )
+def test_harness_imports(tmp_path, monkeypatch):
+    """Harness package imports without error and exposes expected modules.
 
-    assert harness.__version__
+    `harness.sitecustomize_template` writes a `session_start` event at module
+    load and installs hooks on `builtins.open`, `io.open`, `warnings.warn`,
+    and `sys.meta_path`. We restore those globals after the test to avoid
+    leaking patched state into the rest of the suite.
+    """
+    import builtins
+    import io
+    import sys as _sys
+    import warnings
+
+    event_log = tmp_path / "events.jsonl"
+    event_log.touch()
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(event_log))
+
+    # Snapshot global state we expect the shim to mutate.
+    _orig_showwarning = warnings.showwarning
+    _orig_warn = warnings.warn
+    _orig_builtins_open = builtins.open
+    _orig_io_open = io.open
+    _orig_meta_path = list(_sys.meta_path)
+    try:
+        import harness  # noqa: F401
+        from harness import (  # noqa: F401
+            extractor,
+            runner,
+            scheduler,
+            sitecustomize_template,
+            telemetry,
+            venv_pool,
+        )
+
+        assert harness.__version__
+    finally:
+        warnings.showwarning = _orig_showwarning
+        warnings.warn = _orig_warn
+        builtins.open = _orig_builtins_open
+        io.open = _orig_io_open
+        _sys.meta_path[:] = _orig_meta_path
+        _sys.modules.pop("harness.sitecustomize_template", None)
 
 
 def test_graders_imports():

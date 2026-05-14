@@ -7,6 +7,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `harness/shell_parser.py`: bashlex-AST-based Bash command parser for
+  layer-1 attestation. Public surface: `parse_python_invocations`,
+  `find_python_bypass_invocations`, `argv_contains_bypass_flag`.
+  Replaces ~600 lines of regex-based extractors and wrapper-unwrappers
+  that grew shape-by-shape across PR #4's 26 review rounds. The AST
+  walker visits every CommandNode reachable from the parsed tree
+  (including bodies of if/while/for, contents of `eval` /
+  `bash -c "..."` payloads via recursive re-parse, and command
+  substitutions in `$(...)` / backticks) so wrapper-attribution forms
+  surface from language structure rather than from a hand-curated
+  list of regex patterns.
+- `RunValidityError` exception (neutral parent class).
+  `TelemetryMergeError` is now a subclass. New parser-side subclasses
+  `ShellCommandIndeterminate` (variable expansion / command-
+  substitution / parameter expansion in a Python command-word or
+  argv-word) and `ShellCommandParseError` (bashlex cannot model the
+  command; e.g. `case` patterns) both inherit from `RunValidityError`,
+  so callers catching the parent unify fail-closed handling across
+  layer-1 and layer-2/3 failures.
+- `bashlex==0.18` as a new runtime dependency (pinned exactly; upstream
+  is dormant and AST-shape drift would silently break parsing).
+
+### Changed
+- Layer-1 Python-invocation extraction in `harness/telemetry.py` now
+  delegates to `harness.shell_parser`. The previous regex extractors
+  (`_extract_python_invocations_from_command`,
+  `_unwrap_command_for_inspection`, `_strip_heredoc_bodies`,
+  `_strip_command_modifier_prefix`, `_strip_shell_control_prefix`,
+  `_is_in_command_position`, `_find_unquoted_separator`, plus ~20
+  regex constants) are removed. The wrapper-attribution enumeration
+  class (R20 command substitution, R23 P0#2 relative-slash paths, R25
+  modifiers-after-separators, R26 quoted command words /
+  path-qualified wrappers / sudo) closes as a category - no longer a
+  list of patterns to maintain.
+- Indeterminate command-words (variable expansion, command
+  substitution, parameter expansion) and bashlex parse failures
+  now raise `RunValidityError` subclasses. The merger fails closed
+  rather than silently treating these as no-Python.
+
+### Removed
+- ~600 lines of regex-based shell-parsing helpers and their
+  constants from `harness/telemetry.py`. Functionality is preserved
+  in `harness/shell_parser.py` via AST walking. No external
+  consumers existed (verified by audit).
+
+
 - Cold-start agent runner (`harness.runner.run_one`) implementing the locked
   `claude --bare ...` invocation with `cwd=tmpdir`, `env=clean_env`, and
   pre-spawn writability check on the per-run event log path. `_PYRUNTIME_EVENT_LOG`
@@ -28,8 +74,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so default-model drift cannot affect runs.
 - 35 unit tests for `harness.runner` and `harness.probe`, plus 2 live tests
   gated by `@pytest.mark.live`.
+- In-process telemetry layer-2 hooks (`harness/sitecustomize_template.py`):
+  guide-file reads via `get_llm_guide` (wrapped at both
+  `diff_diff.get_llm_guide` and `diff_diff._guides_api.get_llm_guide` to close
+  the submodule-direct-import bypass), guide-file reads via `builtins.open`
+  and `io.open` (catches the `importlib.resources.files(...).read_text()` path
+  that pathlib routes through `io.open`), fit-time `warnings.warn` filtered
+  to `diff_diff.*`, estimator class instantiations and fits (21 classes
+  including HonestDiD, PreTrendsPower, and LinearRegression), diagnostic
+  function calls (5 functions), `session_start` event written at shim load.
+  All hooks use `functools.wraps` and `_pyruntime_wrapped` idempotency
+  markers. The shim opens the event-log fd once at startup
+  (POSIX-resilient to chmod / rename / unlink of the path) and hard-exits
+  the Python interpreter with `os._exit(2)` on event-write failure; the
+  merger fails closed on shim markers in stderr, on `[pyruntime]` markers
+  in Bash tool_result content, and on Bash `is_error=True` for any
+  command containing a Python invocation. This closes the chain "shim
+  fails -> merger detects" even when the agent suppresses stderr via
+  `2>/dev/null`.
+- `harness.telemetry.merge_layers()` real implementation: parses
+  `in_process_events.jsonl` plus a layer-1 (`transcript.jsonl`)
+  python-invocation count cross-check; raises new `TelemetryMergeError` on
+  missing event log, malformed JSONL, the runner-written `telemetry_missing`
+  sentinel, or python-invoked-but-shim-never-loaded. Returns a populated
+  `TelemetryRecord` honoring arm-aware sentinel semantics for both
+  `arm="diff_diff"` (bool flags) and `arm="statsmodels"` (None sentinels on
+  guide fields; bool/tuple zeros on the rest until the statsmodels arm
+  instrumentation lands).
+- 16 unit tests in `tests/test_sitecustomize.py` covering hook builders,
+  meta_path finder, `_guides_api` bypass closure, warning filter, fail-open
+  contract, idempotency, bidirectional regression guards against
+  `diff_diff.__all__`, and the 500-char message cap.
+- 17 unit tests in `tests/test_telemetry_merger.py` covering merger happy
+  paths (diff_diff + statsmodels), fail-closed inputs (missing file,
+  malformed JSONL, sentinel, python-invoked-without-session_start), 0-byte
+  events.jsonl, variant deduplication, open-vs-get_llm_guide flag
+  attribution, python-invocation word-boundary regex including compound
+  shell commands, and `_VARIANT_TO_FILENAME` dict-equality against
+  `diff_diff._guides_api._VARIANT_TO_FILE`.
+- `diff-diff>=3.3.2` added to `dev` extras in `pyproject.toml` so the
+  bidirectional regression tests actually run in CI rather than skipping.
 
 ### Changed
+- Per-invocation attribution now matches each transcript-visible python
+  invocation against a `session_start` by `argv` (interpreter basename +
+  args), not by `sys_executable` pool. Closes the `pip --version && python
+  script.py` masking case where pip's `session_start` could satisfy the
+  visible `python` token under unused-slot pooling, hiding `script.py`'s
+  missing instrumentation. Surplus session_starts that have no visible
+  counterpart (pip console-scripts, child processes) are still allowed.
+- `merge_layers()` now rejects stream-JSON transcripts that lack a terminal
+  successful `result` entry. A capture truncated mid-run (after a Read
+  tool_use but before its tool_result, or after the last visible Bash
+  command but before the final result frame) cannot be treated as
+  complete: per-run evidence past the cut-off is silently missing.
+- `merge_layers()` now fails closed when a guide-file Read tool_use has
+  no matching tool_result in the transcript. Same fail-closed posture as
+  the empty-transcript and missing-terminal-result checks: incomplete
+  transcript means we cannot emit a definitive `opened_llms_*=False`
+  without risking silent layer-1 loss.
 - Renamed in-process telemetry env var from `CAUSAL_LLM_EVAL_EVENT_LOG` to
   `_PYRUNTIME_EVENT_LOG`. The underscore prefix + Python-runtime framing is a
   deliberate low-reactivity choice so an agent enumerating `os.environ` is less
@@ -98,3 +201,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dropped the deprecated `License :: OSI Approved :: MIT License` classifier
   from `pyproject.toml` (PEP 639 conflict with the modern `license = "MIT"`
   expression; previously blocked editable install).
+- `harness/telemetry.py` layer-3 docstring no longer claims to capture
+  Python warnings (layer 2 does that via the `warnings.warn` wrapper); layer
+  3 is CLI-level stderr capture only.
+- `harness/sitecustomize_template.py` is no longer a skeleton: implements
+  the full diff_diff hook surface per the contract in its module docstring.

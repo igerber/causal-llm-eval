@@ -64,6 +64,48 @@ The probe assessment has two layers (both must pass):
 
    Black-box self-report alone could pass a leaky cold-start where the agent doesn't notice; the structural layer catches what self-report would miss.
 
+## Layer-2 reactivity surfaces (accepted)
+
+The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_diff` API entries, `warnings.warn` (call-stack-inspecting, so warnings emitted with `stacklevel=N` are correctly attributed to the diff_diff frame), and `builtins.open` / `io.open` (for guide-file paths). These patches are detectable by an introspecting agent:
+
+- `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper in `sitecustomize.py`; the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
+- `sys.modules['sitecustomize']` is present (Python convention; not eval-specific).
+- `warnings.warn is not <original>` reveals a custom warning handler is installed (the override wraps `warn` rather than `showwarning` so it can inspect the call stack before `stacklevel` rewrites the displayed filename).
+- `builtins.open is not <original>` and `io.open is not <original>` could be detected — both are overridden so pathlib/importlib.resources reads of guide files are recorded.
+- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading `sitecustomize.py` source can see exactly which estimators and diagnostics are monitored.
+- The package name `"diff_diff"` appears as a string literal in the warning filter and patch targets. Visible to introspecting agents.
+
+The shim contains NO string literals naming the eval framework, the agent under test, the comparator arm, or the rubric. `grep -r causal_llm_eval $(python -c 'import sys; print(sys.prefix)')` finds nothing in the shim. Helper names use a neutral `_pyruntime_*` prefix matching the env-var convention (`_PYRUNTIME_EVENT_LOG`).
+
+Determined introspection still wins. Empirically, agents on causal-inference tasks rarely introspect their interpreter; the eval accepts this surface and documents it. Revisit if early case-study runs show agents probing the shim.
+
+Event-size discipline: every layer-2 event keeps the `message` field capped to 500 chars to bound the per-run events.jsonl size. One run should not produce more than ~1 MB of layer-2 events under normal operation.
+
+## Layer-1 attestation architecture
+
+The merger validates Python invocations through three independent layers:
+
+```
+Layer 1   (text):    AST walk of the agent's Bash command
+Layer 1.5 (exec):    per-arm-venv python wrapper           [PR #5]
+Layer 2   (in-proc): sitecustomize event log
+```
+
+Each layer attests independently. Any inconsistency between layers raises a `RunValidityError` subclass and invalidates the run.
+
+Layer 1 is implemented in `harness/shell_parser.py` and walks the bashlex AST of every visible Bash command. The walker visits every `CommandNode` reachable from the parsed tree: top-level commands, members of `&&` / `||` / `;` / `|` pipelines, bodies of `if` / `while` / `for` control flow, contents of brace-groups and subshells, command-substitution targets (`$(...)`, `` `...` ``), and the recursively-re-parsed payloads of `eval` / `bash -c "..."` / `sh -c "..."` (bounded at 10 nesting levels).
+
+For each `CommandNode`, the parser identifies the command-word by skipping leading `KEY=value` env-prefix assignments and recognized wrapper basenames (`time`, `nice`, `nohup`, `timeout`, `env`, `xargs`, `exec`, `stdbuf`, `ionice`, `chrt`, `command`, `sudo`, `doas`). If the command-word's basename matches `python` / `python3` / `python3.x`, the invocation is recorded with its argv. The parser is shape-agnostic: quoted command words (`"python"`), path-qualified wrappers (`/usr/bin/time python`), modifiers after shell separators (`cd /tmp && time python`), and sudo-prefixed launches (`sudo python`) all surface naturally from the same AST walk rather than from a hand-curated list of regex patterns.
+
+This architecture is principled rather than enumeration-based - the failure mode is "AST surfaces an invocation we then have to attribute" rather than "the regex didn't recognize this shape". Two fail-closed contracts complement the AST walk:
+
+- **Indeterminate command-words** (`${PY} script.py`, `$(which python) script.py`): static parsing cannot prove the resolved command word is not a Python launch, so the parser raises `ShellCommandIndeterminate`. The merger does not attest a run where the visible command may have invoked a Python interpreter we cannot enumerate.
+- **bashlex parse failures** (Bash forms bashlex does not model, e.g. `case` pattern lists): raised as `ShellCommandParseError`. Same fail-closed semantics.
+
+Both subclasses inherit from `RunValidityError`. Callers catching the parent unify fail-closed handling across layer-1 (parser-side) and layer-2/3 (`TelemetryMergeError`) failure modes. The parent name is neutral so methodology surfaces do not telegraph the specific check that fired.
+
+PR #5 will add Layer 1.5 (a per-arm-venv `python` wrapper that records exec-time invocations), giving the merger an independent attestation that the static parser can cross-check against.
+
 ## CI gate
 
 The label gate (`ready-for-ci`) blocks merge until a maintainer applies the label. The `.github/workflows/tests.yml` workflow runs `pytest` (default excludes `slow` and `live`) on labeled PRs and on push to main, catching regressions in the cold-start invocation and supporting harness contracts.
