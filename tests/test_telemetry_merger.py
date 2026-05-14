@@ -627,6 +627,60 @@ def test_merge_layers_diff_diff_missing_session_end_raises(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_pidless_session_start_raises(tmp_path):
+    """R31 P0: a session_start record missing the required ``pid`` field
+    is rejected at schema validation, closing the pid-less bypass that
+    would otherwise skip the session_end pairing check."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    pidless_start = {
+        "event": "session_start",
+        "ts": "2026-05-12T00:00:00.000000+00:00",
+        "argv": ["python", "script.py"],
+    }
+    _write_events_jsonl(events_path, [pidless_start], skip_auto_session_end=True)
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(TelemetryMergeError, match="missing required field 'pid'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_pidless_surplus_session_start_raises(tmp_path):
+    """R31 P0: rejection applies to SURPLUS pid-less session_start
+    events too (not transcript-visible). Schema validation runs before
+    attribution, so visible/surplus distinction doesn't matter."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    parent_start = _session_start_event(argv=["python", "parent.py"], pid=11111)
+    parent_end = _session_end_event(pid=11111)
+    pidless_child = {
+        "event": "session_start",
+        "ts": "2026-05-12T00:00:00.000000+00:00",
+        "argv": ["python", "child.py"],
+    }
+    _write_events_jsonl(
+        events_path,
+        [parent_start, parent_end, pidless_child],
+        skip_auto_session_end=True,
+    )
+    _write_transcript(transcript, ["python parent.py"])
+    with pytest.raises(TelemetryMergeError, match="missing required field 'pid'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_non_int_session_pid_raises(tmp_path):
+    """R31 P0: pid type-check. A string pid (or any non-int) is rejected.
+    bool is rejected explicitly even though it subclasses int."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    bad_start = {
+        "event": "session_start",
+        "ts": "2026-05-12T00:00:00.000000+00:00",
+        "argv": ["python", "script.py"],
+        "pid": "12345",
+    }
+    _write_events_jsonl(events_path, [bad_start], skip_auto_session_end=True)
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(TelemetryMergeError, match="pid must be int"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_surplus_child_missing_session_end_raises(tmp_path):
     """R30 P0 #1: a child Python process invisible in the transcript can
     emit session_start, drop a layer-2 event via shim hard-exit, and
@@ -2492,11 +2546,11 @@ def test_merge_layers_diff_diff_raises_on_malformed_known_event(bad_event, tmp_p
     [
         # session_start argv must be list[str].
         (
-            {"event": "session_start", "ts": "x", "argv": "python script.py"},
+            {"event": "session_start", "ts": "x", "argv": "python script.py", "pid": 1},
             "argv must be list",
         ),
         (
-            {"event": "session_start", "ts": "x", "argv": ["python", 123]},
+            {"event": "session_start", "ts": "x", "argv": ["python", 123], "pid": 1},
             "argv must be list",
         ),
         # guide_file_read with unknown variant.

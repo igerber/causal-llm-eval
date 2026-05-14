@@ -342,7 +342,7 @@ def _read_events(path: Path) -> list[dict]:
 # missing required fields means the event is malformed and would silently
 # zero out telemetry fields if accepted as-is. Reject at parse time.
 _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
-    "session_start": ("argv",),
+    "session_start": ("argv", "pid"),
     "session_end": ("pid",),
     "module_import": ("module",),
     "guide_file_read": (
@@ -402,6 +402,15 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
             argv = event["argv"]
             if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
                 _bail(f"argv must be list[str], got {type(argv).__name__}={argv!r}")
+            pid = event["pid"]
+            # bool is a subclass of int; reject explicitly so True/False
+            # don't slip through as valid pids.
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                _bail(f"pid must be int, got {type(pid).__name__}={pid!r}")
+        elif event_type == "session_end":
+            pid = event["pid"]
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                _bail(f"pid must be int, got {type(pid).__name__}={pid!r}")
         elif event_type == "module_import":
             module = event["module"]
             if not isinstance(module, str):
@@ -546,8 +555,8 @@ def _validate_python_bash_results_non_error(entries: list[dict]) -> None:
     Non-Python Bash commands (``ls``, ``cat``, etc.) are NOT subject to
     this check; their failure has no telemetry-completeness implication.
     Bash commands without a recognizable Python invocation by
-    ``_extract_python_invocations_from_command`` are also exempt -
-    only commands the merger considers tracked Python launches.
+    ``parse_python_invocations`` (in ``harness.shell_parser``) are also
+    exempt - only commands the merger considers tracked Python launches.
     """
     bash_results: dict[str, dict] = {}
     for entry in entries:
@@ -863,9 +872,6 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
                 if argv:
                     visible_invocations.append((command, argv))
 
-    session_end_pids: set = {
-        e.get("pid") for e in events if e.get("event") == "session_end" and e.get("pid") is not None
-    }
     for command, visible_argv in visible_invocations:
         matched_idx: int | None = None
         for idx in available_idx:
@@ -885,23 +891,10 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
                 f"masked by an unrelated entry point (e.g. a pip "
                 f"console-script). Cold-start eval is invalid."
             )
-        # Every attributed session_start must have a matching session_end
-        # by pid. Missing session_end signals a hard-exit (os._exit) that
-        # skipped the shim's atexit handler - typically because a hook
-        # write failed mid-run. The shim's stderr marker and the Bash
-        # is_error check may both be hidden by shell exit-status masking
-        # (`2>/dev/null || true`); session_end is the unmaskable signal.
-        matched_session = sessions[matched_idx]
-        session_pid = matched_session.get("pid")
-        if session_pid is not None and session_pid not in session_end_pids:
-            raise TelemetryMergeError(
-                f"python invocation argv={visible_argv!r} in command "
-                f"{command[:160]!r} matched session_start pid={session_pid} "
-                f"but no session_end was recorded for that pid. The shim "
-                f"hard-exited (typically via os._exit on event-write "
-                f"failure) before its atexit handler could fire, so the "
-                f"layer-2 event log may be silently incomplete."
-            )
+        # session_end pairing is enforced globally in _validate_shim_loaded
+        # for EVERY session_start (attributed or surplus). By the time we
+        # reach attribution here, all session_starts are guaranteed to
+        # have matching session_ends - no per-invocation check needed.
         available_idx.remove(matched_idx)
 
 
@@ -964,9 +957,11 @@ def _count_python_invocations(stream_json_path: Path) -> int:
     responsibility (``_validate_layer_artifacts`` runs first in
     ``merge_layers``).
 
-    The word-boundary regex in ``_PYTHON_INVOCATION_RE`` and the structural
-    tool_use/Bash/command match guard against false positives like
-    ``/opt/python/`` (directory) or ``pythonic`` (substring).
+    Counting uses ``parse_python_invocations`` (in
+    ``harness.shell_parser``); the bashlex AST walker guards against
+    false positives like ``/opt/python/`` (directory) or ``pythonic``
+    (substring) at the language level rather than via regex word
+    boundaries.
     """
     entries = _parse_jsonl_strict(stream_json_path, "stream-JSON transcript")
     count = 0
@@ -1044,18 +1039,16 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
             "log was truncated, deleted-and-recreated, or fabricated. "
             "Cold-start eval is invalid."
         )
-    # R30 P0: every session_start with a pid must have a matching
-    # session_end - including SURPLUS sessions (child Python processes
-    # invisible in the transcript). The attributed-only check in
-    # _attribute_python_invocations protected transcript-visible
-    # invocations; this catches child processes a visible script spawned
-    # that hard-exited mid-run.
-    session_starts_with_pid = [
-        e for e in events if e.get("event") == "session_start" and "pid" in e
-    ]
-    session_end_pids = {e["pid"] for e in events if e.get("event") == "session_end" and "pid" in e}
-    for s in session_starts_with_pid:
-        pid = s.get("pid")
+    # R30 P0: every session_start must have a matching session_end -
+    # including SURPLUS sessions (child Python processes invisible in
+    # the transcript). pid is required by schema validation on both
+    # session_start and session_end (R31 P0), so we can iterate
+    # unconditionally without an optional-pid skip path that would
+    # bypass the check.
+    session_starts = [e for e in events if e.get("event") == "session_start"]
+    session_end_pids = {e["pid"] for e in events if e.get("event") == "session_end"}
+    for s in session_starts:
+        pid = s["pid"]
         if pid not in session_end_pids:
             argv = s.get("argv", "<unknown>")
             raise TelemetryMergeError(
