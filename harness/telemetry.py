@@ -779,6 +779,101 @@ def _scan_read_tool_guide_accesses_in_entries(
     return opened
 
 
+def _scan_grep_tool_guide_accesses_in_entries(
+    entries: list[dict],
+) -> dict[str, bool]:
+    """Return ``{filename: True}`` for each bundled guide file SUCCESSFULLY
+    accessed via Claude's Grep tool in the transcript.
+
+    Mirror of ``_scan_read_tool_guide_accesses_in_entries`` for the
+    Grep tool surface (R32 P0). Grep reads file content while searching;
+    a successful Grep against a bundled guide path exposes the content
+    to the agent the same way Read does.
+
+    Grep input shape (Claude's Grep tool):
+    - ``path``: file or directory to search.
+    - ``glob`` / ``pattern``: search terms.
+
+    Path-matching:
+    - If ``path`` (lex-normalized) is a specific bundled guide file
+      (e.g. ``/.../diff_diff/guides/llms.txt``), flag that file.
+    - If ``path`` is the ``diff_diff/guides`` directory itself (with no
+      narrower glob), flag ALL four bundled files: the agent saw each
+      guide's content during the search.
+
+    Same id-presence and tool_result-matching contract as the Read scanner."""
+    known_filenames = set(_VARIANT_TO_FILENAME.values())
+
+    pending: dict[str, frozenset[str]] = {}
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Grep":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            grep_path = tool_input.get("path", "")
+            if not isinstance(grep_path, str) or not grep_path:
+                continue
+            p = Path(os.path.normpath(grep_path))
+            # Direct guide-file target.
+            if (
+                p.name in known_filenames
+                and p.parent.name == "guides"
+                and p.parent.parent.name == "diff_diff"
+            ):
+                matched_files: frozenset[str] = frozenset({p.name})
+            # Guides directory target: the agent saw every guide.
+            elif p.name == "guides" and p.parent.name == "diff_diff":
+                matched_files = frozenset(known_filenames)
+            else:
+                continue
+            tool_use_id = block.get("id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                raise TelemetryMergeError(
+                    f"Grep tool_use targeting guide path {grep_path!r} is "
+                    f"missing or has empty 'id' field; the transcript "
+                    f"cannot match its tool_result, so a silent drop of "
+                    f"layer-1 guide-discovery evidence cannot be ruled out"
+                )
+            if tool_use_id in pending:
+                raise TelemetryMergeError(
+                    f"Grep tool_use for guide path {grep_path!r} reuses "
+                    f"tool_use_id {tool_use_id!r}; transcript tool-use IDs "
+                    f"must be unique to avoid silent result overwrites"
+                )
+            pending[tool_use_id] = matched_files
+
+    if not pending:
+        return {}
+
+    opened: dict[str, bool] = {}
+    matched_ids: set[str] = set()
+    for entry in entries:
+        for result in _iter_tool_result_blocks(entry):
+            tool_use_id = result.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            files = pending.get(tool_use_id)
+            if files is None:
+                continue
+            matched_ids.add(tool_use_id)
+            if not result.get("is_error", False):
+                for fname in files:
+                    opened[fname] = True
+
+    unmatched_ids = set(pending) - matched_ids
+    if unmatched_ids:
+        unmatched_files = sorted({f for tid in unmatched_ids for f in pending[tid]})
+        raise TelemetryMergeError(
+            f"Grep tool_use for bundled guide file(s) {unmatched_files!r} "
+            f"has no matching tool_result in the transcript (tool_use_ids: "
+            f"{sorted(unmatched_ids)!r}). Transcript is incomplete; the "
+            f"per-run record cannot be trusted to reflect guide-discovery state."
+        )
+    return opened
+
+
 def _iter_tool_use_blocks(entry):
     """Yield tool_use blocks from a stream-JSON entry, handling both
     nested (`message.content[*]`) and shallow (top-level type=tool_use) shapes.
@@ -1110,12 +1205,16 @@ def _build_diff_diff_record(
             if filename in opened:
                 opened[filename] = True
 
-    # Layer-1 evidence: Claude's Read tool accessing a bundled guide file
-    # without invoking Python. Layer-2 hooks see nothing in that path, so
-    # without this OR-merge the merger would silently emit
-    # opened_llms_*=False for an actual discovery.
+    # Layer-1 evidence: Claude's Read/Grep tools accessing a bundled
+    # guide file without invoking Python. Layer-2 hooks see nothing in
+    # that path, so without this OR-merge the merger would silently
+    # emit opened_llms_*=False for an actual discovery.
     read_tool_opens = _scan_read_tool_guide_accesses_in_entries(transcript_entries)
     for filename, was_opened in read_tool_opens.items():
+        if was_opened:
+            opened[filename] = True
+    grep_tool_opens = _scan_grep_tool_guide_accesses_in_entries(transcript_entries)
+    for filename, was_opened in grep_tool_opens.items():
         if was_opened:
             opened[filename] = True
 

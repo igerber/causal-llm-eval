@@ -555,8 +555,14 @@ except OSError as _open_err:
     )
     os._exit(2)
 
-# Now record session_start with full identity.
-_write_event(
+# Now record session_start with full identity. Use the hard-exit
+# variant: if the very first event write fails, sitecustomize's
+# ordinary exception propagation would let Python continue running
+# without hooks (Python's site machinery catches sitecustomize errors
+# and continues). The session_start failure is the same fail-closed
+# class as the hook write failures - leave no path where the agent
+# runs without instrumentation.
+_safe_write(
     {
         "event": "session_start",
         "ts": _utc_iso_now(),

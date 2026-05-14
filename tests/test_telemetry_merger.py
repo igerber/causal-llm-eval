@@ -627,6 +627,89 @@ def test_merge_layers_diff_diff_missing_session_end_raises(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def _grep_tool_request(tool_use_id: str, path: str, pattern: str = "foo") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Grep",
+                    "input": {"path": path, "pattern": pattern},
+                }
+            ],
+        },
+    }
+
+
+def test_merge_layers_diff_diff_grep_tool_guide_access_flips_flag(tmp_path):
+    """R32 P0: a successful Grep against a bundled guide file flips
+    ``opened_llms_*`` the same way Read does. Pre-R32 the merger only
+    scanned Read tool_uses; a Grep on llms.txt left the flag False
+    despite the agent seeing guide content."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_tool_request("g1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+
+
+def test_merge_layers_diff_diff_grep_tool_guides_dir_flips_all_flags(tmp_path):
+    """R32 P0: a Grep against the guides directory itself (no narrower
+    target) sees every bundled file's content; flag all four."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_tool_request("g1", "/install/diff_diff/guides"),
+            _read_tool_result("g1"),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is True
+    assert record.opened_llms_practitioner is True
+    assert record.opened_llms_autonomous is True
+    assert record.opened_llms_full is True
+
+
+def test_merge_layers_diff_diff_grep_tool_failed_does_not_flip(tmp_path):
+    """R32 P0: a failed Grep (is_error=True) does NOT flip the flag.
+    Mirrors the Read scanner's failure semantics."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            _grep_tool_request("g1", "/install/diff_diff/guides/llms.txt"),
+            _read_tool_result("g1", is_error=True),
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is False
+
+
+def test_merge_layers_diff_diff_grep_tool_missing_result_raises(tmp_path):
+    """R32 P0: a Grep tool_use for a bundled guide path with no matching
+    tool_result fails closed (same as Read)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [_grep_tool_request("g1", "/install/diff_diff/guides/llms.txt")],
+    )
+    with pytest.raises(TelemetryMergeError, match="no matching tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_pidless_session_start_raises(tmp_path):
     """R31 P0: a session_start record missing the required ``pid`` field
     is rejected at schema validation, closing the pid-less bypass that

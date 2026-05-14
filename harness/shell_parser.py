@@ -241,12 +241,30 @@ def _maybe_recurse_eval(command_node, depth: int) -> Iterator:
     word_parts = [p for p in command_node.parts if getattr(p, "kind", None) == "word"]
     if not word_parts:
         return
-    # Scan ALL word positions (not just the command-word) looking for
-    # shell-payload wrappers. R28 P0: forms like `timeout 30 bash -c
-    # "python ..."`, `sudo bash -c "..."`, `nice sh -c "..."`, and
-    # `env -S "..."` hide a shell payload behind a recognized wrapper;
-    # the previous "only if first word is bash/sh/eval" check missed
-    # them.
+    # Gate: only recurse if the FIRST word is a recognized wrapper /
+    # shell / eval / env. Otherwise the shell-payload tokens later in
+    # the word list are arguments to a non-executing command (e.g.
+    # ``echo bash -c "python script.py"`` - bash here is an arg to
+    # echo, not an executed shell wrapper). R32 P2: pre-gate the scan
+    # to avoid false-positive recursion that would extract a Python
+    # invocation from non-executed text.
+    first = word_parts[0]
+    if not _is_literal_word(first):
+        return
+    first_basename = os.path.basename(first.word)
+    if (
+        first_basename not in _PYTHON_WRAPPER_BASENAMES
+        and first_basename not in _INLINE_PARSER_NAMES
+        and first_basename not in _DASH_C_PARSER_NAMES
+        and first_basename != "env"
+    ):
+        return
+    # Scan word positions for shell-payload wrappers. R28 P0: forms
+    # like `timeout 30 bash -c "python ..."`, `sudo bash -c "..."`,
+    # `nice sh -c "..."`, and `env -S "..."` hide a shell payload
+    # behind a recognized wrapper; "only first word" missed those, so
+    # we scan beyond position 0 (but the gate above ensures we're in
+    # an executable-chain context).
     i = 0
     while i < len(word_parts):
         w = word_parts[i]

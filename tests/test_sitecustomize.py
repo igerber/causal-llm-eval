@@ -197,6 +197,40 @@ def test_event_writes_resilient_to_log_path_unlinked(event_log):
     assert stat.st_size > 0, "fd-backed inode has no content after wrapper fired"
 
 
+def test_session_start_write_failure_hard_exits(monkeypatch, restore_globals, capsys, tmp_path):
+    """R32 P1: if the initial ``session_start`` write fails after the fd
+    is opened, the shim must hard-exit with code 2 rather than let
+    Python's site machinery catch the OSError and continue running
+    without hooks installed. The fix routes session_start through
+    ``_safe_write`` (the hard-exit path) like hook events."""
+    path = tmp_path / "events.jsonl"
+    path.touch()
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(path))
+    sys.modules.pop("harness.sitecustomize_template", None)
+
+    captured_exit_codes: list[int] = []
+
+    def fake_exit(code):
+        captured_exit_codes.append(code)
+        raise SystemExit(code)
+
+    # Make os.write fail. The fd is opened first (succeeds), then
+    # session_start writes via os.write (fails). monkeypatch
+    # auto-restores at test teardown.
+    def boom_write(fd, payload):
+        del fd, payload
+        raise OSError(28, "simulated disk full")
+
+    monkeypatch.setattr("os._exit", fake_exit)
+    monkeypatch.setattr("os.write", boom_write)
+    with pytest.raises(SystemExit):
+        importlib.import_module("harness.sitecustomize_template")
+    assert captured_exit_codes == [2]
+    captured = capsys.readouterr()
+    assert "[pyruntime]" in captured.err
+    assert "cannot write event" in captured.err
+
+
 def test_event_log_open_failure_hard_exits(monkeypatch, restore_globals, capsys, tmp_path):
     """R22 P0: when the event-log path cannot be opened at shim import
     (parent dir missing / unwritable), the shim hard-exits with code 2.
