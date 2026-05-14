@@ -286,41 +286,98 @@ _COMMAND_MODIFIER_NAMES = (
 )
 
 
-def _strip_command_modifier_prefix(command: str) -> list[str]:
-    """If ``command`` starts with a recognized modifier word (``command``,
-    ``time``, ``nohup``, ``nice``, ``timeout``, ``env``, ``xargs``,
-    ``exec``, etc.), generate progressive-strip variants and return them.
+_ENV_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=\S*")
 
-    Generates multiple variants by progressively stripping the modifier
-    word, then the modifier + 1 leading token, then + 2 tokens, etc.,
-    stopping at the first variant whose remainder begins with a python
-    invocation. This catches modifier-with-args forms like ``nice -n 10
-    python ...`` and ``timeout --signal=KILL 30 python ...`` without
-    requiring per-modifier knowledge of which options take values: the
-    extractor sees the python-prefixed variant and pulls the
-    invocation, while the in-between variants are no-ops.
 
-    Returns ``[]`` if no modifier is present.
+def _split_on_unquoted_separators(command: str) -> list[str]:
+    """Split ``command`` on every unquoted shell separator and return the
+    resulting segments. Each segment is a single shell command (with no
+    leading/trailing separator), suitable for per-segment modifier
+    detection.
+
+    Mirrors ``_find_unquoted_separator`` semantics (tracks single/double
+    quoting; recognizes ``;``, ``&``, ``|``, ``)``, ``\\n``) but yields
+    all segments instead of just the first separator position. Multi-char
+    operators ``&&`` and ``||`` are handled by extending the skip width
+    when the next char matches.
     """
-    s = command.lstrip()
-    for mod in _COMMAND_MODIFIER_NAMES:
-        if s.startswith(mod + " ") or s.startswith(mod + "\t"):
+    segments: list[str] = []
+    rest = command
+    while rest:
+        sep_pos = _find_unquoted_separator(rest)
+        if sep_pos is None:
+            segments.append(rest)
+            break
+        segments.append(rest[:sep_pos])
+        # ``&&`` / ``||`` are two-char separators; advance past both.
+        skip = 1
+        if sep_pos + 1 < len(rest) and rest[sep_pos : sep_pos + 2] in ("&&", "||"):
+            skip = 2
+        rest = rest[sep_pos + skip :]
+    return segments
+
+
+def _strip_leading_env_prefix(s: str) -> str:
+    """Strip leading ``KEY=value`` env-assignment prefixes from ``s``.
+
+    ``VAR=1 OTHER=2 time python ...`` and ``MPLBACKEND=Agg python ...``
+    are common shell shapes; the env prefix is not part of the
+    invocation and must be removed before per-segment modifier detection
+    can see the modifier word.
+    """
+    s = s.lstrip()
+    while True:
+        m = _ENV_ASSIGNMENT_RE.match(s)
+        if not m:
+            return s
+        s = s[m.end() :].lstrip()
+
+
+def _strip_command_modifier_prefix(command: str) -> list[str]:
+    """Generate progressive-strip variants for every shell SEGMENT in
+    ``command`` that starts (after optional ``KEY=value`` env-prefix)
+    with a recognized command modifier (``command``, ``time``, ``nohup``,
+    ``nice``, ``timeout``, ``env``, ``xargs``, ``exec``, ``stdbuf``,
+    ``ionice``, ``chrt``).
+
+    Splits ``command`` on unquoted shell separators (``;``, ``&``, ``&&``,
+    ``|``, ``||``, ``)``, ``\\n``) and applies the modifier-strip logic
+    to each segment. This catches compound forms like ``cd /tmp && time
+    python script.py``, ``VAR=1 nice -n 10 python script.py``, and
+    ``foo; timeout 30 python script.py`` - any of which would silently
+    bypass attribution if the modifier strip ran only at start-of-command
+    (R25 P0).
+
+    For each segment starting with a modifier, generates variants by
+    progressively stripping the modifier word, then modifier+1 leading
+    token, then +2, etc., stopping at the first variant whose remainder
+    begins with a python invocation. This catches modifier-with-args
+    forms (``nice -n 10 python ...``, ``timeout --signal=KILL 30
+    python ...``) without per-modifier option knowledge.
+
+    Returns ``[]`` if no segment carries a recognized modifier.
+    """
+    out: list[str] = []
+    for segment in _split_on_unquoted_separators(command):
+        s = _strip_leading_env_prefix(segment)
+        for mod in _COMMAND_MODIFIER_NAMES:
+            if not (s.startswith(mod + " ") or s.startswith(mod + "\t")):
+                continue
             after_mod = s[len(mod) :].lstrip()
             if not after_mod:
-                return []
-            results = [after_mod]
+                break
+            out.append(after_mod)
             tokens = after_mod.split()
             for i in range(1, len(tokens)):
                 rest = " ".join(tokens[i:])
                 if not rest:
                     continue
-                results.append(rest)
-                # Stop once we've reached a python-prefixed remainder; further
-                # stripping would just re-traverse what extraction already covers.
+                out.append(rest)
+                # Stop once we've reached a python-prefixed remainder.
                 if re.match(r"python(?:3(?:\.\d+)?)?(?:\s|$)", rest):
                     break
-            return results
-    return []
+            break
+    return out
 
 
 def _strip_shell_control_prefix(command: str) -> list[str]:

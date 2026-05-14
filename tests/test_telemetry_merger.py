@@ -2125,6 +2125,90 @@ def test_merge_layers_diff_diff_unwrap_does_not_overflag_safe_wrappers(tmp_path)
     assert record.arm == "diff_diff"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Reviewer-named cases from R25 P0.
+        "cd /tmp && time python script.py",
+        "cd /tmp && time /usr/bin/python script.py",
+        "cd /tmp && command python script.py",
+        "cd /tmp && xargs python script.py",
+        "cd /tmp && exec python script.py",
+        # Other modifier families on the same compound shape.
+        "cd /tmp && nice python script.py",
+        "cd /tmp && nice -n 10 python script.py",
+        "cd /tmp && timeout 30 python script.py",
+        "cd /tmp && timeout --signal=KILL 30 python script.py",
+        "cd /tmp && stdbuf -oL python script.py",
+        "cd /tmp && ionice python script.py",
+        "cd /tmp && chrt -f 1 python script.py",
+        "cd /tmp && nohup python script.py",
+        # `;` and newline separators behave like `&&` for segment boundaries.
+        "cd /tmp; time python script.py",
+        "cd /tmp\ntime python script.py",
+        # Env-prefix in front of the modifier inside a segment.
+        "cd /tmp && VAR=1 time python script.py",
+        "cd /tmp && VAR=1 OTHER=2 nice -n 10 python script.py",
+        # Env-prefix at start of command, then modifier (no compound).
+        "VAR=1 nice -n 10 python script.py",
+        "MPLBACKEND=Agg time python script.py",
+    ],
+)
+def test_merge_layers_diff_diff_modifier_after_separator_fails_closed(tmp_path, command):
+    """R25 P0: command modifiers (``time``, ``nice``, ``command``, etc.)
+    after a shell separator or env-prefix must still be unwrapped so the
+    python invocation is extracted and attribution required.
+
+    Pre-R25 ``_strip_command_modifier_prefix`` only stripped modifiers at
+    start of the whole Bash command. ``cd /tmp && time python script.py``
+    produced NO extracted invocation; an uninstrumented python could run
+    with no required session_start, and the merger would emit a clean
+    all-False record - silent layer-2 telemetry loss.
+
+    The fix splits the command on unquoted shell separators FIRST, then
+    applies modifier-strip per segment. Each parametrized command above
+    contains a python invocation that must be visible to attribution;
+    with an empty event log and no matching session_start, the merger
+    raises ``no matching session_start``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, [command])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+@pytest.mark.parametrize(
+    "command,session_argv",
+    [
+        ("cd /tmp && time python script.py", ["python", "script.py"]),
+        (
+            "cd /tmp && time /usr/bin/python script.py",
+            ["/usr/bin/python", "script.py"],
+        ),
+        (
+            "cd /tmp && nice -n 10 python script.py",
+            ["python", "script.py"],
+        ),
+        (
+            "VAR=1 nice -n 10 python script.py",
+            ["python", "script.py"],
+        ),
+    ],
+)
+def test_merge_layers_diff_diff_modifier_after_separator_with_session_attributes(
+    tmp_path, command, session_argv
+):
+    """R25: matching session_start (interpreter + args) for the same
+    compound-modifier forms attributes correctly. Pairs with the
+    negative test above; verifies the fix doesn't over-extract or
+    misattribute when the session is present."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event(argv=session_argv)])
+    _write_transcript(transcript, [command])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
 # ---------------------------------------------------------------------------
 # R17 regressions
 # ---------------------------------------------------------------------------
