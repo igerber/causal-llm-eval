@@ -498,9 +498,18 @@ class _DiffDiffPostImportHook:
 # owns).
 _initial_path = os.environ.get("_PYRUNTIME_EVENT_LOG")
 if not _initial_path:
-    raise TelemetryConfigError(
-        "_PYRUNTIME_EVENT_LOG is unset; runtime event log cannot be written."
+    # Hard exit: Python's site machinery normally catches ordinary
+    # exceptions raised from sitecustomize and continues running. That
+    # would let an agent's Python subprocess start without telemetry
+    # capture, silently. Print to stderr (so the runner / merger can see
+    # the marker via layer-3 or tool_result scan) and terminate the
+    # interpreter immediately.
+    print(
+        "[pyruntime] _PYRUNTIME_EVENT_LOG is unset; sitecustomize cannot "
+        "initialize the runtime event log",
+        file=sys.stderr,
     )
+    os._exit(2)
 _EVENT_LOG_PATH = _initial_path
 
 # Now record session_start with full identity.

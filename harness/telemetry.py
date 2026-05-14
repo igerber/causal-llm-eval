@@ -767,6 +767,61 @@ def _iter_tool_result_blocks(entry):
         yield entry
 
 
+def _validate_bash_tool_results_complete(entries: list[dict]) -> None:
+    """Raise ``TelemetryMergeError`` if any Bash ``tool_use`` in the
+    transcript lacks a matching ``tool_result``.
+
+    Claude's tool-call flow guarantees every ``tool_use`` is followed by a
+    ``tool_result`` in the same conversation (success or error). A
+    missing match indicates the transcript was truncated between the
+    request and the response, which silently drops the subprocess stderr
+    for that command. If that stderr would have contained the shim's
+    ``[pyruntime] cannot write event`` marker, a dropped layer-2 event
+    becomes silently invisible and the merger emits an all-False
+    telemetry record. Reciprocal of the Read tool_result fail-closed
+    check (``_scan_read_tool_guide_accesses_in_entries``); same
+    invariant, different tool surface.
+
+    Tool uses without an ``id`` field are also rejected; without an id
+    the match cannot be established and the result may be missing
+    silently.
+    """
+    bash_uses: dict[str, dict] = {}
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_use_id = block.get("id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                raise TelemetryMergeError(
+                    "Bash tool_use is missing or has empty 'id' field; the "
+                    "transcript cannot match its tool_result, so a silently "
+                    "dropped stderr (including a possible shim event-write "
+                    "failure marker) cannot be ruled out"
+                )
+            bash_uses[tool_use_id] = block
+
+    if not bash_uses:
+        return
+
+    matched_ids: set[str] = set()
+    for entry in entries:
+        for result in _iter_tool_result_blocks(entry):
+            tool_use_id = result.get("tool_use_id")
+            if isinstance(tool_use_id, str) and tool_use_id in bash_uses:
+                matched_ids.add(tool_use_id)
+
+    unmatched = set(bash_uses) - matched_ids
+    if unmatched:
+        raise TelemetryMergeError(
+            f"Bash tool_use(s) {sorted(unmatched)!r} have no matching "
+            f"tool_result in the transcript. The transcript is truncated "
+            f"between request and response, so the subprocess stderr "
+            f"(which may contain the shim event-write failure marker) "
+            f"is silently missing. Per-run record cannot be trusted."
+        )
+
+
 def _scan_read_tool_guide_accesses_in_entries(
     entries: list[dict],
 ) -> dict[str, bool]:
@@ -1068,10 +1123,16 @@ def _extract_python_invocations_from_segment(command: str) -> list[list[str]]:
     for m in _PYTHON_INVOCATION_RE.finditer(command):
         match_start = m.start()
         boundary_char = m.group(0)[0] if m.group(0) else ""
-        # interp_end is the position right after the python token (exclusive):
-        # m.end() points one past the trailing boundary char (space, `<`, etc.),
-        # so the python token ends at m.end() - 1.
-        interp_end = m.end() - 1
+        # interp_end is the position right after the python token (exclusive).
+        # The trailing group is ``(?:[\s<>]|$)`` - when a real boundary char
+        # (space, `<`, `>`) was consumed, m.end() points one past it and the
+        # python token ends at m.end() - 1. When the match ended via ``$``
+        # (zero-width, no boundary consumed), m.end() IS the end of the
+        # python token and subtracting 1 would truncate the last char.
+        if m.group(0) and m.group(0)[-1] in (" ", "\t", "\n", "<", ">"):
+            interp_end = m.end() - 1
+        else:
+            interp_end = m.end()
         if boundary_char == "/":
             # Absolute path: walk left to recover the rest of the path
             # (e.g. `/usr/bin/python3`). Stop at any shell separator,
@@ -1115,7 +1176,14 @@ def _extract_python_invocations_from_segment(command: str) -> list[list[str]]:
         # separator. A raw-regex scan would falsely terminate at a
         # in-quoted ``;`` in commands like
         # ``python -c 'import os; print(1)'``.
-        rest_start = m.end() - 1  # include the boundary char in rest
+        # Args region starts at the trailing boundary char (so e.g. ``python -c``
+        # gives args ``  -c`` with leading whitespace that shlex tolerates).
+        # When the match ended via ``$`` (no boundary char consumed), there is
+        # no trailing boundary to include; rest is empty.
+        if m.group(0) and m.group(0)[-1] in (" ", "\t", "\n", "<", ">"):
+            rest_start = m.end() - 1
+        else:
+            rest_start = m.end()
         rest = command[rest_start:]
         sep_pos = _find_unquoted_separator(rest)
         args_region = rest[:sep_pos] if sep_pos is not None else rest
@@ -1602,11 +1670,14 @@ def merge_layers(
       session_start by ``argv`` (interpreter basename + args).
     - A guide-file Read tool_use with no matching tool_result
       (incomplete transcript / cannot determine success).
+    - A Bash tool_use with no matching tool_result (subprocess stderr
+      silently missing; could contain the shim event-write marker).
 
     The transcript is parsed exactly once (per-invocation attribution,
     guide-read scan, and bypass detection all consume the parsed entries).
     """
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
+    _validate_bash_tool_results_complete(transcript_entries)
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(
             f"shim event-write failure marker present in {stderr_path}; "

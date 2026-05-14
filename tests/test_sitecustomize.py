@@ -97,14 +97,30 @@ def test_session_start_event_written_on_import(event_log):
     assert "T" in session_events[0]["ts"]
 
 
-def test_session_start_raises_without_env_var(monkeypatch, restore_globals):
+def test_session_start_hard_exits_without_env_var(monkeypatch, restore_globals, capsys):
+    """R21 P1: when ``_PYRUNTIME_EVENT_LOG`` is unset at shim import, the
+    shim calls ``os._exit(2)`` rather than raising. Python's site machinery
+    catches ordinary exceptions from sitecustomize.py and continues the
+    user program; only a hard exit reliably stops the subprocess. The
+    test mocks ``os._exit`` to capture the exit code instead of killing
+    pytest."""
     monkeypatch.delenv("_PYRUNTIME_EVENT_LOG", raising=False)
     sys.modules.pop("harness.sitecustomize_template", None)
-    with pytest.raises(Exception) as excinfo:
+
+    captured_exit_codes: list[int] = []
+
+    def fake_exit(code):
+        captured_exit_codes.append(code)
+        # Raise to abort module load (mimics process termination).
+        raise SystemExit(code)
+
+    monkeypatch.setattr("os._exit", fake_exit)
+    with pytest.raises(SystemExit):
         importlib.import_module("harness.sitecustomize_template")
-    # The exception is wrapped through the import system; assert the message
-    # is the TelemetryConfigError text.
-    assert "_PYRUNTIME_EVENT_LOG is unset" in str(excinfo.value)
+    assert captured_exit_codes == [2]
+    captured = capsys.readouterr()
+    assert "[pyruntime]" in captured.err
+    assert "_PYRUNTIME_EVENT_LOG is unset" in captured.err
 
 
 def test_event_log_path_captured_at_import_resists_env_mutation(event_log, monkeypatch, tmp_path):

@@ -32,27 +32,53 @@ def _write_events_jsonl(path: Path, events: list[dict]) -> None:
 def _write_transcript(path: Path, bash_commands: list[str]) -> None:
     """Write a minimal stream-JSON transcript with the given Bash commands.
 
-    Each command becomes a tool_use block inside an assistant message entry.
-    A terminal `result` entry is appended so the merger's completeness
-    check passes; tests that want to exercise truncation should overwrite
+    Each command becomes a tool_use block inside an assistant message
+    entry, paired with a matching tool_result on a user-role entry. A
+    terminal `result` entry is appended so the merger's completeness
+    checks pass; tests that want to exercise truncation should overwrite
     the file without the result entry.
     """
     with open(path, "w") as f:
-        for cmd in bash_commands:
-            entry = {
-                "type": "assistant",
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Bash",
-                            "input": {"command": cmd},
-                        }
-                    ],
-                },
-            }
-            f.write(json.dumps(entry) + "\n")
+        for i, cmd in enumerate(bash_commands):
+            tool_use_id = f"bash_{i}"
+            f.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": tool_use_id,
+                                    "input": {"command": cmd},
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            f.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "is_error": False,
+                                    "content": "",
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
         f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
 
 
@@ -1807,6 +1833,101 @@ def test_merge_layers_diff_diff_raises_on_malformed_value(bad_event, match, tmp_
     _write_events_jsonl(events_path, [_session_start_event(), bad_event])
     with pytest.raises(TelemetryMergeError, match=match):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+# ---------------------------------------------------------------------------
+# R21 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_merge_layers_diff_diff_raises_on_bash_tool_use_without_result(tmp_path):
+    """R21 P0: a Bash tool_use without a matching tool_result must fail
+    closed. The transcript is truncated between request and response; the
+    subprocess stderr (potentially containing the shim event-write
+    failure marker) is silently missing."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python", "-c", "print(1)"])],
+    )
+    # Write a Bash tool_use with NO matching tool_result.
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "id": "bash_1",
+                            "input": {"command": "python -c 'print(1)'"},
+                        }
+                    ],
+                },
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="no matching tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_raises_on_bash_tool_use_without_id(tmp_path):
+    """R21 P0 variant: a Bash tool_use without an ``id`` field cannot be
+    matched to its tool_result, so the merger fails closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript_entries(
+        transcript,
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "echo hi"},
+                            # No "id" field
+                        }
+                    ],
+                },
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="missing or has empty 'id'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_no_arg_python_attribution(tmp_path):
+    """R21 P2: bare ``python`` invocation with no args (REPL) attributes
+    against a session_start with ``argv=["python"]``. Pre-R21 the
+    interp_end calculation truncated the trailing char to ``pytho``
+    when the regex matched via ``$``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["python"])],
+    )
+    _write_transcript(transcript, ["python"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_no_arg_absolute_python(tmp_path):
+    """R21 P2 variant: absolute path with no args. ``/usr/bin/python3``
+    with no trailing space must extract correctly."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["/usr/bin/python3"])],
+    )
+    _write_transcript(transcript, ["/usr/bin/python3"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
 
 
 # ---------------------------------------------------------------------------
