@@ -244,6 +244,13 @@ _PAREN_SUBSHELL_RE = re.compile(r"(?:^|\s)\(\s*([^()]+?)\s*\)")
 _IF_PREFIX_RE = re.compile(r"^if\s+(.+?);\s*then\b", re.DOTALL)
 _WHILE_PREFIX_RE = re.compile(r"^(?:while|until)\s+(.+?);\s*do\b", re.DOTALL)
 _NEGATION_PREFIX_RE = re.compile(r"^!\s+(.+)$")
+# Shell control BODIES (test command vs body command): the prefix patterns
+# above extract the test command; these extract the body. ``then BODY (else
+# BODY)? fi``, ``do BODY done``, and ``case ... in PATTERN) BODY ;;`` arms.
+_THEN_BODY_RE = re.compile(r"\bthen\s+(.+?)(?:\s*;\s*(?:else|elif|fi)\b|$)", re.DOTALL)
+_ELSE_BODY_RE = re.compile(r"\belse\s+(.+?)(?:\s*;\s*fi\b|$)", re.DOTALL)
+_DO_BODY_RE = re.compile(r"\bdo\s+(.+?)(?:\s*;\s*done\b|$)", re.DOTALL)
+_CASE_ARM_RE = re.compile(r"\)\s+([^;)]+?)\s*;;", re.DOTALL)
 
 # Recognized command modifiers that take a command (and possibly options /
 # numeric args) before that command.
@@ -300,8 +307,25 @@ def _strip_command_modifier_prefix(command: str) -> list[str]:
 
 
 def _strip_shell_control_prefix(command: str) -> list[str]:
-    """Extract the test/body command from leading shell-control structures:
-    ``if CMD; then``, ``while CMD; do``, ``until CMD; do``, ``! CMD``."""
+    """Extract test commands AND body commands from shell-control structures.
+
+    Test commands (return what the structure tests):
+    - ``! CMD`` -> ``CMD``
+    - ``if CMD; then ...`` -> ``CMD``
+    - ``while CMD; do ...`` / ``until CMD; do ...`` -> ``CMD``
+
+    Body commands (return what the structure executes):
+    - ``then BODY ; (else|elif|fi)`` -> ``BODY``
+    - ``else BODY ; fi`` -> ``BODY``
+    - ``do BODY ; done`` -> ``BODY`` (covers for/while/until loops)
+    - ``case ... in PATTERN) BODY ;;`` -> each ``BODY`` arm
+
+    Body extraction matters because a one-line ``for f in x; do python "$f";
+    done`` or ``if true; then python -S; fi`` would otherwise hide the
+    python invocation from extraction (the python token isn't in command
+    position by ``_is_in_command_position`` because ``do`` / ``then`` are
+    not in the separator set).
+    """
     out: list[str] = []
     s = command.lstrip()
     m = _NEGATION_PREFIX_RE.match(s)
@@ -312,6 +336,15 @@ def _strip_shell_control_prefix(command: str) -> list[str]:
         out.append(m.group(1).strip())
     m = _WHILE_PREFIX_RE.match(s)
     if m:
+        out.append(m.group(1).strip())
+    # Body extraction: search anywhere in the command (not just at start).
+    for m in _THEN_BODY_RE.finditer(s):
+        out.append(m.group(1).strip())
+    for m in _ELSE_BODY_RE.finditer(s):
+        out.append(m.group(1).strip())
+    for m in _DO_BODY_RE.finditer(s):
+        out.append(m.group(1).strip())
+    for m in _CASE_ARM_RE.finditer(s):
         out.append(m.group(1).strip())
     return out
 
@@ -584,7 +617,79 @@ def _read_events(path: Path) -> list[dict]:
             f"in-process event log not found at {path}; "
             f"the runner should have written a telemetry_missing sentinel"
         )
-    return _parse_jsonl_strict(path, "event log")
+    events = _parse_jsonl_strict(path, "event log")
+    _validate_event_schemas(events, path)
+    return events
+
+
+# Required field schemas for known event types. The shim writes these under
+# strict producer-side control (see ``harness/sitecustomize_template.py``);
+# missing required fields means the event is malformed and would silently
+# zero out telemetry fields if accepted as-is. Reject at parse time.
+_EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
+    "session_start": ("argv",),
+    "module_import": ("module",),
+    "guide_file_read": (
+        "via",
+    ),  # via=='get_llm_guide' needs variant; via=='open' needs filename - checked below
+    "estimator_init": ("class",),
+    "estimator_fit": ("class",),
+    "diagnostic_call": ("name",),
+    "warning_emitted": ("filename",),
+    # telemetry_missing sentinel has no required fields; the merger raises on
+    # its presence regardless of payload.
+    "telemetry_missing": (),
+}
+
+
+def _validate_event_schemas(events: list[dict], path: Path) -> None:
+    """Reject malformed known-event records.
+
+    A line that parses as a JSON object but is missing required fields for
+    its declared ``event`` type is silently lossy: downstream code reads
+    ``event.get("filename", "")`` and the empty default doesn't match any
+    bundled guide, so the event APPEARS in the log (passing the
+    ``_validate_shim_loaded`` non-empty / has-session_start check) but
+    contributes nothing to discoverability flags. The merger then emits a
+    valid-looking record with missing evidence. Fail closed instead.
+
+    Unknown event types are ignored (forward-compatibility: a future shim
+    may emit new event types, and we don't want old mergers to reject
+    them outright). Only KNOWN event types are schema-checked.
+    """
+    for i, event in enumerate(events):
+        event_type = event.get("event")
+        if not isinstance(event_type, str):
+            continue  # not a typed event; ignore
+        required = _EVENT_SCHEMA.get(event_type)
+        if required is None:
+            continue
+        for field in required:
+            if field not in event:
+                raise TelemetryMergeError(
+                    f"event log {path} entry {i} (event={event_type!r}) is "
+                    f"missing required field {field!r}; the shim wrote a "
+                    f"malformed record and downstream telemetry would silently "
+                    f"omit this evidence"
+                )
+        # via-specific required fields for guide_file_read.
+        if event_type == "guide_file_read":
+            via = event.get("via")
+            if via == "get_llm_guide" and "variant" not in event:
+                raise TelemetryMergeError(
+                    f"event log {path} entry {i} (guide_file_read via='get_llm_guide') "
+                    f"is missing required 'variant' field"
+                )
+            if via == "open" and "filename" not in event:
+                raise TelemetryMergeError(
+                    f"event log {path} entry {i} (guide_file_read via='open') "
+                    f"is missing required 'filename' field"
+                )
+            if via not in ("get_llm_guide", "open"):
+                raise TelemetryMergeError(
+                    f"event log {path} entry {i} (guide_file_read) has unknown "
+                    f"via={via!r}; recognized values: 'get_llm_guide', 'open'"
+                )
 
 
 def _iter_tool_result_blocks(entry):
@@ -1144,17 +1249,29 @@ def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]
             has_python_env_var = bool(_PYTHON_ENV_VAR_RE.search(command))
             has_activation = bool(_SHELL_ACTIVATION_RE.search(command))
             has_wrapper = bool(_PYTHON_WRAPPER_RE.search(command))
-            # Shell-wrapper bypass: `bash -c "python ..."`, `eval 'python ...'`,
+            # Shell-wrapper bypass: `bash -c "python -S ..."`, `eval 'python -S ...'`,
             # etc. The inner python token lives inside a quoted payload that
-            # _PYTHON_INVOCATION_RE does not visit (it scans the outer
-            # command). When the command contains both a shell wrapper AND
-            # any word-bounded `python` token, fail closed.
+            # _PYTHON_INVOCATION_RE does not visit. Only flag as bypass
+            # when there's actually a primitive bypass vector (-S, PATH=,
+            # source/activation) inside the wrapper - otherwise the
+            # unwrap+attribution path handles benign wrappers correctly.
             has_shell_wrapper = bool(_SHELL_WRAPPER_RE.search(command))
             has_eval_wrapper = bool(_EVAL_WRAPPER_RE.search(command))
             has_python_literal = bool(_PYTHON_LITERAL_RE.search(command))
             if (has_shell_wrapper or has_eval_wrapper) and has_python_literal:
-                bypass_commands.append(command)
-                continue
+                # Require a primitive bypass marker (-S flag literal OR
+                # PATH= manipulation) in either the outer command or any
+                # unwrapped variant - a primitive hidden inside a `bash -c`
+                # quoted payload IS a bypass even if the outer regex
+                # doesn't see it. Without any primitive in any variant,
+                # fall through to unwrap+attribution.
+                variants = _unwrap_command_for_inspection(command)
+                if any(
+                    _BARE_BYPASS_FLAG_RE.search(v) or _PATH_ASSIGNMENT_RE.search(v)
+                    for v in variants
+                ):
+                    bypass_commands.append(command)
+                    continue
             # Command modifier prefix bypass: `command python -S ...`,
             # `time python -S ...`, `nohup python -S ...`, `timeout 30
             # python -S ...`. The python token is not in command position

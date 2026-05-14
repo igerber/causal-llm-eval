@@ -72,14 +72,16 @@ def _make_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _session_start_event(sys_executable: str | None = None, argv: list | None = None) -> dict:
-    """Build a session_start event. Pass `argv` to match the corresponding
-    transcript-visible python invocation under the new per-invocation
-    attribution check."""
-    event: dict = {"event": "session_start", "ts": "2026-05-12T00:00:00.000000+00:00"}
+    """Build a session_start event. ``argv`` defaults to a placeholder so
+    schema validation passes; tests that need attribution against a
+    specific python invocation should pass an explicit ``argv``."""
+    event: dict = {
+        "event": "session_start",
+        "ts": "2026-05-12T00:00:00.000000+00:00",
+        "argv": argv if argv is not None else ["python", "-c", "pass"],
+    }
     if sys_executable is not None:
         event["sys_executable"] = sys_executable
-    if argv is not None:
-        event["argv"] = argv
     return event
 
 
@@ -1414,21 +1416,25 @@ def test_merge_layers_diff_diff_raises_on_bash_dash_c_python(tmp_path):
 
 
 def test_merge_layers_diff_diff_raises_on_bash_dash_lc_python(tmp_path):
-    """R14 P0 variant: ``bash -lc`` (login shell) is a common form."""
+    """R14 P0 variant: ``bash -lc`` (login shell) is a common form. Post-R18
+    this no longer raises with 'bypass' (no -S primitive in payload), but
+    unwrap+attribution catches the inner python invocation and fails closed
+    with no-matching-session-start."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])
     _write_transcript(transcript, ["bash -lc 'python script.py'"])
-    with pytest.raises(TelemetryMergeError, match="bypass"):
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
 def test_merge_layers_diff_diff_raises_on_eval_python(tmp_path):
     """R14 P0 variant: ``eval 'python script.py'`` similarly hides the
-    python token from the regex extractor."""
+    python token from the regex extractor. Post-R18 unwrap+attribution
+    catches it via the eval payload extractor."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])
     _write_transcript(transcript, ["eval 'python script.py'"])
-    with pytest.raises(TelemetryMergeError, match="bypass"):
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -1536,11 +1542,13 @@ def test_merge_layers_diff_diff_raises_on_bash_long_option_dash_c(tmp_path):
 
 
 def test_merge_layers_diff_diff_raises_on_bash_dash_o_pipefail_dash_c(tmp_path):
-    """R15 P0 variant: ``bash -o pipefail -c "..."`` (multi-token option)."""
+    """R15 P0 variant: ``bash -o pipefail -c "..."`` (multi-token option).
+    Post-R18 the wrapper without -S/PATH= primitive falls through to
+    unwrap+attribution, which fails closed on missing session_start."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(events_path, [])
     _write_transcript(transcript, ['bash -o pipefail -c "python script.py"'])
-    with pytest.raises(TelemetryMergeError, match="bypass"):
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
@@ -1663,6 +1671,97 @@ def test_merge_layers_diff_diff_post_heredoc_python_dash_S(tmp_path):
     )
     with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+# ---------------------------------------------------------------------------
+# R18 regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # for-loop body (R18 P0 #1, example 1)
+        'for f in script.py; do python "$f"; done',
+        # while-loop body (R18 P0 #1, example 2)
+        "while true; do python script.py; break; done",
+        # if-then body (R18 P0 #1, example 3) - the body, not the test
+        "if true; then python script.py; fi",
+        # case arm body (R18 P0 #1, example 4)
+        "case x in x) python script.py ;; esac",
+    ],
+)
+def test_merge_layers_diff_diff_shell_control_body_requires_session(command, tmp_path):
+    """R18 P0 #1: python in a one-line shell-control body (for/while/if-then/
+    case-arm) must be extracted and attributed. Pre-R18 the body command was
+    not unwrapped, so absent session_start did not fail closed."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])  # no session
+    _write_transcript(transcript, [command])
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_shell_control_body_with_dash_S(tmp_path):
+    """R18 P0 #1 variant: ``if true; then python -S script.py; fi`` puts a
+    bypass primitive inside a then-body. Unwrap surfaces it for bypass."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [])
+    _write_transcript(transcript, ["if true; then python -S script.py; fi"])
+    with pytest.raises(TelemetryMergeError, match="bypass|no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        # session_start without argv (the shim always writes argv).
+        {"event": "session_start", "ts": "2026-05-12T00:00:00Z"},
+        # guide_file_read with no via.
+        {"event": "guide_file_read"},
+        # guide_file_read via=get_llm_guide without variant.
+        {"event": "guide_file_read", "via": "get_llm_guide"},
+        # guide_file_read via=open without filename.
+        {"event": "guide_file_read", "via": "open"},
+        # guide_file_read with unknown via.
+        {"event": "guide_file_read", "via": "unknown_method"},
+        # estimator_init without class.
+        {"event": "estimator_init"},
+        # estimator_fit without class.
+        {"event": "estimator_fit"},
+        # diagnostic_call without name.
+        {"event": "diagnostic_call"},
+        # warning_emitted without filename.
+        {"event": "warning_emitted", "category": "UserWarning"},
+        # module_import without module.
+        {"event": "module_import"},
+    ],
+)
+def test_merge_layers_diff_diff_raises_on_malformed_known_event(bad_event, tmp_path):
+    """R18 P0 #2: a known event type with missing required fields is silently
+    lossy under the previous merger (downstream code reads
+    ``event.get("filename", "")`` and the empty default doesn't match any
+    bundled guide, so the event APPEARS in the log but contributes
+    nothing). Schema validation rejects it at parse time."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    # Pair the malformed event with a valid session_start so the
+    # validate-shim-loaded check doesn't fire first.
+    _write_events_jsonl(events_path, [_session_start_event(), bad_event])
+    with pytest.raises(TelemetryMergeError, match="missing required|unknown via"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_unknown_event_type_ignored(tmp_path):
+    """R18 P0 #2 negative: unknown event TYPES are ignored (forward
+    compatibility - a future shim version may emit new event types and we
+    don't want old mergers to reject them)."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(), {"event": "future_event_type", "data": "anything"}],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
 
 
 @pytest.mark.parametrize(
