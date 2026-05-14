@@ -822,6 +822,77 @@ def _validate_bash_tool_results_complete(entries: list[dict]) -> None:
         )
 
 
+def _validate_python_bash_results_non_error(entries: list[dict]) -> None:
+    """Raise ``TelemetryMergeError`` if any Bash ``tool_result`` for a
+    command containing a Python invocation has ``is_error=True``.
+
+    Completes the failure-marker chain established by R13 and R22:
+
+    - R13 catches the shim's ``[pyruntime] cannot write event`` marker
+      when it reaches stderr (``_scan_stderr_for_shim_failures``) or a
+      Bash tool_result's content (``_scan_tool_results_for_shim_failures``).
+    - R22 hardens the shim to ``os._exit(2)`` on event-write failure
+      rather than silently continuing.
+    - This validator closes the remaining hole: if the agent invokes
+      ``python script.py 2>/dev/null`` and the shim hard-exits, the
+      stderr marker never reaches a scannable surface, but the
+      subprocess exit code is non-zero, which surfaces as
+      ``tool_result.is_error=True`` on the Bash result. Any non-zero
+      exit for a Python invocation is therefore treated as a
+      telemetry-completeness failure: the subprocess died with the
+      content of its run undetermined, and a downstream guide-read /
+      estimator / diagnostic event might have been dropped.
+
+    Non-Python Bash commands (``ls``, ``cat``, etc.) are NOT subject to
+    this check; their failure has no telemetry-completeness implication.
+    Bash commands without a recognizable Python invocation by
+    ``_extract_python_invocations_from_command`` are also exempt -
+    only commands the merger considers tracked Python launches.
+    """
+    bash_results: dict[str, dict] = {}
+    for entry in entries:
+        for result in _iter_tool_result_blocks(entry):
+            tool_use_id = result.get("tool_use_id")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                bash_results[tool_use_id] = result
+
+    for entry in entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_use_id = block.get("id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                # Missing id is caught by _validate_bash_tool_results_complete;
+                # skip here.
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if not isinstance(command, str) or not command:
+                continue
+            python_invocations = _extract_python_invocations_from_command(command)
+            if not python_invocations:
+                continue
+            result = bash_results.get(tool_use_id)
+            if result is None:
+                # Missing tool_result is caught by
+                # _validate_bash_tool_results_complete; skip here.
+                continue
+            if result.get("is_error", False):
+                raise TelemetryMergeError(
+                    f"Bash tool_result for tool_use_id {tool_use_id!r} "
+                    f"(Python invocation: {python_invocations[0]!r}) has "
+                    f"is_error=True. The subprocess exited with a "
+                    f"non-zero status, which may indicate the shim's "
+                    f"hard-exit on an event-write failure - particularly "
+                    f"when stderr is suppressed (e.g. '2>/dev/null') so "
+                    f"the [pyruntime] failure marker is invisible to the "
+                    f"merger. Telemetry completeness for this run cannot "
+                    f"be verified; per-run record cannot be trusted."
+                )
+
+
 def _validate_tool_use_ids_unique(entries: list[dict]) -> None:
     """Raise ``TelemetryMergeError`` if any two ``tool_use`` blocks share
     a tool_use ``id`` across the transcript.
@@ -1286,19 +1357,20 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
     Args after the interpreter must match exactly (shell-tokenized argv from
     the visible Bash command compared against ``sys.orig_argv[1:]``).
 
-    Interpreter argv[0] matching is asymmetric:
+    Interpreter argv[0] matching:
 
-    - If the VISIBLE argv[0] is absolute (``startswith("/")``), require
-      exact equality with the session's argv[0]. Basename-only fallback
-      would silently attribute ``/usr/bin/python3 script.py`` (off-venv,
-      no sitecustomize) to a session whose argv[0] is
-      ``/per-arm-venv/bin/python3`` and whose args also match. The visible
-      absolute path is unambiguous and must identify the exact
-      interpreter.
-    - If the VISIBLE argv[0] is relative (bare ``python`` / ``python3``
-      / ``python3.11``), allow path-vs-basename fallback. The shell may
-      have PATH-resolved the bare name to an absolute interpreter, in
-      which case ``sys.orig_argv[0]`` carries the resolved path even
+    - If the VISIBLE argv[0] contains any path separator (``/``), require
+      exact equality with the session's argv[0]. This covers absolute
+      paths (``/usr/bin/python3``) AND relative paths
+      (``./venv/bin/python``, ``../venv/bin/python``, ``venv/bin/python``).
+      Basename-only fallback for any of these would silently attribute an
+      off-venv interpreter to a same-args per-arm-venv session and lose
+      telemetry for the off-venv invocation. The visible path is
+      unambiguous and must identify the exact interpreter.
+    - If the VISIBLE argv[0] is a bare token with no path separator
+      (``python`` / ``python3`` / ``python3.11``), allow path-vs-basename
+      fallback. The shell PATH-resolves the bare name to an absolute
+      interpreter, so ``sys.orig_argv[0]`` carries the resolved path even
       though the visible argv[0] is just the bare token.
     """
     if not session_argv or not visible_argv:
@@ -1307,8 +1379,11 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
         return False
     if session_argv[0] == visible_argv[0]:
         return True
-    # Asymmetric fallback: only when visible is relative.
-    if visible_argv[0].startswith("/"):
+    # Fallback ONLY when the visible argv[0] is a bare interpreter token
+    # (no path separators). Any path separator - leading, trailing, or
+    # embedded - implies the agent identified a specific interpreter and
+    # must match the session exactly.
+    if "/" in visible_argv[0]:
         return False
     return Path(session_argv[0]).name == Path(visible_argv[0]).name
 
@@ -1699,31 +1774,70 @@ def merge_layers(
     TelemetryRecord docstring): for arm == "statsmodels", `opened_llms_*`
     and `called_get_llm_guide` are encoded as None ("not applicable").
 
-    Raises ``TelemetryMergeError`` on fail-closed conditions:
-    - In-process event log missing or malformed.
-    - Runner-written ``telemetry_missing`` sentinel present.
-    - Empty or non-object transcript.
-    - Shim event-write failure marker in outer cli_stderr.log OR in any
-      Bash tool_result content (the agent's python subprocess stderr is
-      captured into tool_result.content, not into cli_stderr.log).
-    - Python bypass flag (`-S`) in any transcript command.
-    - Stream-JSON transcript missing a terminal successful `result` entry
-      (truncated capture).
-    - Any visible python invocation that cannot be attributed to a
-      session_start by ``argv`` (interpreter basename + args).
-    - A guide-file Read tool_use with no matching tool_result
-      (incomplete transcript / cannot determine success).
-    - A Bash tool_use with no matching tool_result (subprocess stderr
-      silently missing; could contain the shim event-write marker).
-    - A guide-file Read tool_use with a missing/empty/non-string id.
-    - Two tool_use blocks sharing the same id (would silently cross-match
-      tool_results across surfaces).
+    Raises ``TelemetryMergeError`` on any fail-closed condition. The full
+    invariant matrix:
+
+    **Cold-start integrity** (shim-side, asserted indirectly via merger):
+    - The shim hard-exits if ``_PYRUNTIME_EVENT_LOG`` is unset or the
+      event-log path is unopenable (visible as a Bash tool_result with
+      ``is_error=True`` plus the ``[pyruntime]`` marker on stderr or in
+      tool_result content; see the failure-marker class below).
+
+    **Transcript completeness**:
+    - Stream-JSON transcript is non-empty and ends with a terminal
+      successful ``result`` entry (no mid-run truncation).
+    - Every Bash ``tool_use`` has a non-empty string ``id`` and a
+      matching ``tool_result`` (no truncation between request and
+      response; stderr / subprocess content is recoverable).
+    - Every Bash ``tool_result`` for a command containing a Python
+      invocation has ``is_error=False`` (a non-zero exit can mask a
+      stderr-suppressed shim hard-exit; see R23 P0#1).
+    - Every guide-targeting Read ``tool_use`` has a non-empty string
+      ``id`` and a matching ``tool_result`` (mirror of Bash check).
+    - All ``tool_use`` IDs are unique across surfaces (would otherwise
+      silently cross-match a tool_result between a Bash use and a Read
+      use).
+
+    **Failure-marker propagation**:
+    - No ``[pyruntime] cannot write event`` marker in
+      ``cli_stderr.log`` (caught when stderr is not redirected).
+    - No ``[pyruntime]`` marker in any Bash tool_result content (caught
+      when subprocess stderr is captured into the tool result rather
+      than redirected to /dev/null).
+    - No Bash ``is_error=True`` for any Python invocation (the
+      remaining defense when stderr is suppressed and the hard-exit
+      can only be observed via subprocess exit code).
+
+    **Argv attribution**:
+    - Every transcript-visible Python invocation has a matching
+      ``session_start`` event by exact argv (interpreter argv[0] +
+      script args). Basename fallback on argv[0] is allowed ONLY for
+      bare tokens (``python`` / ``python3`` / ``python3.x``); any
+      path separator in argv[0] - absolute, leading-dot relative, or
+      embedded - requires exact match (no per-arm-venv masking of
+      off-venv launches; see R23 P0#2).
+
+    **Bypass detection**:
+    - No transcript-visible Python invocation uses the ``-S`` short
+      flag (would skip ``site.py`` and prevent sitecustomize import).
+    - No ``PATH=`` / ``env -u`` / ``./python`` style primitive bypass
+      forms in the outer command.
+
+    **Schema validation** (events.jsonl):
+    - Every known event has the required fields with the correct
+      types and (where applicable) valid enum values.
+
+    **Data layer**:
+    - In-process event log file is readable, well-formed JSONL, and
+      contains no ``telemetry_missing`` runner sentinel.
 
     The transcript is parsed exactly once (per-invocation attribution,
-    guide-read scan, and bypass detection all consume the parsed entries).
+    guide-read scan, completeness check, and bypass detection all
+    consume the parsed entries).
     """
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     _validate_bash_tool_results_complete(transcript_entries)
+    _validate_python_bash_results_non_error(transcript_entries)
     _validate_tool_use_ids_unique(transcript_entries)
     if _scan_stderr_for_shim_failures(stderr_path):
         raise TelemetryMergeError(

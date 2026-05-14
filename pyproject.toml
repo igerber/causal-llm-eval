@@ -48,9 +48,11 @@ dev = [
     # time so the bidirectional regression tests (`test_sitecustomize.py` and
     # `test_telemetry_merger.py`) can verify `_ESTIMATOR_CLASS_NAMES`,
     # `_DIAGNOSTIC_FUNCTION_NAMES`, and `_VARIANT_TO_FILENAME` against the
-    # actual diff_diff exports. PR #5 (per-arm venv pool) will pin the
-    # specific version each eval run uses; the dev dep is just for tests.
-    "diff-diff>=3.3.2",
+    # actual diff_diff exports. Pinned exactly so a future diff-diff release
+    # changing exports cannot make CI drift relative to what this PR
+    # validated against. PR #5 (per-arm venv pool) will manage the eval-time
+    # pin separately.
+    "diff-diff==3.3.2",
 ]
 
 [tool.setuptools.packages.find]

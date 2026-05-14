@@ -559,6 +559,171 @@ def test_merge_layers_diff_diff_duplicate_tool_use_id_across_bash_read_raises(tm
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_diff_diff_python_bash_is_error_raises(tmp_path):
+    """R23 P0#1: a Bash tool_result with ``is_error=True`` for a command
+    containing a Python invocation is rejected at merge time.
+
+    Catches the remaining hard-exit observability hole from R22: the shim
+    hard-exits with ``os._exit(2)`` on an event-write failure, but if the
+    agent runs ``python script.py 2>/dev/null`` the stderr marker is
+    suppressed and never reaches ``cli_stderr.log`` or the Bash
+    tool_result content. The subprocess exit code still propagates as
+    ``tool_result.is_error=True``; this validator closes the chain by
+    treating any non-zero exit on a tracked Python invocation as
+    telemetry-completeness failure."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    # Write a transcript where the Python Bash tool_result has is_error=True.
+    with open(transcript, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "id": "bash_1",
+                                "input": {"command": "python script.py 2>/dev/null"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "bash_1",
+                                "is_error": True,
+                                "content": "",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
+    with pytest.raises(TelemetryMergeError, match="is_error=True"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_non_python_bash_is_error_passes(tmp_path):
+    """R23: ``is_error=True`` on a non-Python Bash command (``ls``,
+    ``cat``, etc.) is NOT a telemetry-completeness failure - the agent
+    can run anything and have it fail; only Python invocations carry the
+    hard-exit-observability invariant.
+
+    Verifies the validator scopes correctly to Python-invocation
+    commands; a failing ``ls /nonexistent`` doesn't break the merge."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    with open(transcript, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "id": "bash_1",
+                                "input": {"command": "ls /nonexistent"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "bash_1",
+                                "is_error": True,
+                                "content": "ls: cannot access '/nonexistent'",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
+    # Should NOT raise: ls failure has no telemetry-completeness implication.
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_python_bash_compound_command_is_error_raises(tmp_path):
+    """R23: a compound command like ``pip install foo && python script.py``
+    with ``is_error=True`` triggers the validator. The bash command
+    contains a Python invocation; we cannot tell whether pip or python
+    failed, so the per-run record cannot be trusted."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event(argv=["python", "script.py"])])
+    with open(transcript, "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "id": "bash_1",
+                                "input": {"command": "pip install foo && python script.py"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "bash_1",
+                                "is_error": True,
+                                "content": "pip install failed",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+        f.write(json.dumps({"type": "result", "subtype": "success"}) + "\n")
+    with pytest.raises(TelemetryMergeError, match="is_error=True"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_duplicate_tool_use_id_within_read_raises(tmp_path):
     """R22 P0: two guide-Read tool_uses sharing the same id are rejected
     by the per-surface uniqueness check (raises before the cross-surface
@@ -1296,6 +1461,74 @@ def test_merge_layers_diff_diff_absolute_path_exact_match_attributes(tmp_path):
         [_session_start_event(argv=["/usr/bin/python3", "script.py"])],
     )
     _write_transcript(transcript, ["/usr/bin/python3 script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+@pytest.mark.parametrize(
+    "visible_argv0",
+    ["./venv/bin/python", "../venv/bin/python", "venv/bin/python"],
+)
+def test_merge_layers_diff_diff_relative_slash_path_does_not_basename_match(
+    tmp_path, visible_argv0
+):
+    """R23 P0#2: visible argv[0] containing ANY path separator (absolute or
+    relative) must require exact match. ``./venv/bin/python script.py``,
+    ``../venv/bin/python script.py``, and ``venv/bin/python script.py`` are
+    all explicit path launches; they may point at a project-local venv that
+    is NOT the per-arm instrumented venv, and silently basename-matching to
+    a ``/per-arm-venv/bin/python script.py`` session would mask an
+    off-instrumentation invocation.
+
+    Pre-R23 only absolute paths (``startswith('/')``) blocked the basename
+    fallback; relative slash-containing paths slipped through and inherited
+    the wrong session. R23 widens the gate to ``'/' in visible_argv[0]``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(
+                sys_executable="/per-arm-venv/bin/python",
+                argv=["/per-arm-venv/bin/python", "script.py"],
+            )
+        ],
+    )
+    _write_transcript(transcript, [f"{visible_argv0} script.py"])
+    with pytest.raises(TelemetryMergeError, match="no matching session_start"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_diff_diff_relative_slash_path_exact_match_attributes(tmp_path):
+    """R23: relative-slash argv[0] DOES match when the session's argv[0] is
+    identical (positive case). The exact-match rule applies the same way
+    to relative-with-slash as to absolute paths."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [_session_start_event(argv=["./venv/bin/python", "script.py"])],
+    )
+    _write_transcript(transcript, ["./venv/bin/python script.py"])
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_diff_diff_bare_token_still_basename_fallback(tmp_path):
+    """R23: bare interpreter tokens (no path separator) still get basename
+    fallback. ``python script.py`` matches a session whose argv[0] is the
+    PATH-resolved ``/per-arm-venv/bin/python``; this is the legitimate
+    case where the shell PATH-resolved the bare name and the absolute
+    resolved path lives in ``sys.orig_argv[0]``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(
+                sys_executable="/per-arm-venv/bin/python",
+                argv=["/per-arm-venv/bin/python", "script.py"],
+            )
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
     record = merge_layers("diff_diff", transcript, events_path, stderr_log)
     assert record.arm == "diff_diff"
 
