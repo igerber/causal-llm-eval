@@ -1785,6 +1785,15 @@ def merge_layers(
 ) -> TelemetryRecord:
     """Merge the three telemetry layers into a single record.
 
+    Production-mode invocation requires BOTH ``runner_pid`` and
+    ``venv_path``: the former enables the three-layer sentinel demand
+    + reciprocal session_start <-> exec_python check; the latter enables
+    the venv-root-anchored ``executable`` allowlist on exec_python events.
+    Supplying only one is a validity footgun (the merger silently skips
+    the missing check); the merger raises ``ValueError`` instead.
+    Legacy fixture mode supplies neither and skips both checks.
+
+
     `arm` drives the sentinel semantics on guide-discovery fields (see
     TelemetryRecord docstring): for arm == "statsmodels", `opened_llms_*`
     and `called_get_llm_guide` are encoded as None ("not applicable").
@@ -1853,6 +1862,15 @@ def merge_layers(
     guide-read scan, completeness check, and bypass detection all
     consume the parsed entries).
     """
+    # PR #5 R6 P2: production mode requires runner_pid + venv_path
+    # together. Each enables a different validity check; supplying one
+    # without the other silently skips the missing check.
+    if (runner_pid is None) != (venv_path is None):
+        raise ValueError(
+            "merge_layers production mode requires both runner_pid and "
+            "venv_path together (or neither for legacy fixture mode); "
+            f"got runner_pid={runner_pid!r}, venv_path={venv_path!r}"
+        )
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     _validate_bash_tool_results_complete(transcript_entries)
     _validate_tool_use_ids_unique(transcript_entries)

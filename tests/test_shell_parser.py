@@ -446,3 +446,43 @@ def test_find_python_bypass_detects_actual_python_substring():
     cmd = r"find /tmp/venv -name .actual-python -exec {} -S script.py \;"
     bypasses = find_python_bypass_invocations(cmd)
     assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_env_prefix():
+    """R6 P0: ``env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py``
+    retargets the shim's event log to a non-runner-owned path. The
+    wrapper + sitecustomize would write events to /tmp/fake while the
+    runner-owned log appears empty; merger would treat this as a
+    shell-only run (false negative). Bypass detection now flags
+    _PYRUNTIME_EVENT_LOG= prefix on env wrappers.
+    """
+    cmd = "env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_export():
+    """``export _PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py``
+    same retarget via shell export.
+    """
+    cmd = "export _PYRUNTIME_EVENT_LOG=/tmp/fake && python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_standalone():
+    """``_PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py``
+    standalone assignment.
+    """
+    cmd = "_PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_prefix_on_python():
+    """``_PYRUNTIME_EVENT_LOG=/tmp/fake python script.py`` direct
+    prefix-assignment on the python CommandNode.
+    """
+    cmd = "_PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]

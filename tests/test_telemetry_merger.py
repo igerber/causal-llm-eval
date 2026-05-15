@@ -3815,3 +3815,31 @@ def test_merge_layers_relative_venv_bin_python3X_matches(tmp_path):
         venv_path=venv,
     )
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_requires_runner_pid_and_venv_path_together(tmp_path):
+    """R6 P2 CQ-1: production mode requires both runner_pid AND venv_path.
+    Supplying only one is a validity footgun (skips the missing check
+    silently).
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, [])
+    with pytest.raises(ValueError, match="runner_pid and venv_path together"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            runner_pid=_DEFAULT_RUNNER_PID,
+            # venv_path missing
+        )
+    with pytest.raises(ValueError, match="runner_pid and venv_path together"):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            venv_path=tmp_path / "venv",
+            # runner_pid missing
+        )

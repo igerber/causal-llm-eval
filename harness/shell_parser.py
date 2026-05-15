@@ -571,7 +571,7 @@ def find_python_bypass_invocations(command: str) -> list[str]:
             break
         bypass_via_assignment = False
         for k, _value in _prefix_assignments(cn):
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 bypass_via_assignment = True
                 break
         if bypass_via_assignment:
@@ -595,15 +595,19 @@ def _has_arg(command_node, target: str) -> bool:
 
 def _has_path_or_python_assignment_arg(command_node) -> bool:
     """For an `export` CommandNode: True if any arg word's ``KEY=`` prefix
-    matches PATH or PYTHON*. The value may be literal or non-literal
-    (``export PATH=/usr/bin:$PATH``); only the key matters for detection."""
+    matches PATH, PYTHON*, or ``_PYRUNTIME_EVENT_LOG``. The value may be
+    literal or non-literal (``export PATH=/usr/bin:$PATH``); only the
+    key matters for detection. PR #5 R6 P0: ``_PYRUNTIME_EVENT_LOG``
+    retargeting (``export _PYRUNTIME_EVENT_LOG=/tmp/fake``) sends shim
+    events to an attacker-chosen file while the runner-owned log
+    appears empty."""
     for p in command_node.parts:
         if getattr(p, "kind", None) != "word":
             continue
         w = getattr(p, "word", "")
         if "=" in w:
             k, _, _ = w.partition("=")
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 return True
     return False
 
@@ -624,7 +628,7 @@ def _is_assignment_only_path_or_python(command_node) -> bool:
             word = getattr(p, "word", "")
             if "=" in word:
                 k, _, _ = word.partition("=")
-                if k == "PATH" or k.startswith("PYTHON"):
+                if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                     has_target_assignment = True
     return has_target_assignment and not has_word
 
@@ -668,7 +672,7 @@ def _env_wrapper_bypasses_python(command_node) -> bool:
             continue
         if "=" in tok and not tok.startswith("-"):
             k = tok.partition("=")[0]
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 has_primitive = True
             continue
         bn = os.path.basename(tok)

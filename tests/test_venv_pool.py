@@ -57,10 +57,19 @@ def shared_venv(tmp_path_factory):
 
 
 def _site_packages(venv_path: Path) -> Path:
-    """Return the venv's site-packages directory."""
+    """Return the venv's site-packages directory.
+
+    Test-only introspection: invokes ``.actual-python`` with ``-S`` to
+    skip ``site.py`` (and therefore ``sitecustomize.py``) since this is
+    a build-time probe, not an agent run. Without ``-S`` the sitecustomize
+    in the venv would hard-exit with code 2 because
+    ``_PYRUNTIME_EVENT_LOG`` is unset (correct production behavior; not
+    what we want for a sysconfig query).
+    """
     probe = subprocess.run(
         [
             str(venv_path / ".pyruntime-real" / ".actual-python"),
+            "-S",
             "-c",
             "import sysconfig; print(sysconfig.get_paths()['purelib'])",
         ],
@@ -82,9 +91,13 @@ def test_build_arm_template_creates_venv_with_python_executable(shared_venv):
 
 
 def test_build_arm_template_installs_correct_library_version(shared_venv):
+    # Test-only introspection: -S bypasses sitecustomize since this
+    # build-time probe runs without _PYRUNTIME_EVENT_LOG. See
+    # _site_packages() docstring above.
     probe = subprocess.run(
         [
             str(shared_venv / ".pyruntime-real" / ".actual-python"),
+            "-S",
             "-c",
             "import diff_diff; print(diff_diff.__version__)",
         ],
