@@ -177,6 +177,8 @@ The eval measures whether agents on causal-inference tasks discover and use libr
 
 **Out-of-scope (documented limitation):**
 
+**Deviation from plan:** the original PR #5 plan called for the layer-1.5 wrapper + substring detection to close ALL delegated python execution. The wildcard hidden-binary case below is a residual class that requires deliberate adversarial intent to construct; closing it structurally would require OS-level mechanisms (see "Out-of-scope structural defenses" below). This deviation is intentional and the residual is documented per-class with rationale.
+
 A determined adversarial agent that constructs a wildcard delegated execution like
 
 ```
@@ -209,6 +211,8 @@ Both are larger than the eval's research question warrants.
 
 **Out-of-scope: session-detached descendants (PR #5 R16/R17):**
 
+**Deviation from plan:** PR #5 R16 added post-wait `os.killpg` quiescence to close the same-process-group descendant case. The session-detached case (`setsid`, `daemonize`, `os.setsid()`) requires a structurally different defense (process supervision outside the original group, or shell-parser detection of detachment primitives that cannot cover the in-process variant). Closing it is deferred to a future PR if the threat model changes; documented out-of-scope per-class with rationale below.
+
 `run_one()` puts Claude in a new process group via `start_new_session=True` and, on both timeout and normal exit paths, sends `SIGKILL` to the entire group. This catches descendants spawned via the standard `fork()`/`exec()` chain (e.g., agent `Bash` invocations of `python script.py &`, where the backgrounded process inherits the original process group). It does NOT catch descendants that explicitly detach from the process group:
 
 - `setsid python script.py &` (Bash creates a new session for the child)
@@ -230,6 +234,8 @@ The shell-parser's bypass detection in `harness/shell_parser.py::find_python_byp
 Realistic agents working on causal-inference tasks do not exhibit this behavior. As with the wildcard delegated execution case above, the residual class is observably equivalent to "agent ran python adversarially in a way the layered defense cannot see post-hoc": the eval's interpretation is correct for both ("agent did not discover/use these surfaces" measured at finalization time).
 
 **Out-of-scope: off-venv Python via delegated/shebang forms (PR #5 R19):**
+
+**Deviation from plan:** the original PR #5 plan claimed the per-run venv + layer-1.5 wrapper provides "one fresh per-run venv" isolation for ALL python invocations. The off-venv delegated/shebang class (`find -exec /usr/bin/python3`, `xargs /usr/bin/python3`, `./script.py` with absolute shebang) bypasses the wrapper because the venv-routed PATH only catches bare `python` / `python3` / `python3.X` tokens. Closing it structurally would require either removing `/usr/bin`/`/bin` from agent PATH (breaks essential agent capabilities) or per-platform sitecustomize installation in the system Python (out of scope for the eval). This deviation is intentional; rationale and threat-model implications documented below.
 
 The runner sanitizes the agent's `PATH` to put the per-run venv's `bin/` first, so any agent typing bare `python` / `python3` / `python3.X` is wrapper-routed. `/usr/bin` and `/bin` remain on the agent PATH (required for `ls` / `cat` / `find` / `mkdir` etc.) which means absolute off-venv Python interpreters at `/usr/bin/python3` are still on the filesystem and reachable. The layer-1 AST parser attributes direct `/usr/bin/python3 script.py` invocations (the basename matcher recognizes `python3`), so those fail closed when no `session_start` follows. But parser-invisible forms can execute the absolute interpreter without the AST parser modeling the invocation:
 
