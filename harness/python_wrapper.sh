@@ -24,7 +24,19 @@
 # Tested compatible with dash, mawk/gawk/busybox awk, macOS bash 3.2 in
 # POSIX mode.
 
-real="$(dirname "$0")/../.pyruntime-real/python-real"
+# Resolve $0 to its absolute directory so the recorded ``executable``
+# path is canonical regardless of how the wrapper was invoked
+# (``python script.py``, ``./venv/bin/python script.py``,
+# ``${venv}/bin/python script.py``). The merger normalizes both sides
+# but a relative recorded path would not match the venv-root-anchored
+# allowlist.
+case "$0" in
+    /*) wrapper_dir="$(dirname "$0")" ;;
+    *)  wrapper_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" ;;
+esac
+# Resolve /.. by chdir + pwd (POSIX-portable; no realpath dependency).
+real_dir="$(cd "${wrapper_dir}/../.pyruntime-real" 2>/dev/null && pwd)"
+real="${real_dir}/python-real"
 
 log="${_PYRUNTIME_EVENT_LOG:-}"
 if [ -n "$log" ]; then

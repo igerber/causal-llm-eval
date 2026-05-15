@@ -137,3 +137,106 @@ def test_wrapper_argv_with_special_chars(fake_venv, tmp_path):
     events = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
     assert len(events) == 1
     assert events[0]["argv"] == ["python", "-c", "pass", weird]
+
+
+@pytest.fixture
+def fake_venv_with_strip_s_shim(tmp_path):
+    """Fake venv with the strip-S shim AND a fake actual-python binary.
+
+    Layout:
+        ${tmp}/bin/python                       -> wrapper
+        ${tmp}/.pyruntime-real/python-real      -> strip-S shim
+        ${tmp}/.pyruntime-real/.actual-python   -> printf-based fake binary
+
+    The fake actual-python prints its argv so tests can assert
+    argv-preservation through the strip-S layer.
+    """
+    from harness.venv_pool import _PYTHON_REAL_STRIP_S_SCRIPT
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    real_dir = tmp_path / ".pyruntime-real"
+    real_dir.mkdir()
+    # Fake actual-python: prints "ARGV:" then each arg on its own line,
+    # using printf to preserve quoting fidelity.
+    actual = real_dir / ".actual-python"
+    actual.write_text(
+        '#!/usr/bin/env sh\nprintf "ARGV:\\n"\nfor a in "$@"; do printf "  [%s]\\n" "$a"; done\n'
+    )
+    actual.chmod(0o755)
+    # Strip-S shim from venv_pool source.
+    python_real = real_dir / "python-real"
+    python_real.write_text(_PYTHON_REAL_STRIP_S_SCRIPT)
+    python_real.chmod(0o755)
+    # Wrapper.
+    wrapper = bin_dir / "python"
+    shutil.copyfile(_WRAPPER_SOURCE, wrapper)
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return tmp_path
+
+
+def test_strip_s_shim_preserves_quoted_args_with_spaces(fake_venv_with_strip_s_shim):
+    """R4 P1 #2: ``python -c 'print(1)'`` with quoted multi-word args
+    must reach .actual-python with argv exactly preserved (no field
+    splitting / globbing).
+    """
+    venv = fake_venv_with_strip_s_shim
+    log = venv / "events.jsonl"
+    result = subprocess.run(
+        [str(venv / "bin" / "python"), "-c", "import sys; print('hi')", "x y z"],
+        env={
+            "PATH": f"{venv / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    # The fake actual-python prints argv; verify the quoted arg with spaces
+    # arrived as a single token, not split.
+    assert "[-c]" in result.stdout
+    assert "[import sys; print('hi')]" in result.stdout
+    assert "[x y z]" in result.stdout
+
+
+def test_strip_s_shim_drops_S_flag(fake_venv_with_strip_s_shim):
+    """``python -S script.py`` -> .actual-python sees ``script.py``
+    (no -S). Confirms strip-S shim removes the bypass flag before
+    the real interpreter runs.
+    """
+    venv = fake_venv_with_strip_s_shim
+    log = venv / "events.jsonl"
+    result = subprocess.run(
+        [str(venv / "bin" / "python"), "-S", "script.py"],
+        env={
+            "PATH": f"{venv / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "[-S]" not in result.stdout
+    assert "[script.py]" in result.stdout
+
+
+def test_strip_s_shim_strips_S_from_compact_IS_form(fake_venv_with_strip_s_shim):
+    """R4 P1 #2: ``python -IS -c 'print(1)'`` compact form. -IS contains
+    the S bypass flag; strip-S shim removes the S character, keeping
+    -I.
+    """
+    venv = fake_venv_with_strip_s_shim
+    log = venv / "events.jsonl"
+    result = subprocess.run(
+        [str(venv / "bin" / "python"), "-IS", "-c", "print(1)"],
+        env={
+            "PATH": f"{venv / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    # -IS becomes -I; original -IS is gone.
+    assert "[-I]" in result.stdout
+    assert "[-IS]" not in result.stdout

@@ -654,19 +654,18 @@ def _install_production_state() -> None:
 
     # PR #5 R1: route ``subprocess.Popen([sys.executable, ...])`` and
     # equivalent child-spawn idioms through the layer-1.5 wrapper rather
-    # than the real interpreter. After ``exec "$real" "$@"`` in the
-    # wrapper, the real python initializes ``sys.executable`` to the
-    # path of ``python-real`` (which lives at
-    # ``${venv}/.pyruntime-real/python-real``, off the agent's PATH).
-    # A child spawn via ``[sys.executable, ...]`` would therefore exec
-    # the real interpreter directly, skipping the wrapper. Rewriting
-    # ``sys.executable`` to the wrapper's path closes this: any
-    # subprocess.Popen([sys.executable, ...]) call now re-enters the
-    # wrapper, which records exec_python and exec's python-real again.
+    # than the real interpreter. After exec'ing through the wrapper +
+    # strip-S shim chain, the real python initializes ``sys.executable``
+    # to the path the kernel exec'd: either
+    # ``${venv}/.pyruntime-real/python-real`` (R1 single-stage layout)
+    # or ``${venv}/.pyruntime-real/.actual-python`` (R3 two-stage
+    # strip-S layout). Either way, walk up two directory levels to find
+    # the venv root, then rewrite ``sys.executable`` to the wrapper at
+    # ``${venv}/bin/python``. Subsequent ``subprocess.Popen``
+    # invocations re-enter the wrapper, which records exec_python and
+    # exec's the chain again.
     _real_executable = sys.executable
-    if _real_executable.endswith("/python-real"):
-        # Map ${venv}/.pyruntime-real/python-real -> ${venv}/bin/python
-        # by walking up to the venv root and then into bin/.
+    if _real_executable.endswith("/python-real") or _real_executable.endswith("/.actual-python"):
         _venv_root = os.path.dirname(os.path.dirname(_real_executable))
         _wrapper_path = os.path.join(_venv_root, "bin", "python")
         if os.path.exists(_wrapper_path):

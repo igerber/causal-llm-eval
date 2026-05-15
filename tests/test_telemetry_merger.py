@@ -3700,3 +3700,39 @@ def test_merge_layers_actual_python_substring_flagged_as_bypass(tmp_path):
             runner_pid=_DEFAULT_RUNNER_PID,
             venv_path=venv,
         )
+
+
+def test_merge_layers_session_argv_with_actual_python_basename_matches(tmp_path):
+    """R4 P1 #1: after the strip-S shim execs .actual-python, sitecustomize
+    records sys.orig_argv[0] = ``${venv}/.pyruntime-real/.actual-python``.
+    The merger's python-family basename matcher must accept .actual-python
+    so that visible ``python script.py`` still attributes correctly.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    actual = str(venv / ".pyruntime-real" / ".actual-python")
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            # session_start records argv[0] as the .actual-python path
+            # (kernel-set by the strip-S shim's exec call).
+            _session_start_event(argv=[actual, "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345,
+                argv=["python", "script.py"],
+                ppid=22222,
+                executable=exe,
+            ),
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"

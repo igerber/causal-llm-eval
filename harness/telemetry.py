@@ -1179,13 +1179,14 @@ def _session_argv_matches_invocation(
     return session_basename == visible_basename
 
 
-_PYTHON_FAMILY_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?(?:-real)?$")
+_PYTHON_FAMILY_BASENAME_RE = re.compile(r"^(?:python(?:3(?:\.\d+)?)?(?:-real)?|\.actual-python)$")
 
 
 def _is_python_family_basename(name: str) -> bool:
     """Return True if ``name`` is any python interpreter alias the
     venv may produce: ``python``, ``python3``, ``python3.11``,
-    ``python-real``, ``python3-real``, ``python3.11-real``.
+    ``python-real``, ``python3-real``, ``python3.11-real``, or
+    ``.actual-python`` (the R3 two-stage hidden binary).
     """
     return bool(_PYTHON_FAMILY_BASENAME_RE.match(name))
 

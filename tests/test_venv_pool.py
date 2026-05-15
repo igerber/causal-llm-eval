@@ -121,13 +121,21 @@ def test_build_arm_template_installs_wrapper_for_python_python3_python3X(shared_
         ), f"{path} does not start with the wrapper shebang; first_line={first_line!r}"
 
 
-def test_build_arm_template_wrapper_execs_python_real(shared_venv):
-    """The wrapper transparently passes argv to ``python-real`` and the
-    interpreter still produces correct output.
+def test_build_arm_template_wrapper_execs_python_real(shared_venv, tmp_path):
+    """The wrapper transparently passes argv through the strip-S shim to
+    the actual Python binary and the interpreter still produces correct
+    output. ``_PYRUNTIME_EVENT_LOG`` must be set so sitecustomize loads
+    successfully (otherwise the shim's reachability matters but
+    sitecustomize hard-exits with code 2 before user code runs).
     """
+    log_path = tmp_path / "events.jsonl"
     probe = subprocess.run(
         [str(shared_venv / "bin" / "python"), "-c", "print('ok')"],
         check=True,
+        env={
+            "PATH": f"{shared_venv / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(log_path),
+        },
         capture_output=True,
         text=True,
     )

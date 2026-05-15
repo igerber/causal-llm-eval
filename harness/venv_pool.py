@@ -188,37 +188,43 @@ _PYTHON_REAL_STRIP_S_SCRIPT = """\
 # forms like ``-Sc`` / ``-IS``) from the pre-script argv so sitecustomize
 # always loads. POSIX shell, no bashisms.
 #
-# Threat model: this script is the ONLY documented path to invoke the
-# real CPython binary in this venv. The actual binary lives at
-# ``.actual-python`` and is referenced only here and in the substring-
-# detection allowlist. An agent who finds and execs ``.actual-python``
-# directly with ``-S`` produces no session_start (-S skips site.py)
-# and no exec_python (no wrapper); the merger's reciprocal pid check
-# catches this as "session_start without exec_python is impossible
-# under valid telemetry" (the wrapper always fires first under the
-# expected execution path). See COLD_START_VERIFICATION.md.
+# Argv preservation: rebuilds positional parameters via ``set --`` rather
+# than string flattening, so quoted args containing spaces / globs / tabs
+# pass through unchanged.
 actual="$(dirname "$0")/.actual-python"
-cleaned=""
 seen_script=0
-for a in "$@"; do
+orig_count=$#
+i=0
+while [ $i -lt $orig_count ]; do
+    a="$1"
+    shift
     if [ $seen_script -eq 0 ]; then
         case "$a" in
-            -S|-S*)
-                # Pre-script -S short flag (or compact form like -Sc, -IS).
-                # Drop the S character entirely; preserve other flags by
-                # rebuilding the argv element.
-                stripped=$(printf '%s' "$a" | sed 's/^-/-/; s/S//g')
+            --)
+                # End of options marker; everything after is the script + args.
+                seen_script=1
+                set -- "$@" "$a"
+                i=$((i + 1))
+                continue
+                ;;
+            -*S*)
+                # Pre-script flag containing S in any position
+                # (-S, -Sc, -IS, etc.). Strip S characters; evaluate.
+                stripped=$(printf '%s' "$a" | sed 's/S//g')
                 if [ "$stripped" = "-" ]; then
-                    # Was just "-S"; drop entirely.
+                    # Token was just -S (or -SSS, etc.); drop entirely.
+                    i=$((i + 1))
                     continue
                 fi
                 set -- "$@" "$stripped"
+                i=$((i + 1))
                 continue
                 ;;
-            --)
-                seen_script=1
-                ;;
             -*)
+                # Other flag without S: pass through.
+                set -- "$@" "$a"
+                i=$((i + 1))
+                continue
                 ;;
             *)
                 # First non-flag word ends the pre-script argv region.
@@ -226,10 +232,10 @@ for a in "$@"; do
                 ;;
         esac
     fi
-    cleaned="${cleaned} $a"
+    set -- "$@" "$a"
+    i=$((i + 1))
 done
-# shellcheck disable=SC2086
-exec "$actual" $cleaned
+exec "$actual" "$@"
 """
 
 
