@@ -353,6 +353,9 @@ def test_build_command_includes_all_seven_locked_flags(tmp_path):
     assert "--output-format" in cmd
     idx = cmd.index("--output-format")
     assert cmd[idx + 1] == "stream-json"
+    # PR #6: claude CLI 2.1.143+ requires --verbose with --print +
+    # --output-format=stream-json; without it the CLI emits no transcript.
+    assert "--verbose" in cmd
     assert "--add-dir" in cmd
     idx = cmd.index("--add-dir")
     assert cmd[idx + 1] == str(tmp_path)

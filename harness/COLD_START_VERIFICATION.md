@@ -13,9 +13,12 @@ claude --bare \
        --disable-slash-commands \
        --print \
        --output-format stream-json \
+       --verbose \
        --add-dir <tmpdir> \
        <prompt>
 ```
+
+`--verbose` is required by claude CLI 2.1.143+ when `--print` is combined with `--output-format=stream-json`. Without it the CLI produces no transcript output (silent on `--bare`; explicit "Error: ... requires --verbose" on the non-bare path). It does not affect cold-start isolation; it just makes the streaming output actually stream.
 
 `--bare` is load-bearing - it suppresses CLAUDE.md auto-discovery, auto-memory, plugin sync, attribution, and keychain reads. The other flags strip the remaining surfaces.
 

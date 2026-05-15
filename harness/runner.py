@@ -11,6 +11,7 @@ The locked invocation:
            --disable-slash-commands \\
            --print \\
            --output-format stream-json \\
+           --verbose \\
            --add-dir <tmpdir> \\
            <prompt>
 
@@ -492,6 +493,9 @@ def _build_command(
     stream-json, --add-dir <tmpdir>. COLD_START_VERIFICATION.md specifies
     the contract; the pre-merge-check skill verifies it via AST scan.
 
+    Plus ``--verbose`` (CLI 2.1.143+ requirement when --print is combined
+    with --output-format=stream-json; without it the CLI produces no output).
+
     `--model <id>` is additional: it pins the model so CLI defaults can't
     drift across runs. The value is `RunConfig.model`.
 
@@ -514,6 +518,13 @@ def _build_command(
         "--print",
         "--output-format",
         "stream-json",
+        # Claude CLI 2.1.143+ requires --verbose when --print is combined
+        # with --output-format=stream-json; without it, the CLI emits no
+        # transcript output (silent on --bare; "Error: ... requires
+        # --verbose" on the non-bare path). Without this flag the runner
+        # would still exit 0 but produce a 0-byte transcript, which the
+        # merger has no way to distinguish from "agent emitted nothing".
+        "--verbose",
         "--model",
         model,
         "--add-dir",

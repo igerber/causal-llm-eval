@@ -89,6 +89,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fail-closed.
 
 ### Fixed (PR #6)
+- Locked invocation now passes `--verbose` alongside `--print
+  --output-format stream-json`. Claude CLI 2.1.143+ requires this flag
+  combination; without it the CLI produces a 0-byte transcript and
+  exits 0 (silent on `--bare`; explicit "requires --verbose" error on
+  the non-bare path), which the runner cannot distinguish from "agent
+  emitted nothing." `--verbose` does not affect cold-start isolation —
+  it just makes the streaming output actually stream. Verified by
+  `make smoke` against claude 2.1.143.
 - Shim auto-load now uses a `.pth` file (`_pyruntime_shim.pth` containing
   `import _pyruntime_shim`) instead of `sitecustomize.py`. Homebrew's
   `python@3.13` (Feb 2026+) ships a stdlib-level `sitecustomize.py` that
