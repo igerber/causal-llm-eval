@@ -365,6 +365,51 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             f"wrapper or shim not wired correctly; stderr={sentinel_result.stderr!r}"
         )
 
+    # PR #5 R14 P2 (EV-1): parse the events log AFTER the sentinel
+    # subprocess returns and before spawning Claude. Exit 0 alone proves
+    # the python interpreter ran, not that the wrapper + shim actually
+    # emitted their layer-1.5 + layer-2 events. Without this check, a
+    # broken shim install (e.g. site machinery skipped sitecustomize)
+    # would still let the sentinel exit 0 and the agent would launch
+    # against a half-wired attestation chain. The merger's
+    # ``_validate_three_layer_consistency`` would catch it post-hoc, but
+    # the cold-start doc claims a pre-agent guarantee. Enforce it here.
+    runner_pid = os.getpid()
+    sentinel_lines = agent_event_log_path.read_text().splitlines()
+    sentinel_events = [json.loads(line) for line in sentinel_lines if line.strip()]
+    sentinel_exec = next(
+        (
+            e
+            for e in sentinel_events
+            if e.get("event") == "exec_python" and e.get("ppid") == runner_pid
+        ),
+        None,
+    )
+    if sentinel_exec is None:
+        raise RunValidityError(
+            f"build-time sentinel did not emit an exec_python event with "
+            f"ppid={runner_pid} (the runner pid); the layer-1.5 wrapper "
+            f"is not wired. Events seen: {sentinel_events!r}"
+        )
+    sentinel_pid = sentinel_exec.get("pid")
+    if not any(
+        e.get("event") == "session_start" and e.get("pid") == sentinel_pid for e in sentinel_events
+    ):
+        raise RunValidityError(
+            f"build-time sentinel emitted exec_python (pid={sentinel_pid}) "
+            f"but no matching session_start; the layer-2 sitecustomize "
+            f"shim is not loaded. Events seen: {sentinel_events!r}"
+        )
+    if not any(
+        e.get("event") == "session_end" and e.get("pid") == sentinel_pid for e in sentinel_events
+    ):
+        raise RunValidityError(
+            f"build-time sentinel emitted exec_python + session_start "
+            f"(pid={sentinel_pid}) but no matching session_end; the "
+            f"layer-2 atexit hook is not registered. "
+            f"Events seen: {sentinel_events!r}"
+        )
+
     # PR #5 R12 P0: clean_env now sets a sanitized PATH containing only
     # the per-arm venv bin + system bin allowlist. Operator-local
     # directories (~/.cargo/bin, /opt/homebrew/bin, etc.) do NOT leak

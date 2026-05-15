@@ -7,6 +7,7 @@ flow without spawning live agents. Live tests are in test_runner_live.py
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from contextlib import ExitStack, contextmanager
@@ -56,8 +57,52 @@ def _mock_venv_setup():
             (template_dir / "bin" / "python-real").touch()
             return template_dir
 
-        def fake_run(cmd, **_kwargs):
+        def fake_run(cmd, **kwargs):
             del cmd
+            # PR #5 R14 P2 (EV-1): runner now parses the sentinel
+            # events log post-subprocess and requires exec_python +
+            # session_start + session_end with ppid == runner_pid +
+            # matching pid. Write a minimally well-formed sentinel
+            # trace so the mocked sentinel passes the post-subprocess
+            # attestation check.
+            env = kwargs.get("env") or {}
+            log_path = env.get("_PYRUNTIME_EVENT_LOG")
+            if log_path:
+                runner_pid = os.getpid()
+                sentinel_pid = runner_pid + 1
+                with open(log_path, "a") as fh:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "event": "exec_python",
+                                "pid": sentinel_pid,
+                                "ppid": runner_pid,
+                                "ts": "2026-01-01T00:00:00Z",
+                                "executable": "/fake/python-real",
+                                "argv": ["/fake/python-real", "-c", "pass"],
+                            }
+                        )
+                        + "\n"
+                    )
+                    fh.write(
+                        json.dumps(
+                            {
+                                "event": "session_start",
+                                "pid": sentinel_pid,
+                                "argv": ["/fake/python-real", "-c", "pass"],
+                            }
+                        )
+                        + "\n"
+                    )
+                    fh.write(
+                        json.dumps(
+                            {
+                                "event": "session_end",
+                                "pid": sentinel_pid,
+                            }
+                        )
+                        + "\n"
+                    )
             result = MagicMock()
             result.returncode = 0
             result.stdout = b""
@@ -551,3 +596,157 @@ def test_clean_env_path_is_runner_set_not_passthrough(tmp_path, monkeypatch):
     env = clean_env(tmp_path, tmp_path / "events.jsonl")
     assert env["PATH"]  # non-empty (runner-set)
     assert "/usr/bin" in env["PATH"]
+
+
+# -- post-sentinel attestation tests (R14 P2 EV-1) ----------------------------
+
+
+@contextmanager
+def _mock_venv_setup_with_sentinel_writer(write_callback):
+    """Like _mock_venv_setup but lets the test control sentinel event
+    emission via ``write_callback(log_path)``. Use to simulate broken
+    wiring (e.g., wrapper installed but shim missing -> exec_python
+    written, no session_start).
+    """
+    with ExitStack() as stack:
+
+        def fake_build(arm, library_version, template_dir):
+            del arm, library_version
+            template_dir = Path(template_dir)
+            (template_dir / "bin").mkdir(parents=True, exist_ok=True)
+            (template_dir / "bin" / "python").touch()
+            (template_dir / "bin" / "python-real").touch()
+            return template_dir
+
+        def fake_run(cmd, **kwargs):
+            del cmd
+            env = kwargs.get("env") or {}
+            log_path = env.get("_PYRUNTIME_EVENT_LOG")
+            if log_path:
+                write_callback(log_path)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = b""
+            result.stderr = b""
+            return result
+
+        stack.enter_context(patch("harness.runner.build_arm_template", fake_build))
+        stack.enter_context(patch("harness.runner.subprocess.run", fake_run))
+        stack.enter_context(
+            patch(
+                "harness.runner._resolve_claude_executable",
+                return_value="/usr/local/bin/claude",
+            )
+        )
+        yield
+
+
+def test_run_one_raises_when_sentinel_emits_no_exec_python(tmp_path):
+    """R14 P2 (EV-1): sentinel exit 0 alone is not enough; the runner
+    must verify exec_python ppid=runner_pid was emitted before spawning
+    Claude. A broken wrapper install (or missing wrapper) yields a
+    sentinel that runs the real python successfully but writes no
+    layer-1.5 event - this MUST fail-closed pre-spawn.
+    """
+    from harness.shell_parser import RunValidityError
+
+    def write_nothing(_log_path):
+        pass  # leave the events log empty
+
+    with _mock_venv_setup_with_sentinel_writer(write_nothing):
+        with pytest.raises(RunValidityError, match="did not emit an exec_python event"):
+            run_one(_config(), "prompt", tmp_path / "run_out")
+
+
+def test_run_one_raises_when_sentinel_exec_python_lacks_session_start(tmp_path):
+    """R14 P2 (EV-1): wrapper fired but sitecustomize never loaded.
+    The exec_python event is present (layer-1.5 wired) but no
+    session_start (layer-2 broken) - must fail-closed pre-spawn.
+    """
+    from harness.shell_parser import RunValidityError
+
+    def write_exec_only(log_path):
+        with open(log_path, "a") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "event": "exec_python",
+                        "pid": 11111,
+                        "ppid": os.getpid(),
+                        "ts": "2026-01-01T00:00:00Z",
+                        "executable": "/fake/python-real",
+                        "argv": ["/fake/python-real", "-c", "pass"],
+                    }
+                )
+                + "\n"
+            )
+
+    with _mock_venv_setup_with_sentinel_writer(write_exec_only):
+        with pytest.raises(RunValidityError, match="no matching session_start"):
+            run_one(_config(), "prompt", tmp_path / "run_out")
+
+
+def test_run_one_raises_when_sentinel_lacks_session_end(tmp_path):
+    """R14 P2 (EV-1): exec_python + session_start present (layers 1.5
+    and 2 wired at startup) but session_end missing (atexit hook never
+    registered) - must fail-closed pre-spawn.
+    """
+    from harness.shell_parser import RunValidityError
+
+    def write_exec_and_start_only(log_path):
+        sentinel_pid = 22222
+        with open(log_path, "a") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "event": "exec_python",
+                        "pid": sentinel_pid,
+                        "ppid": os.getpid(),
+                        "ts": "2026-01-01T00:00:00Z",
+                        "executable": "/fake/python-real",
+                        "argv": ["/fake/python-real", "-c", "pass"],
+                    }
+                )
+                + "\n"
+            )
+            fh.write(
+                json.dumps(
+                    {
+                        "event": "session_start",
+                        "pid": sentinel_pid,
+                        "argv": ["/fake/python-real", "-c", "pass"],
+                    }
+                )
+                + "\n"
+            )
+
+    with _mock_venv_setup_with_sentinel_writer(write_exec_and_start_only):
+        with pytest.raises(RunValidityError, match="no matching session_end"):
+            run_one(_config(), "prompt", tmp_path / "run_out")
+
+
+def test_run_one_raises_when_sentinel_exec_python_has_wrong_ppid(tmp_path):
+    """R14 P2 (EV-1): an exec_python event whose ppid is not the runner
+    pid is NOT a sentinel (e.g., agent-spawned, or fabricated). Reject.
+    """
+    from harness.shell_parser import RunValidityError
+
+    def write_wrong_ppid(log_path):
+        with open(log_path, "a") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "event": "exec_python",
+                        "pid": 33333,
+                        "ppid": os.getpid() + 12345,  # not the runner pid
+                        "ts": "2026-01-01T00:00:00Z",
+                        "executable": "/fake/python-real",
+                        "argv": ["/fake/python-real", "-c", "pass"],
+                    }
+                )
+                + "\n"
+            )
+
+    with _mock_venv_setup_with_sentinel_writer(write_wrong_ppid):
+        with pytest.raises(RunValidityError, match="did not emit an exec_python event with ppid"):
+            run_one(_config(), "prompt", tmp_path / "run_out")
