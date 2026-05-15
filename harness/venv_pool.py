@@ -206,7 +206,7 @@ for a in "$@"; do
             -S|-S*)
                 # Pre-script -S short flag (or compact form like -Sc, -IS).
                 # Drop the S character entirely; preserve other flags by
-                # rebuilding the token.
+                # rebuilding the argv element.
                 stripped=$(printf '%s' "$a" | sed 's/^-/-/; s/S//g')
                 if [ "$stripped" = "-" ]; then
                     # Was just "-S"; drop entirely.
@@ -221,7 +221,7 @@ for a in "$@"; do
             -*)
                 ;;
             *)
-                # First non-flag token: end of pre-script argv.
+                # First non-flag word ends the pre-script argv region.
                 seen_script=1
                 ;;
         esac
