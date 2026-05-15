@@ -96,10 +96,17 @@ _TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
 _TELEMETRY_MISSING_MARKER = (
     "=== TELEMETRY MISSING: agent_event_log_path did not exist post-exec ==="
 )
+_DESCENDANTS_LIVE_MARKER = (
+    "=== DESCENDANTS LIVE: agent process group had surviving children "
+    "after main process exited; killed via SIGKILL. Telemetry may be "
+    "incomplete (children could have written events between proc.wait() "
+    "and killpg). Run marked invalid. ==="
+)
 # Exit-code sentinels for fatal harness conditions. Distinct from any real
 # CLI exit code so downstream extractors can branch on them.
 EXIT_CODE_TIMEOUT = -1
 EXIT_CODE_TELEMETRY_MISSING = -2
+EXIT_CODE_DESCENDANTS_LIVE = -3
 
 
 @dataclass
@@ -436,6 +443,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
 
     start = time.monotonic()
     timed_out = False
+    descendants_live = False
     with (
         open(transcript_jsonl_path, "w") as stdout_file,
         open(cli_stderr_log_path, "w") as stderr_file,
@@ -467,9 +475,39 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             timed_out = True
     wall_clock_seconds = time.monotonic() - start
 
+    # PR #5 R16 P1 (EV-1): quiesce the spawned process group on the
+    # NORMAL exit path too. A non-timeout proc.wait() returns when
+    # claude itself exits, but background descendants (e.g. an agent
+    # ``Bash`` invocation that did ``nohup python script.py &``) can
+    # outlive claude and continue writing layer-1.5 / layer-2 events
+    # AFTER ``run_one`` moves the event log into ``output_dir``. That
+    # is a real telemetry race: the merger could see a clean record
+    # at finalization time that gets mutated post-hoc by a surviving
+    # child, or the moved log could miss late writes entirely.
+    #
+    # Try ``killpg(SIGKILL)``: if it succeeds, the PG still had
+    # members (descendants existed), the run is INVALID. Mark
+    # ``descendants_live`` and downgrade ``exit_code`` to
+    # ``EXIT_CODE_DESCENDANTS_LIVE`` (only if not already a
+    # sentinel - timeout takes precedence). If it raises
+    # ``ProcessLookupError``, the kernel has already reaped the PG;
+    # clean exit, no action.
+    if not timed_out:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            descendants_live = True
+        except ProcessLookupError:
+            # PG already empty - claude exited cleanly with no surviving
+            # descendants. No action.
+            pass
+
     if timed_out:
         with open(cli_stderr_log_path, "a") as f:
             f.write(_TIMEOUT_MARKER_FMT.format(timeout=config.timeout_seconds) + "\n")
+    elif descendants_live:
+        with open(cli_stderr_log_path, "a") as f:
+            f.write(_DESCENDANTS_LIVE_MARKER + "\n")
+        exit_code = EXIT_CODE_DESCENDANTS_LIVE
 
     # Promote the in-tmpdir event log into output_dir for forensics. A
     # missing file post-exec is fail-closed (R5 P0): the runner touched it

@@ -109,8 +109,22 @@ def _mock_venv_setup():
             result.stderr = b""
             return result
 
+        # PR #5 R16 P1 (EV-1): the runner now calls ``os.killpg`` on
+        # the normal-exit path to quiesce surviving descendants. In the
+        # unit tests the mocked Popen returns a MagicMock whose ``.pid``
+        # is a MagicMock, which Linux/macOS coerces to some arbitrary
+        # pid that the test process is not allowed to signal
+        # (PermissionError). Patch killpg to raise ProcessLookupError
+        # (the "PG already empty" branch) so the mocked normal-exit
+        # path takes the clean branch. Tests that specifically
+        # exercise the descendants-live failure mode override this.
+        def fake_killpg(pid, sig):
+            del pid, sig
+            raise ProcessLookupError("mocked: PG empty in unit test")
+
         stack.enter_context(patch("harness.runner.build_arm_template", fake_build))
         stack.enter_context(patch("harness.runner.subprocess.run", fake_run))
+        stack.enter_context(patch("harness.runner.os.killpg", fake_killpg))
         stack.enter_context(
             patch(
                 "harness.runner._resolve_claude_executable",
@@ -764,3 +778,85 @@ def test_run_one_raises_when_sentinel_exec_python_has_wrong_ppid(tmp_path):
     with _mock_venv_setup_with_sentinel_writer(write_wrong_ppid):
         with pytest.raises(RunValidityError, match="did not emit an exec_python event with ppid"):
             run_one(_config(), "prompt", tmp_path / "run_out")
+
+
+# -- post-wait descendants quiescence tests (R16 P1 EV-1) ---------------------
+
+
+def test_run_one_marks_run_invalid_when_descendants_survive_normal_exit(tmp_path):
+    """R16 P1 (EV-1): if claude exits normally but a background
+    descendant (e.g., agent did ``nohup python script.py &``) is still
+    alive, the runner must kill the process group AND mark the run
+    invalid. Otherwise the surviving child can write events between
+    ``proc.wait()`` returning and the runner moving the event log,
+    silently mutating the per-run record after finalization.
+
+    The mock simulates the descendants-live case by having ``killpg``
+    succeed (return None) instead of raising ``ProcessLookupError``.
+    Production semantics: a successful killpg means the PG had at
+    least one process to kill -> descendants existed.
+    """
+    output_dir = tmp_path / "run_out"
+
+    descendants_live_killpg_calls: list[tuple] = []
+
+    def fake_killpg_success(pid, sig):
+        # killpg succeeds = PG had members = descendants existed.
+        descendants_live_killpg_calls.append((pid, sig))
+        return None
+
+    with ExitStack() as stack:
+        stack.enter_context(_mock_venv_setup())
+        # Override the default ProcessLookupError-raising killpg with
+        # one that succeeds, simulating "descendants existed and were
+        # killed".
+        stack.enter_context(patch("harness.runner.os.killpg", fake_killpg_success))
+        mock_popen = stack.enter_context(patch("harness.runner.subprocess.Popen"))
+        proc = MagicMock()
+        proc.wait.return_value = 0  # normal claude exit
+        mock_popen.return_value = proc
+        result = run_one(_config(), "prompt", output_dir)
+
+    # killpg was called on the normal-exit path (post-wait quiescence).
+    assert descendants_live_killpg_calls, (
+        "killpg was not called on the normal-exit path; the post-wait "
+        "quiescence check did not run"
+    )
+    # Run was marked invalid via the descendants-live exit code sentinel.
+    from harness.runner import EXIT_CODE_DESCENDANTS_LIVE
+
+    assert result.exit_code == EXIT_CODE_DESCENDANTS_LIVE, (
+        f"expected exit_code={EXIT_CODE_DESCENDANTS_LIVE} (descendants live "
+        f"sentinel), got {result.exit_code}"
+    )
+    # Stderr marker written for downstream forensics.
+    stderr_text = result.cli_stderr_log_path.read_text()
+    assert (
+        "DESCENDANTS LIVE" in stderr_text
+    ), f"expected DESCENDANTS LIVE marker in cli_stderr.log; got: {stderr_text!r}"
+
+
+def test_run_one_clean_exit_when_no_descendants_survive(tmp_path):
+    """Default-case mirror: when claude exits cleanly AND no descendants
+    survive (the killpg ProcessLookupError branch), the run finalizes
+    with the real claude exit code, no DESCENDANTS LIVE marker, and the
+    descendants-live sentinel is NOT used. Establishes the baseline
+    invariant for the descendants-live test above.
+    """
+    output_dir = tmp_path / "run_out"
+
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen") as mock_popen:
+        proc = MagicMock()
+        proc.wait.return_value = 42  # arbitrary non-sentinel claude exit code
+        mock_popen.return_value = proc
+        result = run_one(_config(), "prompt", output_dir)
+
+    # The mocked killpg raises ProcessLookupError; runner takes the
+    # clean branch and preserves the real claude exit code.
+    assert (
+        result.exit_code == 42
+    ), f"expected real claude exit code 42 preserved on clean exit; got {result.exit_code}"
+    stderr_text = result.cli_stderr_log_path.read_text()
+    assert (
+        "DESCENDANTS LIVE" not in stderr_text
+    ), f"DESCENDANTS LIVE marker erroneously written on clean exit: {stderr_text!r}"
