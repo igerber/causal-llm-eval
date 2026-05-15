@@ -217,6 +217,36 @@ while [ $i -lt $orig_count ]; do
                 i=$((i + 1))
                 continue
                 ;;
+            -c|-m)
+                # -c CODE / -m MODULE: next token is the script payload.
+                # After this token+arg, remaining args are sys.argv to the
+                # script and must NOT be S-stripped.
+                set -- "$@" "$a"
+                if [ $i -lt $((orig_count - 1)) ]; then
+                    next="$1"
+                    shift
+                    set -- "$@" "$next"
+                    i=$((i + 2))
+                else
+                    i=$((i + 1))
+                fi
+                seen_script=1
+                continue
+                ;;
+            -W|-X)
+                # -W FILTER / -X OPTION: consumes next token verbatim,
+                # but interpreter flag scanning continues afterward.
+                set -- "$@" "$a"
+                if [ $i -lt $((orig_count - 1)) ]; then
+                    next="$1"
+                    shift
+                    set -- "$@" "$next"
+                    i=$((i + 2))
+                else
+                    i=$((i + 1))
+                fi
+                continue
+                ;;
             -*S*)
                 # Pre-script flag containing S in any position
                 # (-S, -Sc, -IS, etc.). Strip S characters; evaluate.
@@ -237,7 +267,7 @@ while [ $i -lt $orig_count ]; do
                 continue
                 ;;
             *)
-                # First non-flag word ends the pre-script argv region.
+                # First non-flag word (script path) ends pre-script region.
                 seen_script=1
                 ;;
         esac

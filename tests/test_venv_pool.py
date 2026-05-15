@@ -130,7 +130,7 @@ def test_build_arm_template_installs_wrapper_for_python_python3_python3X(shared_
         # binary does not.
         first_line = path.read_text(errors="replace").splitlines()[0]
         assert first_line.startswith(
-            "#!/usr/bin/env sh"
+            "#!/bin/sh"
         ), f"{path} does not start with the wrapper shebang; first_line={first_line!r}"
 
 

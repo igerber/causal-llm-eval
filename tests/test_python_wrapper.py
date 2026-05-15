@@ -362,3 +362,87 @@ def test_wrapper_resists_shadowed_awk_in_venv_bin(venv_layout_fake):
     # Real awk produced a real JSON event, not the hijacked output.
     assert evt["event"] == "exec_python"
     assert "argv" in evt
+
+
+def test_strip_s_shim_resists_shadowed_sed_in_venv_bin(venv_layout_fake):
+    """R10 P2 DT-1: agent drops a malicious ``${venv}/bin/sed``. The
+    strip-S shim's internal PATH=/usr/bin:/bin pin prevents the
+    shadow from being used; sed produces the real strip output.
+    """
+    runner_root, venv_dir, canonical_log = venv_layout_fake
+    # Install the strip-S shim properly (replacing the symlink the
+    # fake_venv fixture installed).
+    from harness.venv_pool import _PYTHON_REAL_STRIP_S_SCRIPT
+
+    real_dir = venv_dir / ".pyruntime-real"
+    python_real = real_dir / "python-real"
+    if python_real.exists() or python_real.is_symlink():
+        python_real.unlink()
+    python_real.write_text(_PYTHON_REAL_STRIP_S_SCRIPT)
+    python_real.chmod(0o755)
+    actual = real_dir / ".actual-python"
+    if actual.exists() or actual.is_symlink():
+        actual.unlink()
+    actual.write_text(
+        '#!/bin/sh\nprintf "ARGV:\\n"\nfor a in "$@"; do printf "  [%s]\\n" "$a"; done\n'
+    )
+    actual.chmod(0o755)
+    # Agent shadows venv/bin/sed with a malicious version.
+    bad_sed = venv_dir / "bin" / "sed"
+    bad_sed.write_text("#!/bin/sh\necho '[hijacked]'\nexit 0\n")
+    bad_sed.chmod(0o755)
+    canonical_log.write_text("")
+    result = subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-S", "-c", "pass"],
+        check=True,
+        env={
+            "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(canonical_log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    # Real sed worked: strip-S removed -S; actual-python ran with -c pass argv.
+    # If the malicious sed had been used, "[hijacked]" would be in stdout
+    # AND the strip would not have happened.
+    assert "[-S]" not in result.stdout, "strip-S shim used hijacked sed"
+    assert "[-c]" in result.stdout
+    assert "[pass]" in result.stdout
+
+
+def test_strip_s_shim_does_not_corrupt_dash_c_argument_with_S(venv_layout_fake):
+    """R10 P2 CQ-1: ``python -c "-S"`` -- the literal "-S" is the python
+    code, not an interpreter flag. Strip-S shim must be option-aware so
+    -c's argument passes through verbatim.
+    """
+    runner_root, venv_dir, canonical_log = venv_layout_fake
+    from harness.venv_pool import _PYTHON_REAL_STRIP_S_SCRIPT
+
+    real_dir = venv_dir / ".pyruntime-real"
+    python_real = real_dir / "python-real"
+    if python_real.exists() or python_real.is_symlink():
+        python_real.unlink()
+    python_real.write_text(_PYTHON_REAL_STRIP_S_SCRIPT)
+    python_real.chmod(0o755)
+    actual = real_dir / ".actual-python"
+    if actual.exists() or actual.is_symlink():
+        actual.unlink()
+    actual.write_text(
+        '#!/bin/sh\nprintf "ARGV:\\n"\nfor a in "$@"; do printf "  [%s]\\n" "$a"; done\n'
+    )
+    actual.chmod(0o755)
+    canonical_log.write_text("")
+    result = subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "-S"],
+        check=True,
+        env={
+            "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(canonical_log),
+        },
+        capture_output=True,
+        text=True,
+    )
+    # The "-S" reaches actual-python intact as the -c argument, NOT
+    # stripped by the shim's S-detection.
+    assert "[-c]" in result.stdout
+    assert "[-S]" in result.stdout

@@ -281,9 +281,12 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     # merger keys on RunResult.runner_pid to distinguish the sentinel
     # (ppid == runner_pid) from agent-spawned events (ppid != runner_pid).
     # PATH for the sentinel must include a system bin dir so the wrapper's
-    # ``#!/usr/bin/env sh`` shebang and its calls to ``awk`` / ``date`` /
-    # ``basename`` / ``printf`` resolve. The venv bin is prepended so
-    # ``python`` resolves to the wrapper before reaching system Python.
+    # internal calls to ``awk`` / ``date`` / ``basename`` / ``printf`` /
+    # ``sed`` resolve. (The wrapper itself uses ``#!/bin/sh`` absolute
+    # shebang and pins its internal PATH to ``/usr/bin:/bin``, but the
+    # sentinel subprocess's PATH still needs system bins for the wrapper
+    # to find them.) The venv bin is prepended so ``python`` resolves
+    # to the wrapper before reaching system Python.
     sentinel_path = f"{venv_dir / 'bin'}{os.pathsep}/usr/bin{os.pathsep}/bin"
     sentinel_result = subprocess.run(
         [str(venv_dir / "bin" / "python"), "-c", "pass"],
