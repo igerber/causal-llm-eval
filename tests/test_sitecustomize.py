@@ -129,7 +129,7 @@ def test_session_start_hard_exits_without_env_var(monkeypatch, restore_globals, 
 
     PR #5: the side effects are gated by ``__name__ == "sitecustomize"``,
     so this test must invoke the shim via ``runpy.run_path`` with
-    ``run_name="sitecustomize"`` to exercise the production load path.
+    ``run_name="_pyruntime_shim"`` to exercise the production load path.
     Plain ``importlib.import_module(...)`` no longer fires the gate.
     """
     import runpy
@@ -147,7 +147,7 @@ def test_session_start_hard_exits_without_env_var(monkeypatch, restore_globals, 
 
     monkeypatch.setattr("os._exit", fake_exit)
     with pytest.raises(SystemExit):
-        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="_pyruntime_shim")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -262,7 +262,7 @@ def test_session_start_write_failure_hard_exits(monkeypatch, restore_globals, ca
     monkeypatch.setattr("os._exit", fake_exit)
     monkeypatch.setattr("os.write", boom_write)
     with pytest.raises(SystemExit):
-        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="_pyruntime_shim")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -294,7 +294,7 @@ def test_event_log_open_failure_hard_exits(monkeypatch, restore_globals, capsys,
 
     monkeypatch.setattr("os._exit", fake_exit)
     with pytest.raises(SystemExit):
-        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="_pyruntime_shim")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -722,24 +722,25 @@ def test_template_import_does_not_fire_side_effects_without_run_name(
     assert "[pyruntime]" not in captured.err
 
 
-def test_runpy_with_sitecustomize_name_fires_side_effects(event_log):
-    """PR #5: the dual-path helper uses runpy with run_name="sitecustomize"
-    to fire side effects. Validate the mechanism directly: a session_start
-    event lands in the event log, mirroring production sitecustomize load.
+def test_runpy_with_pyruntime_shim_name_fires_side_effects(event_log):
+    """PR #6: the .pth-based load executes ``import _pyruntime_shim``, which
+    matches the gate ``__name__ == "_pyruntime_shim"`` and fires side effects.
+    Validate the mechanism directly: a session_start event lands in the event
+    log, mirroring production load via the venv's ``_pyruntime_shim.pth``.
     """
     import runpy
 
     sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
-    runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
+    runpy.run_path(str(_TEMPLATE_PATH), run_name="_pyruntime_shim")
     events = _read_events(event_log)
     assert any(e.get("event") == "session_start" for e in events), events
 
 
 def test_runpy_with_other_name_does_not_fire_side_effects(monkeypatch, restore_globals, tmp_path):
-    """Defensive: a runpy invocation with a name other than "sitecustomize"
+    """Defensive: a runpy invocation with a name other than "_pyruntime_shim"
     must NOT fire the gated side effects, even if ``_PYRUNTIME_EVENT_LOG``
-    is set. The gate keys exclusively on ``__name__ == "sitecustomize"``.
+    is set. The gate keys exclusively on ``__name__ == "_pyruntime_shim"``.
     """
     import runpy
 

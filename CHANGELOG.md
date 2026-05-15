@@ -88,6 +88,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `_harness_version` dirty-suffix, `_harness_version` no-repo
   fail-closed.
 
+### Fixed (PR #6)
+- Shim auto-load now uses a `.pth` file (`_pyruntime_shim.pth` containing
+  `import _pyruntime_shim`) instead of `sitecustomize.py`. Homebrew's
+  `python@3.13` (Feb 2026+) ships a stdlib-level `sitecustomize.py` that
+  takes precedence over any `sitecustomize.py` installed in venv
+  site-packages because stdlib comes before site-packages in `sys.path`,
+  silently breaking the layer-2 sitecustomize shim's load. The `.pth`
+  file is processed by Python's site machinery during initialization
+  (BEFORE `execsitecustomize` runs) regardless of whether stdlib has its
+  own sitecustomize, restoring the load. `harness.venv_pool` installs
+  the template as `_pyruntime_shim.py` + `_pyruntime_shim.pth` (no longer
+  as `sitecustomize.py`); the `__name__` gate in
+  `harness/sitecustomize_template.py` matches `_pyruntime_shim`.
+  Verified by `make smoke` against a Homebrew-affected machine.
+
 ### Changed (PR #6)
 - `harness.probe.run_probe()` now materializes a 1-row placeholder
   parquet inside its own output_dir (via the shared

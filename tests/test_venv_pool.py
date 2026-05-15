@@ -5,7 +5,10 @@ tests assert the four installation steps fire correctly:
 
     1. Venv created at ``template_dir``.
     2. Arm library pip-installed at the pinned version.
-    3. ``sitecustomize.py`` copied into ``site-packages``.
+    3. ``_pyruntime_shim.py`` + ``_pyruntime_shim.pth`` installed into
+       ``site-packages`` (PR #6: replaces the prior ``sitecustomize.py``
+       install which loses to Homebrew's stdlib-level sitecustomize on
+       affected systems).
     4. Layer-1.5 ``python_wrapper.sh`` installed as ``python`` / ``python3``
        / ``python3.X``; original interpreter moved to
        ``${venv}/.pyruntime-real/python-real`` (off PATH).
@@ -108,12 +111,27 @@ def test_build_arm_template_installs_correct_library_version(shared_venv):
     assert probe.stdout.strip() == _DIFF_DIFF_VERSION
 
 
-def test_build_arm_template_copies_sitecustomize_into_site_packages(shared_venv):
+def test_build_arm_template_installs_pyruntime_shim_into_site_packages(shared_venv):
+    """PR #6: shim is installed as ``_pyruntime_shim.py`` + ``_pyruntime_shim.pth``
+    rather than ``sitecustomize.py``. The .pth-based load survives Homebrew's
+    stdlib-level ``sitecustomize.py`` (which would otherwise shadow our
+    ``sitecustomize.py`` in venv site-packages because stdlib comes before
+    site-packages in sys.path).
+    """
     site_packages = _site_packages(shared_venv)
-    target = site_packages / "sitecustomize.py"
-    assert target.exists()
+    shim = site_packages / "_pyruntime_shim.py"
+    pth = site_packages / "_pyruntime_shim.pth"
+    assert shim.exists(), f"_pyruntime_shim.py missing under {site_packages}"
+    assert pth.exists(), f"_pyruntime_shim.pth missing under {site_packages}"
     source = Path(__file__).parent.parent / "harness" / "sitecustomize_template.py"
-    assert _file_sha256(target) == _file_sha256(source)
+    assert _file_sha256(shim) == _file_sha256(source)
+    assert pth.read_text() == "import _pyruntime_shim\n"
+    # Defensive: the legacy sitecustomize.py path MUST NOT be installed
+    # alongside the .pth path (would double-instrument and double-emit
+    # session_start events).
+    assert not (
+        site_packages / "sitecustomize.py"
+    ).exists(), "sitecustomize.py should not be installed; .pth-based load is the only path"
 
 
 def test_build_arm_template_installs_wrapper_for_python_python3_python3X(shared_venv):
