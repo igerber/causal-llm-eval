@@ -41,9 +41,15 @@ def test_run_one_attests_across_all_three_layers(tmp_path):
         prompt_version="test_telemetry_live/v1",
         timeout_seconds=300,
     )
+    # Prompt explicitly asks the agent to run Python via Bash so the
+    # live test exercises layer-1 AST + layer-1.5 wrapper + layer-2
+    # sitecustomize end-to-end, not just the build-time sentinel.
     result = run_one(
         config,
-        "Respond with just the word OK and nothing else.",
+        (
+            "Run the bash command `python -c 'print(2+2)'` and report what "
+            "it printed. Then respond with just OK."
+        ),
         output_dir,
     )
 
@@ -58,17 +64,20 @@ def test_run_one_attests_across_all_three_layers(tmp_path):
         for line in result.in_process_events_path.read_text().splitlines()
         if line.strip()
     ]
-    # Layer-1.5 fired at least once (the build-time sentinel).
+    # Layer-1.5 fired at least twice: build-time sentinel + the agent's
+    # python -c invocation.
     exec_events = [e for e in events if e.get("event") == "exec_python"]
-    assert len(exec_events) >= 1, f"no exec_python events in event log: {events}"
+    assert len(exec_events) >= 2, f"expected sentinel + agent exec_python: {events}"
     sentinel_events = [e for e in exec_events if e.get("ppid") == result.runner_pid]
     assert (
         len(sentinel_events) >= 1
     ), f"no sentinel exec_python events (ppid={result.runner_pid}): {exec_events}"
+    agent_events = [e for e in exec_events if e.get("ppid") != result.runner_pid]
+    assert len(agent_events) >= 1, f"no agent-spawned exec_python events: {exec_events}"
 
-    # Layer-2 fired (sitecustomize loaded for the sentinel invocation).
+    # Layer-2 fired for both the sentinel and the agent invocation.
     session_starts = [e for e in events if e.get("event") == "session_start"]
-    assert len(session_starts) >= 1, f"no session_start events in event log: {events}"
+    assert len(session_starts) >= 2, f"expected sentinel + agent session_start: {events}"
 
     # Merger validates end-to-end with runner_pid + venv_path.
     record = merge_layers(

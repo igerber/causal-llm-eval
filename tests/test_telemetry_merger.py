@@ -3736,3 +3736,82 @@ def test_merge_layers_session_argv_with_actual_python_basename_matches(tmp_path)
         venv_path=venv,
     )
     assert record.arm == "diff_diff"
+
+
+def test_merge_layers_relative_venv_bin_python_matches(tmp_path, monkeypatch):
+    """R5 P1: ``venv/bin/python script.py`` (visible relative path
+    against the run cwd) must attribute to the session whose argv[0] is
+    ``${venv}/.pyruntime-real/python-real``. The runner sets
+    cwd=tmpdir and the venv lives at tmpdir/venv, so the relative
+    visible path resolves under venv_path.parent + relative.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["venv/bin/python script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_relative_dot_slash_venv_bin_python_matches(tmp_path):
+    """``./venv/bin/python script.py`` form same as above."""
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["./venv/bin/python script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"
+
+
+def test_merge_layers_relative_venv_bin_python3X_matches(tmp_path):
+    """Same with the python3.X alias."""
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=[exe, "script.py"], pid=12345),
+            _exec_python_event(
+                pid=12345, argv=["python3.11", "script.py"], ppid=22222, executable=exe
+            ),
+        ],
+    )
+    _write_transcript(transcript, ["venv/bin/python3.11 script.py"])
+    record = merge_layers(
+        "diff_diff",
+        transcript,
+        events_path,
+        stderr_log,
+        runner_pid=_DEFAULT_RUNNER_PID,
+        venv_path=venv,
+    )
+    assert record.arm == "diff_diff"

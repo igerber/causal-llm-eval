@@ -60,7 +60,7 @@ def _site_packages(venv_path: Path) -> Path:
     """Return the venv's site-packages directory."""
     probe = subprocess.run(
         [
-            str(venv_path / ".pyruntime-real" / "python-real"),
+            str(venv_path / ".pyruntime-real" / ".actual-python"),
             "-c",
             "import sysconfig; print(sysconfig.get_paths()['purelib'])",
         ],
@@ -78,13 +78,13 @@ def _site_packages(venv_path: Path) -> Path:
 
 def test_build_arm_template_creates_venv_with_python_executable(shared_venv):
     assert (shared_venv / "bin" / "python").exists()
-    assert (shared_venv / ".pyruntime-real" / "python-real").exists()
+    assert (shared_venv / ".pyruntime-real" / ".actual-python").exists()
 
 
 def test_build_arm_template_installs_correct_library_version(shared_venv):
     probe = subprocess.run(
         [
-            str(shared_venv / ".pyruntime-real" / "python-real"),
+            str(shared_venv / ".pyruntime-real" / ".actual-python"),
             "-c",
             "import diff_diff; print(diff_diff.__version__)",
         ],
@@ -162,8 +162,8 @@ def test_build_arm_template_wrapper_emits_exec_python_event(shared_venv, tmp_pat
     # ["-c", "pass"], so argv = ["python", "-c", "pass"]. The argv[1:]
     # tokens are the load-bearing match key the merger uses.
     assert evt["argv"] == ["python", "-c", "pass"]
-    # Wrapper records ``$(dirname "$0")/../.pyruntime-real/python-real``
-    # which has an embedded ``/..``; normalize before comparing.
+    # Wrapper records the path it execs (the strip-S shim at python-real,
+    # not the .actual-python binary one layer deeper).
     assert os.path.normpath(evt["executable"]) == str(
         shared_venv / ".pyruntime-real" / "python-real"
     )

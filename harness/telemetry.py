@@ -1203,13 +1203,18 @@ def _both_under_same_venv_python(session_argv0: str, visible_argv0: str, venv_pa
     """
     venv_root = os.path.normpath(str(venv_path))
     sess_norm = os.path.normpath(session_argv0)
-    vis_norm = os.path.normpath(visible_argv0)
-    # Both paths must be under the venv root.
     if not sess_norm.startswith(venv_root + os.sep):
         return False
-    # Visible may be relative; if so, resolve it against venv_root's parent
-    # only when it starts with the venv directory name. Conservative: require
-    # absolute or already-normalized path prefix.
+    # Visible may be absolute or relative. PR #5 R5 P1: relative visible
+    # paths like ``venv/bin/python`` and ``./venv/bin/python`` resolve
+    # against the run cwd (= venv_path.parent, since the runner sets
+    # cwd=tmpdir and the venv lives at tmpdir/venv). After resolution
+    # the path lands inside the venv root iff the relative form named
+    # the venv's own bin/.
+    if os.path.isabs(visible_argv0):
+        vis_norm = os.path.normpath(visible_argv0)
+    else:
+        vis_norm = os.path.normpath(str(venv_path.parent / visible_argv0))
     if not vis_norm.startswith(venv_root + os.sep):
         return False
     return _is_python_family_basename(Path(sess_norm).name) and _is_python_family_basename(
