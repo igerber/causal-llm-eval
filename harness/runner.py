@@ -128,6 +128,7 @@ class RunConfig:
     dataset_path: Path
     prompt_path: Path
     prompt_version: str
+    rubric_version: str  # registry id (e.g. "case_study_v1"); see graders/ai_judge.py
     model: str = "claude-opus-4-7"
     timeout_seconds: int = 1800
     random_seed: int | None = None
@@ -175,19 +176,36 @@ class RunMetadata:
     """
 
     # Versioning: every layer that influences the per-run record's bytes
-    harness_version: str  # git SHA of causal-llm-eval at run time
+    harness_version: str  # git SHA of causal-llm-eval at run time, optionally suffixed "-dirty"
     library_version: str  # PyPI version (arm 1: diff-diff; arm 2: statsmodels)
     claude_code_version: str  # output of `claude --version`
     model_version: str  # the string passed to claude's --print (e.g. "claude-opus-4-7")
     # Inputs
-    dataset_sha: str  # sha256 of the dataset parquet
+    dataset_sha: str  # sha256 of the dataset parquet (64 hex chars)
     prompt_version: str  # registry id (e.g. "case_study/v1")
-    rubric_version: str  # registry id (e.g. "case_study_v1")
+    rubric_version: str  # registry id (e.g. "case_study_v1"); see graders/ai_judge.py::JudgeResult.rubric_version
     # Stochasticity
-    random_seed: int  # captured per cell for any harness-side randomness
+    random_seed: int | None  # None = no harness-side seed configured for this run; serialized as JSON null
     # Identity
     run_id: str  # ULID or equivalent unique id; primary key for the record
     arm: str  # "diff_diff" or "statsmodels"
+
+    def __post_init__(self) -> None:
+        """Lightweight format validation so a malformed record can't be silently constructed."""
+        import re
+
+        if not re.fullmatch(r"[0-9a-f]{40}(-dirty)?", self.harness_version):
+            raise ValueError(
+                f"harness_version must be 40-hex SHA + optional -dirty: {self.harness_version!r}"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_sha):
+            raise ValueError(
+                f"dataset_sha must be 64-hex sha256: {self.dataset_sha!r}"
+            )
+        if not self.claude_code_version.strip():
+            raise ValueError("claude_code_version must be non-empty")
+        if self.arm not in ("diff_diff", "statsmodels"):
+            raise ValueError(f"arm must be 'diff_diff' or 'statsmodels': {self.arm!r}")
 
 
 def clean_env(

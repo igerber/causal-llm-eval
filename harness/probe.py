@@ -520,6 +520,7 @@ def run_probe(output_dir: Path | None = None, timeout_seconds: int = 300) -> Pro
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="probe/v1",
+        rubric_version="probe/v1",
         timeout_seconds=timeout_seconds,
     )
 

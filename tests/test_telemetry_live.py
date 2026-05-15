@@ -39,6 +39,7 @@ def test_run_one_attests_across_all_three_layers(tmp_path):
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="test_telemetry_live/v1",
+        rubric_version="test_telemetry_live/v1",
         timeout_seconds=300,
     )
     # Prompt explicitly asks the agent to run Python via Bash so the

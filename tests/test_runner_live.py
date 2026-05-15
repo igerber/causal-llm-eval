@@ -30,6 +30,7 @@ def test_run_one_spawns_real_agent_with_trivial_prompt(tmp_path):
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="test_live/v1",
+        rubric_version="test_live/v1",
         timeout_seconds=300,
     )
 

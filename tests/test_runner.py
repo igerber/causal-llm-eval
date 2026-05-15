@@ -19,12 +19,84 @@ import pytest
 from harness.runner import (
     _ALLOWLISTED_PASSTHROUGH_KEYS,
     RunConfig,
+    RunMetadata,
     _build_command,
     _resolve_claude_executable,
     _resolve_claude_invocation_prefix,
     clean_env,
     run_one,
 )
+
+
+_VALID_SHA = "0" * 40
+_VALID_DATASET_SHA = "0" * 64
+
+
+def _metadata(**overrides) -> RunMetadata:
+    """Build a RunMetadata with valid defaults; tests override one field at a time."""
+    from typing import Any
+
+    base: dict[str, Any] = dict(
+        harness_version=_VALID_SHA,
+        library_version="3.3.2",
+        claude_code_version="2.1.142 (Claude Code)",
+        model_version="claude-opus-4-7",
+        dataset_sha=_VALID_DATASET_SHA,
+        prompt_version="case_study/v1",
+        rubric_version="case_study_v1",
+        random_seed=None,
+        run_id="abc123",
+        arm="diff_diff",
+    )
+    base.update(overrides)
+    return RunMetadata(**base)
+
+
+def test_run_config_requires_rubric_version():
+    """RunConfig.rubric_version is REQUIRED — omission is a TypeError."""
+    with pytest.raises(TypeError, match="rubric_version"):
+        RunConfig(  # type: ignore[call-arg]
+            arm="diff_diff",
+            library_version="3.3.2",
+            dataset_path=Path("/dev/null"),
+            prompt_path=Path("/dev/null"),
+            prompt_version="case_study/v1",
+        )
+
+
+def test_run_metadata_post_init_rejects_bad_dataset_sha():
+    with pytest.raises(ValueError, match="dataset_sha must be 64-hex"):
+        _metadata(dataset_sha="not_hex")
+
+
+def test_run_metadata_post_init_rejects_empty_claude_code_version():
+    with pytest.raises(ValueError, match="claude_code_version must be non-empty"):
+        _metadata(claude_code_version="   ")
+
+
+def test_run_metadata_post_init_accepts_dirty_harness_version():
+    md = _metadata(harness_version=_VALID_SHA + "-dirty")
+    assert md.harness_version.endswith("-dirty")
+
+
+def test_run_metadata_post_init_rejects_short_harness_version():
+    with pytest.raises(ValueError, match="harness_version must be 40-hex"):
+        _metadata(harness_version="abc1234")  # 7 chars, not 40
+
+
+def test_run_metadata_post_init_rejects_unknown_arm():
+    with pytest.raises(ValueError, match="arm must be"):
+        _metadata(arm="econml")
+
+
+def test_run_metadata_random_seed_accepts_none():
+    md = _metadata(random_seed=None)
+    assert md.random_seed is None
+
+
+def test_run_metadata_random_seed_accepts_int():
+    md = _metadata(random_seed=42)
+    assert md.random_seed == 42
 
 
 @contextmanager
@@ -416,6 +488,7 @@ def _config(timeout: int = 1800) -> RunConfig:
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="test/v1",
+        rubric_version="test/v1",
         timeout_seconds=timeout,
     )
 
