@@ -64,15 +64,28 @@ _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
 )
 
-# PR #5 R12 P0: sanitized agent PATH. The runner prepends the per-run
-# venv bin (so the agent's ``python`` resolves to the wrapper) and
-# follows with a minimal system-bin allowlist (so utilities like
-# ``ls``, ``cat``, ``find`` resolve). Operator-local directories like
-# ``/opt/homebrew/bin``, ``~/.cargo/bin``, ``~/.local/bin`` are
-# intentionally excluded; an agent that needs an external tool the
-# venv doesn't provide must fail rather than reach into operator state.
+# PR #5 R12 P0 / R15 P1 (EV-2): sanitized agent PATH. The runner
+# prepends the per-run venv bin (so the agent's ``python`` resolves
+# to the wrapper) and follows with a minimal system-bin allowlist
+# (so utilities like ``ls``, ``cat``, ``find`` resolve).
+#
+# Operator-local directories are intentionally excluded:
+#
+#   * ``/opt/homebrew/bin``, ``~/.cargo/bin``, ``~/.local/bin``:
+#     classic operator-installed tool dirs.
+#   * ``/usr/local/bin``: dropped at R15. On macOS Intel Homebrew
+#     (and many developer machines) ``/usr/local/bin`` is the
+#     Homebrew prefix and contains operator-installed Python
+#     shims, CLIs, and project tools. Even on systems where
+#     ``/usr/local/bin`` is conventionally admin-managed, it can
+#     contain locally-built tools the agent should not be able to
+#     resolve. ``ls`` / ``cat`` / ``find`` / ``mkdir`` etc. all
+#     live in ``/usr/bin`` and ``/bin``, which are sufficient for
+#     the cold-start contract.
+#
+# An agent that needs an external tool the venv doesn't provide
+# must fail rather than reach into operator state.
 _AGENT_SYSTEM_PATH_DIRS: tuple[str, ...] = (
-    "/usr/local/bin",
     "/usr/bin",
     "/bin",
     "/usr/sbin",
@@ -185,12 +198,14 @@ def clean_env(
           set from runner-computed values; any inherited operator
           value is IGNORED.
 
-    PR #5 R12 P0: ``PATH`` is RUNNER-SET, not passthrough. The agent
-    receives ``${venv_bin_dir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin``
-    (when ``venv_bin_dir`` is supplied) or just the system bin allowlist
+    PR #5 R12 P0 / R15 P1 (EV-2): ``PATH`` is RUNNER-SET, not
+    passthrough. The agent receives
+    ``${venv_bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin`` (when
+    ``venv_bin_dir`` is supplied) or just the system bin allowlist
     (when it's None - probe / test paths). Operator-local directories
-    (``/opt/homebrew/bin``, ``~/.cargo/bin``, custom shims) are
-    intentionally excluded.
+    (``/opt/homebrew/bin``, ``/usr/local/bin``, ``~/.cargo/bin``,
+    custom shims) are intentionally excluded; see
+    ``_AGENT_SYSTEM_PATH_DIRS`` for the rationale on each.
 
     No prefix scan, no wildcard. Anything not in either tier (XDG_CONFIG_HOME,
     CLAUDE_CONFIG_DIR, AWS/MCP/GitHub env, CODEX_*, etc.) is dropped.

@@ -664,12 +664,30 @@ def _install_production_state() -> None:
     # ``${venv}/bin/python``. Subsequent ``subprocess.Popen``
     # invocations re-enter the wrapper, which records exec_python and
     # exec's the chain again.
+    #
+    # PR #5 R15 P1 (EV-1): ``sys.executable`` is not the only Python
+    # interpreter handle. ``sys._base_executable`` (CPython 3.11+) is
+    # set during venv site initialization to the BASE interpreter
+    # (typically the one outside the per-run venv) and is what
+    # ``venv.EnvBuilder``, ``subprocess`` in some pip / pyenv idioms,
+    # and any agent that does ``subprocess.run([sys._base_executable,
+    # ...])`` will use. Leaving it untouched is an uninstrumented
+    # escape hatch: a child python spawned through it skips the
+    # wrapper, the AST parser sees only the opaque attribute access
+    # (no python invocation in the visible argv), and layer-2
+    # sitecustomize for that child process loads from whatever venv
+    # the base interpreter is in (NOT the per-run venv with our
+    # shim). Rewrite it alongside ``sys.executable`` so all
+    # documented sys-attribute interpreter handles route through the
+    # wrapper.
     _real_executable = sys.executable
     if _real_executable.endswith("/python-real") or _real_executable.endswith("/.actual-python"):
         _venv_root = os.path.dirname(os.path.dirname(_real_executable))
         _wrapper_path = os.path.join(_venv_root, "bin", "python")
         if os.path.exists(_wrapper_path):
             sys.executable = _wrapper_path
+            if hasattr(sys, "_base_executable"):
+                sys._base_executable = _wrapper_path
 
 
 if __name__ == "sitecustomize":

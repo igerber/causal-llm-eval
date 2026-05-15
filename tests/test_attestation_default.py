@@ -242,5 +242,61 @@ def test_default_attestation_sitecustomize_hard_exits_when_env_unset(bare_venv):
     )
 
 
+def test_default_attestation_sitecustomize_rewrites_base_executable(bare_venv, tmp_path):
+    """R15 P1 (EV-1): sitecustomize must rewrite both ``sys.executable``
+    AND ``sys._base_executable`` to the venv's wrapper. Without the
+    base-executable rewrite, agent code that does
+    ``subprocess.Popen([sys._base_executable, ...])`` would skip the
+    layer-1.5 wrapper entirely and the spawned child would run against
+    the operator's base interpreter (no telemetry, no per-run isolation).
+
+    Auto-skips on shadowed systems (Homebrew Python on macOS) because
+    our sitecustomize doesn't load there to perform the rewrite. On
+    clean CI both attributes get rewritten.
+    """
+    shadowing = _detect_shadowing_sitecustomize(bare_venv)
+    if shadowing is not None:
+        pytest.skip(
+            f"host Python ships its own sitecustomize at {shadowing!r}, "
+            f"shadowing the venv shim; the rewrite cannot run."
+        )
+    log_path = tmp_path / "events.jsonl"
+    log_path.touch()
+    expected_wrapper = str(bare_venv / "bin" / "python")
+    # Run python via the wrapper, then have it print both attributes so
+    # we can verify both point at the wrapper.
+    probe = subprocess.run(
+        [
+            str(bare_venv / "bin" / "python"),
+            "-c",
+            "import sys; "
+            "print(sys.executable); "
+            "print(getattr(sys, '_base_executable', '<missing>'))",
+        ],
+        env={
+            "PATH": f"{bare_venv / 'bin'}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "_PYRUNTIME_EVENT_LOG": str(log_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert probe.returncode == 0, f"probe failed: stderr={probe.stderr!r}, stdout={probe.stdout!r}"
+    lines = probe.stdout.strip().splitlines()
+    assert len(lines) == 2, f"expected 2 lines (executable + base_executable), got: {lines!r}"
+    sys_executable, sys_base_executable = lines
+    assert (
+        sys_executable == expected_wrapper
+    ), f"sys.executable={sys_executable!r} not rewritten to wrapper {expected_wrapper!r}"
+    # Skip the base-executable check on Pythons that don't expose it
+    # (pre-3.11). Otherwise it MUST also point at the wrapper.
+    if sys_base_executable != "<missing>":
+        assert sys_base_executable == expected_wrapper, (
+            f"sys._base_executable={sys_base_executable!r} not rewritten to "
+            f"wrapper {expected_wrapper!r} (R15 EV-1 regression: agent could "
+            f"spawn [sys._base_executable, ...] and bypass the layer-1.5 wrapper)"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -575,6 +575,20 @@ def test_clean_env_path_excludes_operator_path(tmp_path, monkeypatch):
     assert "/usr/bin" in env["PATH"]
 
 
+def test_clean_env_path_excludes_usr_local_bin(tmp_path, monkeypatch):
+    """R15 P1 (EV-2): /usr/local/bin is operator-local on macOS Intel
+    Homebrew (and contains operator-installed shims on many other
+    systems). It MUST NOT appear in the agent's sanitized PATH, even
+    if the operator has it set in their own PATH.
+    """
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env = clean_env(tmp_path, tmp_path / "events.jsonl")
+    parts = env["PATH"].split(os.pathsep)
+    assert (
+        "/usr/local/bin" not in parts
+    ), f"/usr/local/bin leaked into agent PATH (R15 EV-2 regression): {env['PATH']!r}"
+
+
 def test_clean_env_path_includes_venv_bin_when_supplied(tmp_path):
     """When venv_bin_dir is supplied, it's PREPENDED to the sanitized
     PATH so the agent's `python` resolves to the wrapper first.

@@ -750,3 +750,47 @@ def test_runpy_with_other_name_does_not_fire_side_effects(monkeypatch, restore_g
     runpy.run_path(str(_TEMPLATE_PATH), run_name="not_sitecustomize")
     # Event log should not exist (gate didn't fire, so the fd open was skipped).
     assert not log_path.exists()
+
+
+def test_install_production_state_rewrites_base_executable(event_log, monkeypatch, tmp_path):
+    """R15 P1 (EV-1): the side-effect block rewrites BOTH ``sys.executable``
+    AND ``sys._base_executable`` to the venv's wrapper. Without the
+    base-executable rewrite, agent code that does
+    ``subprocess.Popen([sys._base_executable, ...])`` skips the
+    layer-1.5 wrapper entirely (the AST parser sees only an opaque
+    attribute access in argv, no python token to flag).
+
+    This test directly fires the gate via ``_install_production_state``
+    after monkey-patching ``sys.executable`` to the venv-real interpreter
+    path the gate expects, then asserts both attributes get rewritten
+    to the wrapper. Independent of host sitecustomize shadowing.
+    """
+    # Build a fake venv layout that the rewrite block recognizes.
+    # The gate looks for sys.executable ending in /python-real or
+    # /.actual-python and walks up two dirs to find the venv root.
+    fake_venv = tmp_path / "fake-venv"
+    (fake_venv / "bin").mkdir(parents=True)
+    (fake_venv / ".pyruntime-real").mkdir(parents=True)
+    real_path = fake_venv / ".pyruntime-real" / ".actual-python"
+    real_path.touch()
+    wrapper_path = fake_venv / "bin" / "python"
+    wrapper_path.touch()
+
+    # Save original sys attrs so the test fixture can restore them.
+    original_executable = sys.executable
+    original_base = getattr(sys, "_base_executable", None)
+    monkeypatch.setattr(sys, "executable", str(real_path))
+    if hasattr(sys, "_base_executable"):
+        monkeypatch.setattr(sys, "_base_executable", original_base or original_executable)
+
+    _import_shim_fresh()
+
+    assert sys.executable == str(
+        wrapper_path
+    ), f"sys.executable={sys.executable!r} not rewritten to wrapper {wrapper_path!r}"
+    if hasattr(sys, "_base_executable"):
+        assert sys._base_executable == str(wrapper_path), (
+            f"sys._base_executable={sys._base_executable!r} not rewritten to "
+            f"wrapper {wrapper_path!r} (R15 EV-1 regression: agent could "
+            f"spawn [sys._base_executable, ...] and bypass the layer-1.5 wrapper)"
+        )
