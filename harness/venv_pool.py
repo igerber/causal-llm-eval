@@ -94,7 +94,10 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
     # operator-home exposure vector where a symlinked ``python-real`` would
     # resolve to ``/opt/homebrew/Cellar/...`` / ``~/.pyenv/...`` / etc.,
     # leaking the operator's interpreter location to the agent.
-    venv.create(str(template_dir), with_pip=True, clear=False, symlinks=False)
+    # PR #5 R8 P2: clear=True so direct callers (not just run_one) can't
+    # accidentally reuse stale venv state. run_one passes a fresh tmpdir
+    # so this is a no-op there; defensive for any future caller.
+    venv.create(str(template_dir), with_pip=True, clear=True, symlinks=False)
 
     # Scrubbed env for pip install: strip operator-set PIP_* / PYTHON*
     # / HOME so the install is reproducible regardless of operator

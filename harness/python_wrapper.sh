@@ -38,7 +38,31 @@ esac
 real_dir="$(cd "${wrapper_dir}/../.pyruntime-real" 2>/dev/null && pwd)"
 real="${real_dir}/python-real"
 
-log="${_PYRUNTIME_EVENT_LOG:-}"
+# PR #5 R8 P0: compute the canonical runner-owned event log path from
+# the wrapper's own location and OVERRIDE any inherited
+# _PYRUNTIME_EVENT_LOG before exec'ing the real interpreter. The
+# runner sets the env var to ``${tmpdir}/.pyruntime/events.jsonl`` and
+# installs the wrapper at ``${tmpdir}/venv/bin/python``, so walking up
+# two directories from wrapper_dir lands at ``${tmpdir}`` and the
+# canonical log path is reachable. This closes the env-retarget bypass
+# class structurally: any agent code that sets
+# ``_PYRUNTIME_EVENT_LOG=/tmp/fake`` (via shell script, Python
+# subprocess env=, etc.) has its mutation overridden by the wrapper
+# before the child's events fire.
+#
+# Fallback: if walking up two directories does not land at a tree
+# containing ``.pyruntime/`` (e.g., the wrapper is invoked outside a
+# production venv layout, like in unit-test fixtures), fall back to
+# the inherited env var. Test-only invocations still work; production
+# always overrides.
+canonical_root="$(cd "${wrapper_dir}/../.." 2>/dev/null && pwd)"
+canonical_log="${canonical_root}/.pyruntime/events.jsonl"
+if [ -d "${canonical_root}/.pyruntime" ]; then
+    export _PYRUNTIME_EVENT_LOG="$canonical_log"
+    log="$canonical_log"
+else
+    log="${_PYRUNTIME_EVENT_LOG:-}"
+fi
 if [ -n "$log" ]; then
     # JSON-encode argv via a single awk invocation. The recorded argv is
     # ``[basename($0), $@]`` so the merger can match on ``argv[1:]``

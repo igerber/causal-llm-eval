@@ -240,3 +240,58 @@ def test_strip_s_shim_strips_S_from_compact_IS_form(fake_venv_with_strip_s_shim)
     # -IS becomes -I; original -IS is gone.
     assert "[-I]" in result.stdout
     assert "[-IS]" not in result.stdout
+
+
+@pytest.fixture
+def venv_layout_fake(tmp_path):
+    """Wrapper at canonical layout: ``${tmp}/venv/bin/python`` with
+    ``${tmp}/.pyruntime/events.jsonl`` as the canonical runner-owned log.
+
+    Triggers the wrapper's canonical-override path so retarget attempts
+    via inherited env are overridden.
+    """
+    runner_root = tmp_path
+    venv_dir = runner_root / "venv"
+    bin_dir = venv_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    real_dir = venv_dir / ".pyruntime-real"
+    real_dir.mkdir()
+    real = real_dir / "python-real"
+    os.symlink("/usr/bin/true", real)
+    runner_log_dir = runner_root / ".pyruntime"
+    runner_log_dir.mkdir()
+    canonical_log = runner_log_dir / "events.jsonl"
+    canonical_log.touch()
+    wrapper = bin_dir / "python"
+    shutil.copyfile(_WRAPPER_SOURCE, wrapper)
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return runner_root, venv_dir, canonical_log
+
+
+def test_wrapper_overrides_inherited_event_log_with_canonical_path(venv_layout_fake):
+    """R8 P0: the wrapper computes the canonical log path from its own
+    location and overrides any inherited ``_PYRUNTIME_EVENT_LOG``. An
+    agent that sets ``_PYRUNTIME_EVENT_LOG=/tmp/fake`` (via shell
+    script, Python subprocess env=, env wrapper, etc.) cannot route the
+    wrapper's events to a non-runner log.
+    """
+    runner_root, venv_dir, canonical_log = venv_layout_fake
+    fake_log = runner_root / "fake.jsonl"
+    subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "pass"],
+        check=True,
+        env={
+            "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+            # Agent attempts to retarget; wrapper must ignore.
+            "_PYRUNTIME_EVENT_LOG": str(fake_log),
+        },
+        capture_output=True,
+    )
+    # Event landed in the canonical runner-owned log, not the agent's
+    # retarget destination.
+    canonical_events = canonical_log.read_text().strip()
+    assert canonical_events, "wrapper did not write to canonical log"
+    evt = json.loads(canonical_events.splitlines()[0])
+    assert evt["event"] == "exec_python"
+    # Fake retarget destination remains empty.
+    assert not fake_log.exists() or fake_log.read_text() == ""
