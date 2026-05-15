@@ -4,7 +4,7 @@
 # Installed by harness.venv_pool._install_python_wrapper. For every invocation
 # of ${venv}/bin/python (or python3, python3.X), this wrapper appends one
 # JSONL ``exec_python`` event to ${_PYRUNTIME_EVENT_LOG} and then ``exec``s
-# the real interpreter at ${venv}/bin/python-real. The event captures the
+# the real interpreter at ${venv}/.pyruntime-real/python-real. The event captures the
 # argv that reached the wrapper plus pid + ppid so the merger can attribute
 # the invocation across the three-layer attestation chain.
 #

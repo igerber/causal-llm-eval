@@ -19,7 +19,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dash / busybox sh / macOS bash 3.2 in POSIX mode). Appends a single
   JSONL `exec_python` event (pid, ppid, ts, executable, argv) to
   `_PYRUNTIME_EVENT_LOG` then `exec`s the real interpreter at
-  `${VENV}/bin/python-real`. Fail-closed (exit 2) on write failure.
+  `${VENV}/.pyruntime-real/python-real`. Fail-closed (exit 2) on write failure.
 - `exec_python` event type in the layer-2 event log schema.
   `harness/telemetry.py` validates required fields (pid, ppid, ts,
   executable, argv) and, when `merge_layers` is called with `venv_path`,
@@ -32,7 +32,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `argv[1:]`. Cardinality is N-to-many on the runtime side (xargs / find /
   parallel can spawn N python children for one layer-1 invocation).
   argv[0] is excluded from the match key (wrapper records basename
-  `python`; sitecustomize records `${venv}/bin/python-real` after exec).
+  `python`; sitecustomize records `${venv}/.pyruntime-real/python-real` after exec).
 - Build-time python sentinel in `harness.runner.run_one`: a direct
   `subprocess.run([${venv}/bin/python, "-c", "pass"])` runs BEFORE the
   `claude --bare` subprocess, with `_PYRUNTIME_EVENT_LOG` set, so the

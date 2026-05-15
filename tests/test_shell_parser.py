@@ -314,10 +314,14 @@ def test_find_python_bypass_invocations_negative(command):
         (["-s", "script.py"], False),  # lowercase
         (["-c", "code"], False),
         (["-", "stdin-mode"], False),
-        # Long flags don't end the interpreter-flag region; -S after a
-        # long flag IS detected (consistent with the original walker).
+        # Long flags don't end the interpreter-flag region.
         (["--config=x", "-S"], True),
-        (["--", "-S"], True),
+        # PR #5 R11 P2: option-aware fixes (mirror strip-S shim semantics):
+        (["--", "-S"], False),  # -- ends options; subsequent -S is argv
+        (["-c", "-S"], False),  # -c CODE; the -S is python code, not flag
+        (["-m", "-S"], False),  # -m MODULE; -S is the module name (rare but valid)
+        (["-W", "ignore", "-S"], True),  # -W consumes ignore, -S still flag
+        (["-X", "dev", "-S"], True),  # -X consumes dev, -S still flag
         # Plain script arg ends the region; -S after script arg is the
         # script's own arg, not an interpreter flag.
         (["script.py", "-S"], False),

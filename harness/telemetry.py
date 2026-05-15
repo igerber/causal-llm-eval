@@ -1343,7 +1343,7 @@ def _validate_three_layer_consistency(
 
     3. **Match key**: ``argv[1:]`` equality. argv[0] differs by construction
        (wrapper records ``argv[0] = "python"`` resolved by PATH; layer-2's
-       ``sys.orig_argv[0]`` is ``${venv}/bin/python-real`` after the
+       ``sys.orig_argv[0]`` is ``${venv}/.pyruntime-real/python-real`` after the
        wrapper's ``exec``). The load-bearing tokens for attribution are
        the script path + flags, not the interpreter.
 

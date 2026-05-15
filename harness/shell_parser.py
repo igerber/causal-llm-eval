@@ -701,27 +701,60 @@ def argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
     """Return True if any pre-script Python interpreter short-flag
     token contains uppercase ``S`` (sitecustomize-disabling flag).
 
+    Option-aware (PR #5 R11 P2): mirrors the strip-S shim's argv
+    handling at ``harness/venv_pool.py::_PYTHON_REAL_STRIP_S_SCRIPT`` so
+    layer-1 / layer-1.5 detection has the same false-positive
+    discipline as the runtime defense.
+
+    Recognized option-argument shapes (consume the next token without
+    scanning it for ``S``):
+      - ``-c`` / ``-m``: next token is the script payload (code or
+        module name); after it, remaining tokens are sys.argv to the
+        script and the interpreter-flag region is over.
+      - ``-W`` / ``-X``: next token is the option argument; flag
+        scanning continues afterward.
+      - ``--``: end-of-options marker; remaining tokens are
+        non-interpreter argv.
+
     Walks tokens left-to-right. A token starting with single ``-`` and
-    at least one alpha char is a short-flag combination (``-S``,
-    ``-Sc``, ``-IS``); scan for uppercase ``S``. ``--`` starts a long
-    flag (ignored). The first non-flag token ends the interpreter-flag
-    region; ``-S`` after that point is an arg to the script, not an
-    interpreter flag.
+    not in the option-arg-consuming set is a short-flag combination
+    (``-S``, ``-Sc``, ``-IS``); scan for uppercase ``S``. The first
+    non-flag token ends the interpreter-flag region; ``-S`` after that
+    point is an arg to the script, not an interpreter flag.
 
     Tokens are already shlex-tokenized by bashlex, so a ``-S``
     substring inside a quoted ``-c`` code argument lives in a single
     token whose first char is not ``-`` and does not flag.
     """
-    for tok in args_tokens:
+    i = 0
+    while i < len(args_tokens):
+        tok = args_tokens[i]
         if not tok:
+            i += 1
             continue
         if tok == "-":
             return False
+        if tok == "--":
+            # End-of-options; subsequent tokens are non-flag argv.
+            return False
+        if tok in ("-c", "-m"):
+            # Consume next token verbatim (script payload); then end of
+            # interpreter-flag region.
+            return False
+        if tok in ("-W", "-X"):
+            # Consume next token verbatim; flag scanning continues.
+            i += 2
+            continue
         if tok.startswith("--"):
+            # Long flag - python has none that contain ``S`` in the
+            # bypass sense; skip.
+            i += 1
             continue
         if tok.startswith("-"):
             if "S" in tok[1:]:
                 return True
+            i += 1
             continue
+        # First non-flag token: end of interpreter-flag region.
         return False
     return False
