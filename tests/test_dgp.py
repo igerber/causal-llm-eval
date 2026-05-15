@@ -18,10 +18,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from harness.dgp import (
-    CASE_STUDY_V1_DGP_VERSION,
     _DGP_CALL_KWARGS,
     _PERSISTED_COLUMNS,
     _PERSISTED_DTYPES,
+    CASE_STUDY_V1_DGP_VERSION,
     generate_case_study_v1,
 )
 
@@ -62,9 +62,15 @@ def test_dgp_truth_json_schema(tmp_path: Path) -> None:
     payload = json.loads((out_dir / "dgp_truth.json").read_text())
 
     required_top_level = {
-        "dgp_version", "generator_function", "diff_diff_version",
-        "seed", "parameters", "ground_truth", "schema",
-        "uncalibrated", "notes",
+        "dgp_version",
+        "generator_function",
+        "diff_diff_version",
+        "seed",
+        "parameters",
+        "ground_truth",
+        "schema",
+        "uncalibrated",
+        "notes",
     }
     assert required_top_level.issubset(payload.keys())
 
@@ -125,11 +131,14 @@ def test_round_trip_dataframe_equals(tmp_path: Path) -> None:
     assert list(df_read.columns) == list(_PERSISTED_COLUMNS)
     # Re-generate the in-memory equivalent and compare column-by-column.
     import diff_diff
+
     df_full = diff_diff.generate_staggered_data(seed=42, **_DGP_CALL_KWARGS)
     df_expected = df_full[list(_PERSISTED_COLUMNS)].copy()
     for col, dtype in _PERSISTED_DTYPES.items():
         df_expected[col] = df_expected[col].astype(dtype)
-    pd.testing.assert_frame_equal(df_read.reset_index(drop=True), df_expected.reset_index(drop=True))
+    pd.testing.assert_frame_equal(
+        df_read.reset_index(drop=True), df_expected.reset_index(drop=True)
+    )
 
 
 def test_dgp_dtypes_pinned(tmp_path: Path) -> None:
@@ -169,4 +178,4 @@ def test_persisted_parquet_excludes_true_effect(tmp_path: Path) -> None:
     parquet = generate_case_study_v1(tmp_path, seed=42)
     df = pd.read_parquet(parquet)
     assert "true_effect" not in df.columns
-    assert "treat" not in df.columns   # also dropped (derivable from first_treat)
+    assert "treat" not in df.columns  # also dropped (derivable from first_treat)

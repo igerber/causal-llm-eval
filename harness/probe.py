@@ -480,6 +480,40 @@ def _extract_final_assistant_text(transcript_path: Path) -> str:
     return last_text
 
 
+_PLACEHOLDER_DF_INIT = {
+    "unit": [0],
+    "period": [0],
+    "outcome": [0.0],
+}
+
+
+def _materialize_placeholder_dataset(output_dir: Path) -> Path:
+    """Write a 1-row placeholder parquet for the probe's dataset_path.
+
+    The probe doesn't consume dataset content; it just needs a real
+    regular file the runner can copy into the agent tmpdir. Bytes are
+    deterministic across probe invocations (we share the helper with
+    ``harness.dgp``) so the placeholder doesn't narrate harness pandas/
+    pyarrow versions to a future probe agent.
+    """
+    import pandas as pd
+
+    from harness.dgp import _deterministic_write_parquet
+
+    placeholder_dir = Path(output_dir) / "probe_dataset"
+    placeholder_dir.mkdir(parents=True, exist_ok=True)
+    placeholder_path = placeholder_dir / "placeholder.parquet"
+    df = pd.DataFrame(
+        {
+            "unit": pd.array(_PLACEHOLDER_DF_INIT["unit"], dtype="int64"),
+            "period": pd.array(_PLACEHOLDER_DF_INIT["period"], dtype="int64"),
+            "outcome": pd.array(_PLACEHOLDER_DF_INIT["outcome"], dtype="float64"),
+        }
+    )
+    _deterministic_write_parquet(df, placeholder_path)
+    return placeholder_path
+
+
 def _default_output_dir() -> Path:
     """Build a unique default probe output dir.
 
@@ -511,13 +545,22 @@ def run_probe(output_dir: Path | None = None, timeout_seconds: int = 300) -> Pro
         output_dir = _default_output_dir()
     output_dir = Path(output_dir)
 
+    # PR #6: the runner now requires a regular-file ``dataset_path``
+    # (rejects /dev/null which is a character device). The probe doesn't
+    # depend on dataset content — it only proves the agent inherits no
+    # operator state — so materialize a 1-row placeholder parquet using
+    # the SHARED deterministic-write helper from ``harness.dgp`` so the
+    # placeholder bytes don't narrate the harness's pandas/pyarrow
+    # version to a probe agent that does ``head -c 1024 data.parquet``.
+    placeholder_path = _materialize_placeholder_dataset(output_dir)
+
     config = RunConfig(
         arm="diff_diff",
         # PR #5: ``library_version`` is consumed by ``build_arm_template``
         # to pip-install the arm library into the per-run venv. The probe
         # uses the same pinned diff-diff version as the main eval surface.
         library_version="3.3.2",
-        dataset_path=Path("/dev/null"),
+        dataset_path=placeholder_path,
         prompt_path=Path("/dev/null"),
         prompt_version="probe/v1",
         rubric_version="probe/v1",

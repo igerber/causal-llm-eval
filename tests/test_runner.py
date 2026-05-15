@@ -7,9 +7,12 @@ flow without spawning live agents. Live tests are in test_runner_live.py
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,7 +29,6 @@ from harness.runner import (
     clean_env,
     run_one,
 )
-
 
 _VALID_SHA = "0" * 40
 _VALID_DATASET_SHA = "0" * 64
@@ -97,6 +99,26 @@ def test_run_metadata_random_seed_accepts_none():
 def test_run_metadata_random_seed_accepts_int():
     md = _metadata(random_seed=42)
     assert md.random_seed == 42
+
+
+@contextmanager
+def _patch_runtime_metadata_helpers():
+    """Patch _harness_version + _claude_version to safe values.
+
+    PR #6: ``run_one`` calls these helpers at the TOP, BEFORE any other
+    mocked subprocess work could intercept them. Tests that exercise
+    pre-spawn code paths (overwrite guards, sentinel checks) need these
+    patches even when they don't otherwise mock the venv build.
+    """
+    with ExitStack() as stack:
+        stack.enter_context(patch("harness.runner._harness_version", return_value="0" * 40))
+        stack.enter_context(
+            patch(
+                "harness.runner._claude_version",
+                return_value="2.1.142 (Claude Code)",
+            )
+        )
+        yield
 
 
 @contextmanager
@@ -202,6 +224,17 @@ def _mock_venv_setup():
             patch(
                 "harness.runner._resolve_claude_executable",
                 return_value="/usr/local/bin/claude",
+            )
+        )
+        # PR #6: ``run_one`` now calls ``_harness_version`` and
+        # ``_claude_version`` at the TOP, BEFORE the mocked
+        # ``subprocess.run`` would intercept them. Patch directly so
+        # the unit suite doesn't require git or a working claude binary.
+        stack.enter_context(patch("harness.runner._harness_version", return_value="0" * 40))
+        stack.enter_context(
+            patch(
+                "harness.runner._claude_version",
+                return_value="2.1.142 (Claude Code)",
             )
         )
         # PR #5 R19 CQ-1: ``_resolve_claude_invocation_prefix`` reads
@@ -481,11 +514,20 @@ def test_resolve_claude_executable_raises_when_not_on_path(tmp_path, monkeypatch
 # -- run_one tests ------------------------------------------------------------
 
 
+_REAL_DATASET = (
+    Path(__file__).resolve().parent.parent / "datasets" / "case_study_v1" / "data.parquet"
+)
+
+
 def _config(timeout: int = 1800) -> RunConfig:
     return RunConfig(
         arm="diff_diff",
         library_version="n/a",
-        dataset_path=Path("/dev/null"),
+        # PR #6: dataset_path must be a regular file (validated pre-tmpdir).
+        # The committed Phase 1 case-study artifact serves as a real-file
+        # placeholder for unit tests; tests that mock subprocess.Popen
+        # don't actually consume the dataset content.
+        dataset_path=_REAL_DATASET,
         prompt_path=Path("/dev/null"),
         prompt_version="test/v1",
         rubric_version="test/v1",
@@ -570,7 +612,7 @@ def test_run_one_pre_spawn_check_raises_on_unwritable_event_log(tmp_path):
     blocker_file.write_text("not a directory")
     output_dir = blocker_file / "subdir"
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _patch_runtime_metadata_helpers(), patch("harness.runner.subprocess.Popen") as mock_popen:
         with pytest.raises((NotADirectoryError, OSError, FileNotFoundError)):
             run_one(_config(), "prompt", output_dir)
         mock_popen.assert_not_called()
@@ -582,7 +624,7 @@ def test_run_one_raises_on_preexisting_transcript(tmp_path):
     output_dir.mkdir()
     (output_dir / "transcript.jsonl").write_text("old transcript line\n")
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _patch_runtime_metadata_helpers(), patch("harness.runner.subprocess.Popen") as mock_popen:
         with pytest.raises(FileExistsError):
             run_one(_config(), "prompt", output_dir)
         mock_popen.assert_not_called()
@@ -594,7 +636,7 @@ def test_run_one_raises_on_preexisting_in_process_events(tmp_path):
     output_dir.mkdir()
     (output_dir / "in_process_events.jsonl").write_text("old event line\n")
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _patch_runtime_metadata_helpers(), patch("harness.runner.subprocess.Popen") as mock_popen:
         with pytest.raises(FileExistsError):
             run_one(_config(), "prompt", output_dir)
         mock_popen.assert_not_called()
@@ -611,7 +653,7 @@ def test_run_one_raises_on_preexisting_cli_stderr_log(tmp_path):
     output_dir.mkdir()
     (output_dir / "cli_stderr.log").write_text("old stderr content\n")
 
-    with patch("harness.runner.subprocess.Popen") as mock_popen:
+    with _patch_runtime_metadata_helpers(), patch("harness.runner.subprocess.Popen") as mock_popen:
         with pytest.raises(FileExistsError):
             run_one(_config(), "prompt", output_dir)
         mock_popen.assert_not_called()
@@ -850,6 +892,14 @@ def _mock_venv_setup_with_sentinel_writer(write_callback):
                 return_value="/usr/local/bin/claude",
             )
         )
+        # PR #6: see _mock_venv_setup; same rationale.
+        stack.enter_context(patch("harness.runner._harness_version", return_value="0" * 40))
+        stack.enter_context(
+            patch(
+                "harness.runner._claude_version",
+                return_value="2.1.142 (Claude Code)",
+            )
+        )
         yield
 
 
@@ -1060,3 +1110,437 @@ def test_run_one_clean_exit_when_no_descendants_survive(tmp_path):
     assert (
         "DESCENDANTS LIVE" not in stderr_text
     ), f"DESCENDANTS LIVE marker erroneously written on clean exit: {stderr_text!r}"
+
+
+# -- PR #6: dataset validation + metadata.json emission ---------------------
+
+
+def _make_real_parquet(path: Path) -> Path:
+    """Create a tiny real parquet file at ``path``. Used by dataset-validation
+    tests that need a regular-file fixture distinct from the committed one."""
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"x": [0]}).to_parquet(path, engine="pyarrow")
+    return path
+
+
+def _config_with_dataset(dataset: Path, timeout: int = 1800) -> RunConfig:
+    return RunConfig(
+        arm="diff_diff",
+        library_version="n/a",
+        dataset_path=dataset,
+        prompt_path=Path("/dev/null"),
+        prompt_version="test/v1",
+        rubric_version="test/v1",
+        timeout_seconds=timeout,
+    )
+
+
+def test_run_one_dataset_symlink_rejected(tmp_path):
+    real = _make_real_parquet(tmp_path / "real.parquet")
+    link = tmp_path / "link.parquet"
+    link.symlink_to(real)
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError, match="symlink"):
+            run_one(_config_with_dataset(link), "prompt", tmp_path / "out")
+
+
+def test_run_one_dataset_directory_rejected(tmp_path):
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError, match="not a regular file"):
+            run_one(_config_with_dataset(tmp_path), "prompt", tmp_path / "out")
+
+
+def test_run_one_dataset_fifo_rejected(tmp_path):
+    fifo = tmp_path / "fifo"
+    try:
+        os.mkfifo(fifo)
+    except (AttributeError, OSError):
+        pytest.skip("os.mkfifo not supported on this platform")
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError, match="not a regular file"):
+            run_one(_config_with_dataset(fifo), "prompt", tmp_path / "out")
+
+
+def test_run_one_dataset_nul_byte_rejected(tmp_path):
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError, match="NUL byte"):
+            run_one(
+                _config_with_dataset(Path("/tmp/foo\x00bar")),
+                "prompt",
+                tmp_path / "out",
+            )
+
+
+def test_run_one_dataset_missing_rejected(tmp_path):
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError, match="does not exist"):
+            run_one(
+                _config_with_dataset(tmp_path / "no_such_file.parquet"),
+                "prompt",
+                tmp_path / "out",
+            )
+
+
+def test_run_one_validates_dataset_before_tmpdir_creation(tmp_path):
+    """Dataset validation runs BEFORE tempfile.mkdtemp, so failures don't leak tmpdirs."""
+    before = set(Path(tempfile.gettempdir()).glob("causal_run_*"))
+    with _patch_runtime_metadata_helpers():
+        from harness.shell_parser import RunValidityError
+
+        with pytest.raises(RunValidityError):
+            run_one(
+                _config_with_dataset(tmp_path / "no_such_file.parquet"),
+                "prompt",
+                tmp_path / "out",
+            )
+    after = set(Path(tempfile.gettempdir()).glob("causal_run_*"))
+    assert after == before, "dataset validation leaked a causal_run_* tmpdir"
+
+
+def test_run_one_copies_dataset_into_tmpdir(tmp_path):
+    """run_one copies dataset_path into <tmpdir>/data.parquet with matching sha."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    src_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+    output_dir = tmp_path / "out"
+
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen") as mock_popen:
+        mock_popen.return_value.wait.return_value = 0
+        mock_popen.return_value.pid = os.getpid()
+        result = run_one(_config_with_dataset(src), "prompt", output_dir)
+
+    assert result.dataset_in_tmpdir_path is not None
+    assert result.dataset_in_tmpdir_path.name == "data.parquet"
+    copied_sha = hashlib.sha256(result.dataset_in_tmpdir_path.read_bytes()).hexdigest()
+    assert copied_sha == src_sha
+
+
+# -- helper-level tests (PR #6 step 5) -----------------------------------------
+
+
+def test_claude_version_failure_raises(monkeypatch):
+    from harness.runner import _claude_version
+    from harness.shell_parser import RunValidityError
+
+    def fake_run(cmd, **kwargs):
+        del cmd, kwargs
+        result = MagicMock()
+        result.returncode = 127
+        result.stdout = ""
+        result.stderr = "claude: command not found"
+        return result
+
+    monkeypatch.setattr("harness.runner.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "harness.runner._resolve_claude_executable",
+        lambda: "/usr/local/bin/claude",
+    )
+    with pytest.raises(RunValidityError, match="exited 127"):
+        _claude_version()
+
+
+def test_claude_version_multiline_strips_to_last_line(monkeypatch):
+    """Last non-empty line wins; deprecation banners + node-engine warnings are dropped."""
+    from harness.runner import _claude_version
+
+    def fake_run(cmd, **kwargs):
+        del cmd, kwargs
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "node deprecation warning\n\n2.1.142 (Claude Code)\n"
+        result.stderr = ""
+        return result
+
+    monkeypatch.setattr("harness.runner.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "harness.runner._resolve_claude_executable",
+        lambda: "/usr/local/bin/claude",
+    )
+    assert _claude_version() == "2.1.142 (Claude Code)"
+
+
+def test_claude_version_no_event_log_inheritance(monkeypatch):
+    """_claude_version's subprocess.run env MUST NOT include _PYRUNTIME_EVENT_LOG."""
+    from harness.runner import _claude_version
+
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", "/tmp/operator_log_should_not_propagate")
+
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        del cmd
+        captured_env.update(kwargs.get("env") or {})
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = "2.1.142 (Claude Code)"
+        result.stderr = ""
+        return result
+
+    monkeypatch.setattr("harness.runner.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "harness.runner._resolve_claude_executable",
+        lambda: "/usr/local/bin/claude",
+    )
+    _claude_version()
+    assert (
+        "_PYRUNTIME_EVENT_LOG" not in captured_env
+    ), f"_claude_version leaked _PYRUNTIME_EVENT_LOG into subprocess env: {captured_env!r}"
+
+
+def _init_tmp_git_repo(repo_root: Path) -> None:
+    """Initialize a tmp git repo with one commit, configured to not require user/email global."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo_root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ],
+        cwd=repo_root,
+        check=True,
+    )
+
+
+def test_git_dirty_suffix(tmp_path, monkeypatch):
+    """_harness_version returns '<sha>-dirty' when working tree has uncommitted changes."""
+    from harness.runner import _harness_version
+
+    repo_root = tmp_path / "fake_repo"
+    _init_tmp_git_repo(repo_root)
+    pkg_dir = repo_root / "harness"
+    pkg_dir.mkdir()
+    fake_runner = pkg_dir / "runner.py"
+    fake_runner.write_text("# fake\n")
+    # Untracked file = dirty
+    monkeypatch.setattr("harness.runner.__file__", str(fake_runner))
+    out = _harness_version()
+    assert out.endswith("-dirty"), f"expected -dirty suffix; got {out!r}"
+    assert len(out) == 40 + len("-dirty")
+
+
+def test_git_no_repo_fails_closed(tmp_path, monkeypatch):
+    from harness.runner import _harness_version
+    from harness.shell_parser import RunValidityError
+
+    not_a_repo = tmp_path / "not_a_repo"
+    pkg_dir = not_a_repo / "harness"
+    pkg_dir.mkdir(parents=True)
+    fake_runner = pkg_dir / "runner.py"
+    fake_runner.write_text("# fake\n")
+    monkeypatch.setattr("harness.runner.__file__", str(fake_runner))
+    with pytest.raises(RunValidityError, match=".git not found"):
+        _harness_version()
+
+
+def test_harness_version_walks_up_to_git(tmp_path, monkeypatch):
+    """_harness_version finds .git when __file__ is several levels deep.
+
+    The walk-up succeeds (no RunValidityError) when .git lives at a
+    parent of __file__. Cleanliness is not the contract here — the
+    presence/absence of `-dirty` depends on whether the test directory
+    has untracked files. We just assert the format is a valid SHA[+-dirty].
+    """
+    import re
+
+    from harness.runner import _harness_version
+
+    repo_root = tmp_path / "deep_repo"
+    _init_tmp_git_repo(repo_root)
+    deep = repo_root / "sub1" / "sub2" / "harness"
+    deep.mkdir(parents=True)
+    fake_runner = deep / "runner.py"
+    fake_runner.write_text("# fake\n")
+    monkeypatch.setattr("harness.runner.__file__", str(fake_runner))
+    out = _harness_version()
+    assert re.fullmatch(r"[0-9a-f]{40}(-dirty)?", out), f"unexpected format: {out!r}"
+
+
+# -- metadata.json emission tests (PR #6 step 6) -------------------------------
+
+
+def _run_one_with_full_mocks(
+    src_dataset: Path,
+    output_dir: Path,
+    *,
+    popen_returncode: int = 0,
+    write_event_log: bool = True,
+    descendants_live: bool = False,
+):
+    """Helper: run run_one() under _mock_venv_setup with a real parquet src.
+
+    Defaults simulate a clean exit. Override to exercise failure paths.
+    """
+    with ExitStack() as stack:
+        stack.enter_context(_mock_venv_setup())
+        mock_popen = stack.enter_context(patch("harness.runner.subprocess.Popen"))
+        mock_popen.return_value.wait.return_value = popen_returncode
+        mock_popen.return_value.pid = os.getpid()
+
+        if descendants_live:
+            # Override the killpg patch in _mock_venv_setup so killpg
+            # SUCCEEDS (== descendants existed), triggering the
+            # descendants_live branch.
+            stack.enter_context(patch("harness.runner.os.killpg", lambda pid, sig: None))
+
+        if not write_event_log:
+            # Override the fake_run in _mock_venv_setup so the sentinel
+            # writes nothing to the agent event log -> after the
+            # subprocess "exits", agent_event_log_path won't exist
+            # because the sentinel writes there but our mock writes
+            # only to the path the runner passes in env. Simpler:
+            # remove the agent log file post-spawn to trigger
+            # telemetry_missing.
+            real_popen_wait = mock_popen.return_value.wait
+
+            def wait_then_remove(*args, **kwargs):
+                rc = real_popen_wait(*args, **kwargs)
+                # Remove the agent event log so promote-step takes
+                # the telemetry-missing branch.
+                for p in Path(tempfile.gettempdir()).glob("causal_run_*/.pyruntime/events.jsonl"):
+                    p.unlink()
+                return rc
+
+            mock_popen.return_value.wait = wait_then_remove
+
+        return run_one(_config_with_dataset(src_dataset), "prompt", output_dir)
+
+
+def test_run_one_writes_metadata_json(tmp_path):
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    src_sha = hashlib.sha256(src.read_bytes()).hexdigest()
+    output_dir = tmp_path / "out"
+
+    result = _run_one_with_full_mocks(src, output_dir)
+
+    assert result.metadata_json_path is not None
+    assert result.metadata_json_path.exists()
+    payload = json.loads(result.metadata_json_path.read_text())
+
+    expected_keys = {
+        "harness_version",
+        "library_version",
+        "claude_code_version",
+        "model_version",
+        "dataset_sha",
+        "prompt_version",
+        "rubric_version",
+        "random_seed",
+        "run_id",
+        "arm",
+    }
+    assert set(payload.keys()) == expected_keys
+    assert payload["dataset_sha"] == src_sha
+    assert payload["rubric_version"] == "test/v1"  # specific value, not just presence
+    assert payload["arm"] == "diff_diff"
+    assert payload["random_seed"] is None  # JSON null when config.random_seed is None
+    assert payload["claude_code_version"] == "2.1.142 (Claude Code)"
+    assert payload["harness_version"] == "0" * 40
+
+
+def test_run_one_refuses_to_overwrite_metadata(tmp_path):
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "metadata.json").write_text("{}\n")
+
+    with _patch_runtime_metadata_helpers(), patch("harness.runner.subprocess.Popen") as mock_popen:
+        with pytest.raises(FileExistsError, match="metadata.json"):
+            run_one(_config_with_dataset(src), "prompt", output_dir)
+        mock_popen.assert_not_called()
+
+
+def test_metadata_json_key_order_stable(tmp_path):
+    """Two clean runs produce metadata.json bodies with identical key order."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    out1 = tmp_path / "out1"
+    out2 = tmp_path / "out2"
+    r1 = _run_one_with_full_mocks(src, out1)
+    r2 = _run_one_with_full_mocks(src, out2)
+    bytes1 = r1.metadata_json_path.read_bytes()
+    bytes2 = r2.metadata_json_path.read_bytes()
+    # run_id is a per-run UUID, so bytes won't be identical. But the KEY ORDER
+    # (sort_keys=True) and structural form should match. Strip values and compare keys.
+    p1 = json.loads(bytes1)
+    p2 = json.loads(bytes2)
+    assert list(p1.keys()) == list(p2.keys())
+    # And every field except run_id matches.
+    for k in p1:
+        if k == "run_id":
+            continue
+        assert p1[k] == p2[k], f"field {k} drifted across runs: {p1[k]!r} vs {p2[k]!r}"
+
+
+def test_metadata_json_round_trips_to_runmetadata(tmp_path):
+    """RunMetadata(**json.loads(metadata.json)) reconstructs an equal dataclass."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+    result = _run_one_with_full_mocks(src, output_dir)
+    payload = json.loads(result.metadata_json_path.read_text())
+    restored = RunMetadata(**payload)
+    # Round-trip again to confirm structural equality.
+    assert dataclasses.asdict(restored) == payload
+
+
+def test_run_one_does_not_emit_metadata_on_timeout(tmp_path):
+    """Timeout exit code (-1) MUST suppress metadata.json emission."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+
+    with _mock_venv_setup(), patch("harness.runner.subprocess.Popen") as mock_popen:
+        # First wait() raises TimeoutExpired (the timeout firing); subsequent
+        # wait() calls in the cleanup branch return 0 (proc has been killed).
+        mock_popen.return_value.wait.side_effect = [
+            subprocess.TimeoutExpired("cmd", 60),
+            0,
+        ]
+        mock_popen.return_value.pid = os.getpid()
+        result = run_one(_config_with_dataset(src), "prompt", output_dir)
+
+    from harness.runner import EXIT_CODE_TIMEOUT
+
+    assert result.exit_code == EXIT_CODE_TIMEOUT
+    assert result.metadata_json_path is None
+    assert not (output_dir / "metadata.json").exists()
+
+
+def test_run_one_does_not_emit_metadata_on_descendants_live(tmp_path):
+    """descendants_live branch MUST suppress metadata.json emission."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+    result = _run_one_with_full_mocks(src, output_dir, descendants_live=True)
+    from harness.runner import EXIT_CODE_DESCENDANTS_LIVE
+
+    assert result.exit_code == EXIT_CODE_DESCENDANTS_LIVE
+    assert result.metadata_json_path is None
+    assert not (output_dir / "metadata.json").exists()
+
+
+def test_run_one_does_not_emit_metadata_on_telemetry_missing(tmp_path):
+    """telemetry_missing branch MUST suppress metadata.json emission."""
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+    result = _run_one_with_full_mocks(src, output_dir, write_event_log=False)
+    from harness.runner import EXIT_CODE_TELEMETRY_MISSING
+
+    assert result.exit_code == EXIT_CODE_TELEMETRY_MISSING
+    assert result.metadata_json_path is None
+    assert not (output_dir / "metadata.json").exists()

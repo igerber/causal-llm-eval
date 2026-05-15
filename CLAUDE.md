@@ -68,7 +68,7 @@ make preflight
 
 6. **Two-stage extraction**: Deterministic (from in-process instrumentation log) for ground-truth signals like estimator class instantiated; AI judge (separate Claude API call) for transcript-derived signals like estimator-choice classification and reasoning. Disagreements flagged for spot-check.
 
-7. **Reproducibility schema**: Per-run records pin library version (PyPI), claude binary version, model id, dataset SHA, prompt version, harness git SHA, random seed. `make case-study-v1` validates re-runs fall within documented tolerances.
+7. **Reproducibility schema**: Per-run records pin library version (PyPI), claude binary version, model id, dataset SHA, prompt version, rubric version, harness git SHA, random seed, run_id, and arm. PR #6 wired emission via `harness.runner.run_one()` writing `output_dir/metadata.json` ON CLEAN EXIT ONLY. `RunMetadata.__post_init__` validates field formats so a malformed record can't be silently constructed. `make case-study-v1` (future) will validate re-runs against documented tolerances using the now-emitted `metadata.json`.
 
 ## Documenting Deviations (AI Review Compatibility)
 

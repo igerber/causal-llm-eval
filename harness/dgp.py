@@ -125,7 +125,9 @@ def _compute_ground_truth(df: pd.DataFrame) -> dict:
     treated_obs = df[df["treated"] == 1].copy()
     treated_obs["event_time"] = treated_obs["period"] - treated_obs["first_treat"]
     effects: dict[str, dict[str, float]] = {}
-    for (onset, et), tau in treated_obs.groupby(["first_treat", "event_time"])["true_effect"].first().items():
+    for (onset, et), tau in (
+        treated_obs.groupby(["first_treat", "event_time"])["true_effect"].first().items()
+    ):
         effects.setdefault(str(int(onset)), {})[str(int(et))] = float(tau)
 
     overall_att = float(treated_obs["true_effect"].mean()) if len(treated_obs) else 0.0
@@ -252,7 +254,9 @@ def _main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("out_dir", type=Path, help="Directory to materialize artifacts into.")
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed (default: 42; the committed-artifact seed).",
     )
     args = parser.parse_args(argv)

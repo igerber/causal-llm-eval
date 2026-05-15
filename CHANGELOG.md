@@ -6,6 +6,103 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (PR #6)
+- `harness/dgp.py`: synthetic data-generating process for the Phase 1
+  case study. Wraps `diff_diff.generate_staggered_data` with locked
+  starter parameters (uncalibrated; calibration loop is the next ROADMAP
+  deliverable). Exposes `generate_case_study_v1(out_dir, seed=42)` plus
+  a CLI entry point (`python -m harness.dgp <out_dir> [--seed N]`). Uses
+  a shared `_deterministic_write_parquet` helper that pins
+  `pyarrow.parquet.write_table` options + strips the pandas/pyarrow
+  metadata blob so two invocations with the same seed produce
+  bit-identical bytes (validated empirically at pyarrow 24.0.0). The
+  helper is also reused by the probe so placeholder bytes don't narrate
+  the harness's pandas/pyarrow versions.
+- `datasets/case_study_v1/{data.parquet, dgp_truth.json, README.md}`:
+  the committed Phase 1 case-study dataset (seed=42). The DGP's
+  `true_effect` ground-truth column is intentionally DROPPED from
+  `data.parquet` to preserve eval validity; ground truth lives only in
+  `dgp_truth.json`. `dgp_truth.json` pins a 2-level shape for
+  `true_effects_per_event_time_per_cohort` (cohort_onset → event_time →
+  tau) so downstream judges/extractors can target a stable schema.
+- `rubrics/case_study_v1.yaml` + `rubrics/README.md` +
+  `prompts/case_study/v1.txt`: stub registry files (with `# STUB ONLY -
+  DO NOT FILL IN PLACE` headers) so `RunConfig.rubric_version` and
+  `RunConfig.prompt_version` resolve to real on-disk files. The v1 IDs
+  are RESERVED for the stub state; PR #7+ should write `*_v2` files
+  rather than editing v1 in place (would silently invalidate any
+  per-run records that reference v1).
+- `RunConfig.rubric_version: str` (REQUIRED — no default). Mirrors
+  `JudgeResult.rubric_version` semantically. Cascaded through
+  `harness/probe.py`, `tests/test_runner.py::_config`, and the live
+  test fixtures.
+- `_harness_version()` helper in `harness/runner.py`: returns the harness
+  git SHA, with a `-dirty` suffix when `git status --porcelain`
+  (untracked included — a stray `.bak` could shadow imports) returns
+  anything. Walks upward from `__file__` to find `.git` so editable
+  installs work. 30s timeout for `git status` on slow disks.
+- `_claude_version()` helper in `harness/runner.py`: returns the last
+  non-empty line of `claude --version` (strips deprecation banners and
+  node-engine warnings that may precede the version string in future CLI
+  releases). Pinned `env={"PATH": os.environ.get("PATH", "")}` so the
+  operator's `_PYRUNTIME_EVENT_LOG` cannot leak into the claude CLI
+  subprocess and write stray events.
+- `_validate_dataset_path()` helper: strict-reject regular-file
+  validation. Catches symlinks via `lstat()` (NOT `stat()`, which
+  follows symlinks). Rejects symlink, directory, device, FIFO, socket,
+  NUL byte in path, and missing files. Runs at the TOP of `run_one()`,
+  BEFORE `tempfile.mkdtemp()`, so failures don't leak tmpdirs.
+- `_copy_dataset_into_tmpdir()` helper: copies the validated dataset
+  into `tmpdir/data.parquet` via `shutil.copy2` (cross-device-safe) and
+  returns the sha256 of the COPIED bytes (the artifact-of-record). The
+  agent reads from `tmpdir/data.parquet` (top-level for relative-path
+  simplicity).
+- `harness.runner.run_one()` now writes `output_dir/metadata.json`
+  ONLY on clean exit (`exit_code == 0` AND `not descendants_live` AND
+  no `telemetry_missing` sentinel). Absence is the signal that the run
+  did not complete cleanly. Fields: harness_version, library_version,
+  claude_code_version, model_version, dataset_sha, prompt_version,
+  rubric_version, random_seed (JSON null when None), run_id, arm. Keys
+  are sort_keys=True + indent=2 for byte-stability across runs.
+- `RunMetadata.__post_init__` validation: `harness_version` matches
+  `[0-9a-f]{40}(-dirty)?`, `dataset_sha` is 64-hex sha256,
+  `claude_code_version` is non-empty, `arm` is `diff_diff` or
+  `statsmodels`. Catches malformed metadata at construction time.
+- `RunResult.dataset_in_tmpdir_path` and `RunResult.metadata_json_path`
+  fields. `metadata_json_path` is `None` on failure paths (matches the
+  on-disk absence).
+- `make dgp` target: `python -m harness.dgp datasets/case_study_v1
+  --seed 42` (regenerates the committed artifact in-place; idempotent
+  given a stable pyarrow version).
+- ~25 new tests in `tests/test_dgp.py` and `tests/test_runner.py`
+  covering: parquet bit-identity (single-platform), seed-changes-bytes
+  sanity, dgp_truth schema shape, committed-vs-regenerated dataset
+  match, dtype pinning, `RunConfig.rubric_version` requiredness,
+  `RunMetadata` post-init validation rules, dataset rejection family
+  (symlink / directory / FIFO / NUL byte / missing), pre-tmpdir
+  validation ordering, metadata.json round-trip, metadata.json key
+  order stability, metadata.json suppression on each failure path
+  (timeout / descendants_live / telemetry_missing), `_claude_version`
+  multi-line stripping, `_claude_version` env hygiene (no
+  `_PYRUNTIME_EVENT_LOG` leak), `_harness_version` `.git` walk-up,
+  `_harness_version` dirty-suffix, `_harness_version` no-repo
+  fail-closed.
+
+### Changed (PR #6)
+- `harness.probe.run_probe()` now materializes a 1-row placeholder
+  parquet inside its own output_dir (via the shared
+  `_deterministic_write_parquet` helper from `harness.dgp`) and passes
+  that path as `RunConfig.dataset_path`, replacing the prior
+  `Path("/dev/null")` placeholder which the new strict-reject runner
+  validation would reject (character device).
+- `RunMetadata.random_seed` annotation: `int` → `int | None`. JSON
+  `null` represents "no harness-side seed configured for this run."
+  Replaces a planned `-1` sentinel that would have collided with
+  realistic future calibrated seeds.
+- `harness.runner.run_one()` overwrite-refusal guard now includes
+  `metadata.json` alongside `transcript.jsonl`,
+  `in_process_events.jsonl`, and `cli_stderr.log`.
+
 ### Added
 - `harness/venv_pool.py::build_arm_template` (was a Phase 0 stub):
   builds a fresh per-run venv at `tmpdir/venv`, pip-installs the arm

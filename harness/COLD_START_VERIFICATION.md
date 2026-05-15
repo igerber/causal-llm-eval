@@ -39,6 +39,18 @@ CLI flags are necessary but not sufficient. The runner also pins:
 
 - **No symlink tricks**: the per-run tmpdir is a real directory containing the dataset, the prompt, and a hidden runner-owned `.pyruntime/` subdirectory holding the in-process telemetry event log (`.pyruntime/events.jsonl`, kept inside tmpdir so its path does not leak the harness repo location via `_PYRUNTIME_EVENT_LOG`). No symlinks back into the operator's homedir.
 
+## Dataset copy + strict regular-file validation (PR #6)
+
+`run_one()` validates `RunConfig.dataset_path` STRICTLY before spawning the agent: regular files only, rejecting symlinks, directories, devices, FIFOs, sockets, and paths containing NUL bytes. Validation runs at the TOP of `run_one()`, BEFORE `tempfile.mkdtemp()`, so a failed validation does NOT leak a tmpdir. The symlink rejection (via `lstat()` rather than `stat()`, which would follow symlinks) is the load-bearing piece of cold-start hygiene here: an operator-home symlink in `dataset_path` would otherwise leak the operator's filesystem into a "cold-start" agent's view.
+
+After validation, `run_one()` copies the dataset into `tmpdir/data.parquet` (top-level for relative-path simplicity from the agent's perspective) via `shutil.copy2`, and computes the sha256 of the COPIED bytes for `metadata.json::dataset_sha`. The agent reads from the in-tmpdir copy, NOT the operator's source path; the source path's filesystem location never appears in the agent's view.
+
+## Per-run reproducibility metadata (PR #6)
+
+After clean exit (`exit_code == 0` AND no `descendants_live` AND no `telemetry_missing` sentinel), `run_one()` writes `output_dir/metadata.json` with the locked reproducibility schema (`harness_version`, `library_version`, `claude_code_version`, `model_version`, `dataset_sha`, `prompt_version`, `rubric_version`, `random_seed`, `run_id`, `arm`). Bytes are deterministic (`json.dump(..., sort_keys=True, indent=2, ensure_ascii=True)`).
+
+Failure paths SUPPRESS the metadata write — absence of `metadata.json` is itself the signal that a run did not complete cleanly enough to be a reproducibility-anchored record. Downstream extractors and the `analysis/reproducibility_check.py` (PR #8+) branch on file presence rather than parsing partial blobs.
+
 ## Inheritance probe
 
 The smoke test runs the agent with a two-layer probe prompt (defined in `harness/probe.py::PROBE_PROMPT`):
