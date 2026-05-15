@@ -513,7 +513,10 @@ def run_probe(output_dir: Path | None = None, timeout_seconds: int = 300) -> Pro
 
     config = RunConfig(
         arm="diff_diff",
-        library_version="n/a",
+        # PR #5: ``library_version`` is consumed by ``build_arm_template``
+        # to pip-install the arm library into the per-run venv. The probe
+        # uses the same pinned diff-diff version as the main eval surface.
+        library_version="3.3.2",
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="probe/v1",

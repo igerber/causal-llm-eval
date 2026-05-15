@@ -26,11 +26,11 @@ def test_run_one_spawns_real_agent_with_trivial_prompt(tmp_path):
     output_dir = tmp_path / "live_run"
     config = RunConfig(
         arm="diff_diff",
-        library_version="n/a",
+        library_version="3.3.2",
         dataset_path=Path("/dev/null"),
         prompt_path=Path("/dev/null"),
         prompt_version="test_live/v1",
-        timeout_seconds=180,
+        timeout_seconds=300,
     )
 
     result = run_one(config, "Respond with just the word OK and nothing else.", output_dir)

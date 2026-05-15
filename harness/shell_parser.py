@@ -76,6 +76,14 @@ _INLINE_PARSER_NAMES = frozenset({"eval"})
 _DASH_C_PARSER_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 
 _PYTHON_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+# PR #5: any ``*-real`` basename matching a python interpreter alias
+# (``python-real``, ``python3-real``, ``python3.11-real``) is treated as a
+# python invocation AND a bypass primitive. The layer-1.5 wrapper renames
+# the venv's real interpreter to ``python-real``; any direct invocation
+# of that name (e.g., ``${venv}/bin/python-real script.py``) skips the
+# wrapper, so the merger has no layer-1.5 attestation for the run. Adding
+# it to bypass detection makes the merger fail closed.
+_PYTHON_REAL_BASENAME_RE = re.compile(r"^python(?:3(?:\.\d+)?)?-real$")
 
 
 def _preprocess(command: str) -> str:
@@ -116,6 +124,21 @@ def _is_python_basename(name: str) -> bool:
     """Match ``python``, ``python3``, ``python3.x``; reject ``pythonw``,
     ``python2``, ``python-config``."""
     return bool(_PYTHON_BASENAME_RE.match(name))
+
+
+def _is_python_real_basename(name: str) -> bool:
+    """Match ``python-real``, ``python3-real``, ``python3.x-real``.
+
+    PR #5: the layer-1.5 wrapper renames the venv's real interpreter to
+    ``python-real`` so the wrapper at ``${venv}/bin/python`` can find it
+    via ``$(dirname "$0")/python-real``. Direct invocation of the real
+    interpreter (e.g., ``${venv}/bin/python-real script.py``) skips the
+    wrapper entirely - no exec_python event fires - which would let an
+    agent bypass layer-1.5 attestation. The parser treats this as both
+    a python invocation (so the AST walker yields it) AND a bypass
+    primitive (so ``find_python_bypass_invocations`` flags the run).
+    """
+    return bool(_PYTHON_REAL_BASENAME_RE.match(name))
 
 
 def _is_literal_word(node) -> bool:
@@ -390,7 +413,7 @@ def _extract_python_argv(command_node) -> Optional[list[str]]:
         w = words[i]
         _assert_literal(w, "command-word" if not after_wrapper else "argv")
         basename = os.path.basename(w.word)
-        if _is_python_basename(basename):
+        if _is_python_basename(basename) or _is_python_real_basename(basename):
             args: list[str] = []
             for p in words[i + 1 :]:
                 _assert_literal(p, "argv")
@@ -462,6 +485,20 @@ def parse_python_invocations(command: str) -> list[list[str]]:
     return out
 
 
+_REAL_INTERPRETER_BYPASS_RE = re.compile(
+    r"\.pyruntime-real\b|\bpython(?:3(?:\.\d+)?)?-real\b|\.actual-python\b"
+)
+# PR #5 R7 P0: substring detection for any visible reference to the
+# shim's event-log env var. Covers delegated retarget forms the AST
+# walker cannot model (``find -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake
+# python ...``, ``xargs -I {} env _PYRUNTIME_EVENT_LOG=...``, etc.).
+# The runner sets ``_PYRUNTIME_EVENT_LOG`` once at agent spawn; any
+# subsequent visible reference to this name in a Bash command IS an
+# attempt to retarget or unset the shim's log destination, regardless
+# of how deeply nested the exec is.
+_PYRUNTIME_EVENT_LOG_REF_RE = re.compile(r"\b_PYRUNTIME_EVENT_LOG\b")
+
+
 def find_python_bypass_invocations(command: str) -> list[str]:
     """Return ``[command]`` if it contains any Python bypass primitive,
     else ``[]``.
@@ -479,10 +516,31 @@ def find_python_bypass_invocations(command: str) -> list[str]:
       - ``.``, ``source``, ``conda activate``, ``pyenv shell`` activation
         command appearing in the same outer command before a Python
         CommandNode: shell activation mutates env (often PATH).
+      - **Any occurrence of ``.pyruntime-real`` or ``python-real`` /
+        ``python3-real`` / ``python3.X-real`` in the visible Bash command**:
+        these tokens reference the layer-1.5 wrapper's hidden real
+        interpreter location. Direct command-word invocation is caught by
+        the AST walker; delegated forms like
+        ``find venv -name python-real -exec {} -S script.py \\;`` keep
+        the token inside a non-CommandNode argv but still trigger this
+        substring check. The merger fails closed regardless of how the
+        agent threaded the reference. (PR #5 R2 P0 #1.)
 
     Raises ShellCommandIndeterminate / ShellCommandParseError per the
     parser's normal contract.
     """
+    # Cheap pre-pass: any reference to the real-interpreter location or
+    # its basename in the visible command is a bypass primitive, even if
+    # the token sits inside a delegated execution argv (find -exec,
+    # xargs, fd -x, parallel) that the AST walker cannot model.
+    if _REAL_INTERPRETER_BYPASS_RE.search(command):
+        return [command]
+    # PR #5 R7 P0: any visible reference to ``_PYRUNTIME_EVENT_LOG`` is
+    # also a bypass primitive. The runner sets this env var once at
+    # agent spawn; the agent has no legitimate reason to mention it.
+    # Catches delegated retarget forms the AST cannot model.
+    if _PYRUNTIME_EVENT_LOG_REF_RE.search(command):
+        return [command]
     nodes = _parse(command)
     has_activation = False
     has_path_mutation = False
@@ -514,12 +572,21 @@ def find_python_bypass_invocations(command: str) -> list[str]:
         argv = _extract_python_argv(cn)
         if argv is None:
             continue
+        # PR #5: any direct invocation of ``python-real`` /
+        # ``python3-real`` / ``python3.X-real`` is a bypass primitive
+        # (skips the layer-1.5 wrapper and the wrapper's exec_python
+        # event emission). The argv[0] is the path the agent invoked;
+        # the basename check catches both ``python-real`` and
+        # ``${venv}/bin/python-real``.
+        if _is_python_real_basename(os.path.basename(argv[0])):
+            out.append(command)
+            break
         if argv_contains_bypass_flag(argv[1:]):
             out.append(command)
             break
         bypass_via_assignment = False
         for k, _value in _prefix_assignments(cn):
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 bypass_via_assignment = True
                 break
         if bypass_via_assignment:
@@ -543,15 +610,19 @@ def _has_arg(command_node, target: str) -> bool:
 
 def _has_path_or_python_assignment_arg(command_node) -> bool:
     """For an `export` CommandNode: True if any arg word's ``KEY=`` prefix
-    matches PATH or PYTHON*. The value may be literal or non-literal
-    (``export PATH=/usr/bin:$PATH``); only the key matters for detection."""
+    matches PATH, PYTHON*, or ``_PYRUNTIME_EVENT_LOG``. The value may be
+    literal or non-literal (``export PATH=/usr/bin:$PATH``); only the
+    key matters for detection. PR #5 R6 P0: ``_PYRUNTIME_EVENT_LOG``
+    retargeting (``export _PYRUNTIME_EVENT_LOG=/tmp/fake``) sends shim
+    events to an attacker-chosen file while the runner-owned log
+    appears empty."""
     for p in command_node.parts:
         if getattr(p, "kind", None) != "word":
             continue
         w = getattr(p, "word", "")
         if "=" in w:
             k, _, _ = w.partition("=")
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 return True
     return False
 
@@ -572,7 +643,7 @@ def _is_assignment_only_path_or_python(command_node) -> bool:
             word = getattr(p, "word", "")
             if "=" in word:
                 k, _, _ = word.partition("=")
-                if k == "PATH" or k.startswith("PYTHON"):
+                if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                     has_target_assignment = True
     return has_target_assignment and not has_word
 
@@ -616,10 +687,11 @@ def _env_wrapper_bypasses_python(command_node) -> bool:
             continue
         if "=" in tok and not tok.startswith("-"):
             k = tok.partition("=")[0]
-            if k == "PATH" or k.startswith("PYTHON"):
+            if k == "PATH" or k.startswith("PYTHON") or k == "_PYRUNTIME_EVENT_LOG":
                 has_primitive = True
             continue
-        if _is_python_basename(os.path.basename(tok)):
+        bn = os.path.basename(tok)
+        if _is_python_basename(bn) or _is_python_real_basename(bn):
             has_python = True
             break
     return has_primitive and has_python
@@ -629,27 +701,71 @@ def argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
     """Return True if any pre-script Python interpreter short-flag
     token contains uppercase ``S`` (sitecustomize-disabling flag).
 
+    Option-aware (PR #5 R11 P2): mirrors the strip-S shim's argv
+    handling at ``harness/venv_pool.py::_PYTHON_REAL_STRIP_S_SCRIPT`` so
+    layer-1 / layer-1.5 detection has the same false-positive
+    discipline as the runtime defense.
+
+    Recognized option-argument shapes (consume the next token without
+    scanning it for ``S``):
+      - ``-c`` / ``-m``: next token is the script payload (code or
+        module name); after it, remaining tokens are sys.argv to the
+        script and the interpreter-flag region is over.
+      - ``-W`` / ``-X``: next token is the option argument; flag
+        scanning continues afterward.
+      - ``--``: end-of-options marker; remaining tokens are
+        non-interpreter argv.
+
     Walks tokens left-to-right. A token starting with single ``-`` and
-    at least one alpha char is a short-flag combination (``-S``,
-    ``-Sc``, ``-IS``); scan for uppercase ``S``. ``--`` starts a long
-    flag (ignored). The first non-flag token ends the interpreter-flag
-    region; ``-S`` after that point is an arg to the script, not an
-    interpreter flag.
+    not in the option-arg-consuming set is a short-flag combination
+    (``-S``, ``-Sc``, ``-IS``); scan for uppercase ``S``. The first
+    non-flag token ends the interpreter-flag region; ``-S`` after that
+    point is an arg to the script, not an interpreter flag.
 
     Tokens are already shlex-tokenized by bashlex, so a ``-S``
     substring inside a quoted ``-c`` code argument lives in a single
     token whose first char is not ``-`` and does not flag.
     """
-    for tok in args_tokens:
+    i = 0
+    while i < len(args_tokens):
+        tok = args_tokens[i]
         if not tok:
+            i += 1
             continue
         if tok == "-":
             return False
+        if tok == "--":
+            # End-of-options; subsequent tokens are non-flag argv.
+            return False
+        if tok in ("-c", "-m"):
+            # Consume next argv element verbatim (script payload); then
+            # end of interpreter-flag region.
+            return False
+        if tok.startswith("-c") or tok.startswith("-m"):
+            # Attached forms ``-cCODE`` / ``-mMODULE`` are also valid; the
+            # rest of the element is the script payload, no extra
+            # consumption.
+            return False
+        if tok in ("-W", "-X"):
+            # Consume next argv element verbatim; flag scanning continues.
+            i += 2
+            continue
+        if tok.startswith("-W") or tok.startswith("-X"):
+            # Attached forms ``-Werror::SomeWarning`` / ``-Xdev`` carry
+            # the option payload in the same argv element. Skip without
+            # scanning the payload for ``S``.
+            i += 1
+            continue
         if tok.startswith("--"):
+            # Long flag - python has none that contain ``S`` in the
+            # bypass sense; skip.
+            i += 1
             continue
         if tok.startswith("-"):
             if "S" in tok[1:]:
                 return True
+            i += 1
             continue
+        # First non-flag word ends the interpreter-flag region.
         return False
     return False

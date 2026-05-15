@@ -515,62 +515,14 @@ class _DiffDiffPostImportHook:
         return spec
 
 
-# Module-load top-level. Resolve and capture the event log path FIRST so
-# subsequent hook events use this captured value, not whatever
-# ``os.environ`` happens to hold when the hook fires (an agent could mutate
-# or unset the env var mid-run; capturing here pins the file the runner
-# owns).
-_initial_path = os.environ.get("_PYRUNTIME_EVENT_LOG")
-if not _initial_path:
-    # Hard exit: Python's site machinery normally catches ordinary
-    # exceptions raised from sitecustomize and continues running. That
-    # would let an agent's Python subprocess start without telemetry
-    # capture, silently. Print to stderr (so the runner / merger can see
-    # the marker via layer-3 or tool_result scan) and terminate the
-    # interpreter immediately.
-    print(
-        "[pyruntime] _PYRUNTIME_EVENT_LOG is unset; sitecustomize cannot "
-        "initialize the runtime event log",
-        file=sys.stderr,
-    )
-    os._exit(2)
-_EVENT_LOG_PATH = _initial_path
-
-# Open the event log fd ONCE at startup and hold it for the lifetime of
-# the interpreter. Resilient to chmod / rename / unlink of the path: the
-# fd refers to the inode, not the pathname, so the agent cannot break
-# later writes by mutating the filesystem entry. If even this initial
-# open fails (path unwritable / parent dir gone), hard-exit so the agent
-# subprocess fails visibly rather than running without telemetry.
-try:
-    _EVENT_LOG_FD = os.open(
-        _EVENT_LOG_PATH,
-        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-        0o644,
-    )
-except OSError as _open_err:
-    print(
-        f"[pyruntime] cannot open event log {_EVENT_LOG_PATH}: {_open_err}",
-        file=sys.stderr,
-    )
-    os._exit(2)
-
-# Now record session_start with full identity. Use the hard-exit
-# variant: if the very first event write fails, sitecustomize's
-# ordinary exception propagation would let Python continue running
-# without hooks (Python's site machinery catches sitecustomize errors
-# and continues). The session_start failure is the same fail-closed
-# class as the hook write failures - leave no path where the agent
-# runs without instrumentation.
-_safe_write(
-    {
-        "event": "session_start",
-        "ts": _utc_iso_now(),
-        "sys_executable": sys.executable,
-        "argv": list(getattr(sys, "orig_argv", sys.argv)),
-        "pid": os.getpid(),
-    }
-)
+# ``_EVENT_LOG_PATH`` and ``_EVENT_LOG_FD`` are declared at module top
+# (lines ~78-79) with sentinel values ("" and -1). The gate below rebinds
+# them when Python's site machinery loads the file as ``sitecustomize``.
+# Tests / docs tooling that import the module as ``harness.sitecustomize_template``
+# see the sentinel values; any call to ``_write_event()`` then OSError's
+# (fd=-1 is invalid) which is the desired fail-closed behavior outside the
+# gated production path.
+_initial_path: str | None = None
 
 
 def _write_session_end() -> None:
@@ -605,23 +557,144 @@ def _write_session_end() -> None:
         pass
 
 
-atexit.register(_write_session_end)
+def _install_production_state() -> None:
+    """Production initialization: env-var check, fd open, session_start
+    emit, atexit register, hook install.
 
-# Resolve the bundled guides directory WITHOUT importing diff_diff. The
-# open-hook below needs this to recognize Path/open reads of guide files;
-# without top-level resolution, reads that happen before `import diff_diff`
-# would silently miss.
-try:
-    _diff_diff_spec = importlib.util.find_spec("diff_diff")
-    if _diff_diff_spec is not None and _diff_diff_spec.origin:
-        from pathlib import Path as _Path  # noqa: F401
+    Called exactly once when Python's site machinery loads the file as
+    ``sitecustomize`` from the per-arm venv's site-packages (via the
+    ``__name__ == "sitecustomize"`` gate below). Also called by test
+    fixtures via ``_import_shim_fresh()`` to fire the side effects on the
+    importlib-imported module's namespace (so classes defined here and
+    instances inserted into ``sys.meta_path`` are the same identity the
+    tests see via ``shim.<attr>`` access).
 
-        _diff_diff_guides_dir = str(_Path(_diff_diff_spec.origin).resolve().parent / "guides")
-except (ImportError, ValueError, AttributeError):
-    pass
+    Idempotent guard: if the meta-path hook is already installed, this
+    is a no-op. Used by tests that may call ``_import_shim_fresh()``
+    multiple times.
+    """
+    global _initial_path, _EVENT_LOG_PATH, _EVENT_LOG_FD, _diff_diff_guides_dir
+    # Resolve and capture the event log path FIRST so subsequent hook events
+    # use this captured value, not whatever ``os.environ`` happens to hold
+    # when the hook fires (an agent could mutate or unset the env var
+    # mid-run; capturing here pins the file the runner owns).
+    _initial_path = os.environ.get("_PYRUNTIME_EVENT_LOG")
+    if not _initial_path:
+        # Hard exit: Python's site machinery normally catches ordinary
+        # exceptions raised from sitecustomize and continues running. That
+        # would let an agent's Python subprocess start without telemetry
+        # capture, silently. Print to stderr (so the runner / merger can
+        # see the marker via layer-3 or tool_result scan) and terminate the
+        # interpreter immediately.
+        print(
+            "[pyruntime] _PYRUNTIME_EVENT_LOG is unset; sitecustomize cannot "
+            "initialize the runtime event log",
+            file=sys.stderr,
+        )
+        os._exit(2)
+    _EVENT_LOG_PATH = _initial_path
 
-# Insert post-import hook at FRONT of meta_path so it beats the default
-# PathFinder for `diff_diff`.
-sys.meta_path.insert(0, _DiffDiffPostImportHook())
-_install_warning_hook()
-_install_open_hook()
+    # Open the event log fd ONCE at startup and hold it for the lifetime of
+    # the interpreter. Resilient to chmod / rename / unlink of the path:
+    # the fd refers to the inode, not the pathname, so the agent cannot
+    # break later writes by mutating the filesystem entry. If even this
+    # initial open fails (path unwritable / parent dir gone), hard-exit so
+    # the agent subprocess fails visibly rather than running without
+    # telemetry.
+    try:
+        _EVENT_LOG_FD = os.open(
+            _EVENT_LOG_PATH,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            0o644,
+        )
+    except OSError as _open_err:
+        print(
+            f"[pyruntime] cannot open event log {_EVENT_LOG_PATH}: {_open_err}",
+            file=sys.stderr,
+        )
+        os._exit(2)
+
+    # Now record session_start with full identity. Use the hard-exit
+    # variant: if the very first event write fails, sitecustomize's
+    # ordinary exception propagation would let Python continue running
+    # without hooks (Python's site machinery catches sitecustomize errors
+    # and continues). The session_start failure is the same fail-closed
+    # class as the hook write failures - leave no path where the agent
+    # runs without instrumentation.
+    _safe_write(
+        {
+            "event": "session_start",
+            "ts": _utc_iso_now(),
+            "sys_executable": sys.executable,
+            "argv": list(getattr(sys, "orig_argv", sys.argv)),
+            "pid": os.getpid(),
+        }
+    )
+
+    atexit.register(_write_session_end)
+
+    # Resolve the bundled guides directory WITHOUT importing diff_diff. The
+    # open-hook below needs this to recognize Path/open reads of guide
+    # files; without top-level resolution, reads that happen before
+    # `import diff_diff` would silently miss.
+    try:
+        _diff_diff_spec = importlib.util.find_spec("diff_diff")
+        if _diff_diff_spec is not None and _diff_diff_spec.origin:
+            from pathlib import Path as _Path  # noqa: F401
+
+            _diff_diff_guides_dir = str(_Path(_diff_diff_spec.origin).resolve().parent / "guides")
+    except (ImportError, ValueError, AttributeError):
+        pass
+
+    # Insert post-import hook at FRONT of meta_path so it beats the default
+    # PathFinder for `diff_diff`.
+    sys.meta_path.insert(0, _DiffDiffPostImportHook())
+    _install_warning_hook()
+    _install_open_hook()
+
+    # PR #5 R1: route ``subprocess.Popen([sys.executable, ...])`` and
+    # equivalent child-spawn idioms through the layer-1.5 wrapper rather
+    # than the real interpreter. After exec'ing through the wrapper +
+    # strip-S shim chain, the real python initializes ``sys.executable``
+    # to the path the kernel exec'd: either
+    # ``${venv}/.pyruntime-real/python-real`` (R1 single-stage layout)
+    # or ``${venv}/.pyruntime-real/.actual-python`` (R3 two-stage
+    # strip-S layout). Either way, walk up two directory levels to find
+    # the venv root, then rewrite ``sys.executable`` to the wrapper at
+    # ``${venv}/bin/python``. Subsequent ``subprocess.Popen``
+    # invocations re-enter the wrapper, which records exec_python and
+    # exec's the chain again.
+    #
+    # PR #5 R15 P1 (EV-1): ``sys.executable`` is not the only Python
+    # interpreter handle. ``sys._base_executable`` (CPython 3.11+) is
+    # set during venv site initialization to the BASE interpreter
+    # (typically the one outside the per-run venv) and is what
+    # ``venv.EnvBuilder``, ``subprocess`` in some pip / pyenv idioms,
+    # and any agent that does ``subprocess.run([sys._base_executable,
+    # ...])`` will use. Leaving it untouched is an uninstrumented
+    # escape hatch: a child python spawned through it skips the
+    # wrapper, the AST parser sees only the opaque attribute access
+    # (no python invocation in the visible argv), and layer-2
+    # sitecustomize for that child process loads from whatever venv
+    # the base interpreter is in (NOT the per-run venv with our
+    # shim). Rewrite it alongside ``sys.executable`` so all
+    # documented sys-attribute interpreter handles route through the
+    # wrapper.
+    _real_executable = sys.executable
+    if _real_executable.endswith("/python-real") or _real_executable.endswith("/.actual-python"):
+        _venv_root = os.path.dirname(os.path.dirname(_real_executable))
+        _wrapper_path = os.path.join(_venv_root, "bin", "python")
+        if os.path.exists(_wrapper_path):
+            sys.executable = _wrapper_path
+            if hasattr(sys, "_base_executable"):
+                sys._base_executable = _wrapper_path
+
+
+if __name__ == "sitecustomize":
+    # Production path: Python's site machinery loads this file as
+    # ``sitecustomize`` from the per-arm venv's site-packages. Fire the
+    # production state install exactly once. Tests / docs tooling that
+    # import the module as ``harness.sitecustomize_template`` skip this
+    # block and call ``_install_production_state()`` explicitly via
+    # ``_import_shim_fresh()``.
+    _install_production_state()

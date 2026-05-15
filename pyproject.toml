@@ -62,6 +62,13 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["harness*", "graders*", "analysis*"]
 
+[tool.setuptools.package-data]
+# PR #5: ship the layer-1.5 ``python_wrapper.sh`` shim with the wheel /
+# sdist so ``harness.venv_pool.build_arm_template`` can copy it into the
+# per-arm venv. Without this declaration, the shell script is omitted
+# from non-editable installs and venv build fails outside source checkouts.
+harness = ["python_wrapper.sh"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Slow and live tests are excluded by default at the addopts level so plain

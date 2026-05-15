@@ -87,7 +87,7 @@ The merger validates Python invocations through three independent layers:
 
 ```
 Layer 1   (text):    AST walk of the agent's Bash command
-Layer 1.5 (exec):    per-arm-venv python wrapper           [PR #5]
+Layer 1.5 (exec):    per-arm-venv python wrapper
 Layer 2   (in-proc): sitecustomize event log
 ```
 
@@ -104,7 +104,39 @@ This architecture is principled rather than enumeration-based - the failure mode
 
 Both subclasses inherit from `RunValidityError`. Callers catching the parent unify fail-closed handling across layer-1 (parser-side) and layer-2/3 (`TelemetryMergeError`) failure modes. The parent name is neutral so methodology surfaces do not telegraph the specific check that fired.
 
-PR #5 will add Layer 1.5 (a per-arm-venv `python` wrapper that records exec-time invocations), giving the merger an independent attestation that the static parser can cross-check against.
+## Layer-1.5 attestation architecture
+
+Layer 1.5 is implemented as a POSIX shell wrapper (`harness/python_wrapper.sh`) installed in every per-arm venv by `harness.venv_pool._install_python_wrapper`. The original interpreter is moved to `${venv}/.pyruntime-real/python-real` - a non-PATH location outside `bin/` so an agent cannot type `python-real` to bypass the wrapper. Each of `python`, `python3`, and `python3.X` in `bin/` becomes a copy of the wrapper script. Any `python` invocation in the venv routes through the wrapper before reaching the real interpreter at `${venv}/.pyruntime-real/python-real`.
+
+For every invocation, the wrapper:
+
+1. JSON-encodes the entire argv array via a single `awk` pass (handles `\b \f \n \r \t \" \\` control-char escapes; portable across mawk / gawk / busybox awk).
+2. Appends one JSONL `exec_python` event (`pid`, `ppid`, `ts`, `executable`, `argv`) to `${_PYRUNTIME_EVENT_LOG}` via `>>` (O_APPEND atomic for writes under PIPE_BUF, typically 4 KiB).
+3. `exec`s `${venv}/.pyruntime-real/python-real` with the original argv, transferring control to the real interpreter with no further wrapper overhead.
+
+Fail-closed semantics match the layer-2 shim: `exit 2` on append failure (unwritable log path), and the event-write step is skipped entirely when `_PYRUNTIME_EVENT_LOG` is unset (in which case layer-2 sitecustomize will independently hard-exit, so the spawned interpreter still fails closed). NUL bytes in argv cannot occur in POSIX argv by the `execve` contract; the wrapper does not implement awk-level NUL detection (BSD awk behavior is unreliable).
+
+The merger validates layer-1.5 events against the run's venv-root-anchored allowlist: `executable` MUST equal `${venv}/.pyruntime-real/python-real` (normalized via `os.path.normpath` to handle the wrapper's literal `bin/../.pyruntime-real/python-real` form). Forged executables outside the run's venv root fail schema validation. Additionally, any visible Bash command that references `.pyruntime-real` or a `python*-real` token by name is flagged as a bypass primitive (catches `find venv -name python-real -exec {} -S script.py \;` and similar delegated forms the AST walker cannot model).
+
+## Build-time python sentinel
+
+After `build_arm_template` returns, `run_one` invokes a direct `subprocess.run([${venv}/bin/python, "-c", "pass"])` with `_PYRUNTIME_EVENT_LOG` set, BEFORE spawning the `claude --bare` agent subprocess. This sentinel:
+
+- Produces exactly one `exec_python` event (from the wrapper) plus one `session_start` event (from sitecustomize) in the event log, proving wrapper + shim are wired before any agent code runs.
+- Has `ppid == runner_pid` (the wrapper records the immediate parent, which is the runner's `subprocess.run`).
+
+The merger's three-layer cross-check uses `ppid == runner_pid` as a binary partition between sentinel and agent events. Sentinel events satisfy the "≥1 exec_python required" demand even for shell-only agent runs that never invoke python. Agent-spawned exec_python events (`ppid != runner_pid`) match layer-1 AST-extracted python invocations by `argv[1:]` equality (argv[0] differs by construction: wrapper records basename `python`, sitecustomize records `${venv}/.pyruntime-real/python-real`). A reciprocal pid check ensures every session_start has a matching exec_python and vice versa, so an agent that directly executes the real interpreter (bypassing the wrapper) leaves a session_start with no exec_python pair and fails closed.
+
+## Per-arm venv build (PR #5)
+
+`harness.venv_pool.build_arm_template(arm, library_version, template_dir)` builds a fresh per-run venv:
+
+1. `venv.create(template_dir, with_pip=True)` materializes the venv with pip.
+2. `${venv}/bin/python -m pip install <arm-pkg>==<library_version>` installs the arm library at the pinned PyPI version (`diff-diff==3.3.2` today; `statsmodels` is deferred to PR #7).
+3. `_install_shim_into_venv` copies `harness/sitecustomize_template.py` into the venv's `site-packages` as `sitecustomize.py`. Python's site machinery auto-loads it on every interpreter start.
+4. `_install_python_wrapper` installs the layer-1.5 wrapper (see above).
+
+Phase 1 builds a fresh venv per run (~10-30s per build). Phase 2 (PR #6+) replaces this with `clone_for_run`: build the template once per pytest session / per cell, then clone-per-run cuts the cost to <1s.
 
 ## CI gate
 
@@ -130,3 +162,100 @@ The pre-merge-check skill (Section 2.1) runs an AST-based scan for required cold
 | Operator cwd | Spawn site uses `cwd=<run tmpdir>`, not the harness repo; probe confirms `pwd` is the tmpdir |
 
 This file is updated when a new surface is identified that the probe should check.
+
+## Telemetry-bypass threat model (PR #5)
+
+The eval measures whether agents on causal-inference tasks discover and use library-level guidance surfaces. Telemetry completeness is a means to that end, not the eval's research question. This section delineates which bypass classes the merger must defeat (because they affect realistic measurement) and which are out-of-scope (because they require deliberate adversarial behavior we do not study).
+
+**In-scope (defended structurally):**
+
+1. **Direct invocation of a hidden interpreter via wrapper bypass**: any agent typing `python` / `python3` / `python3.X` is PATH-routed to the layer-1.5 wrapper at `${venv}/bin/python*`, which records `exec_python` and execs the strip-S shim at `${venv}/.pyruntime-real/python-real`.
+2. **`-S` flag bypass on the strip-S shim**: the shim removes `-S` (and compact forms `-Sc` / `-IS`) from pre-script argv before exec'ing the actual CPython binary at `${venv}/.pyruntime-real/.actual-python`. Sitecustomize loads regardless of how the shim was invoked.
+3. **Direct invocation of `python-real` or `.actual-python` (path-qualified)**: substring detection in `harness/shell_parser.py::find_python_bypass_invocations` flags any visible Bash command containing `.pyruntime-real`, `python*-real`, or `.actual-python` as a bypass primitive; the merger fails closed.
+4. **Delegated forms that name the bypass tokens** (`find venv -name python-real -exec {} -S \;`, `xargs -I {} {} -S`): same substring detection.
+5. **Reciprocal pid check**: every `session_start` MUST have a matching `exec_python` by pid and vice versa. An agent that bypasses the wrapper but reaches the strip-S shim still loads sitecustomize → session_start fires without exec_python → fail closed.
+
+**Out-of-scope (documented limitation):**
+
+**Deviation from plan:** the original PR #5 plan called for the layer-1.5 wrapper + substring detection to close ALL delegated python execution. The wildcard hidden-binary case below is a residual class that requires deliberate adversarial intent to construct; closing it structurally would require OS-level mechanisms (see "Out-of-scope structural defenses" below). This deviation is intentional and the residual is documented per-class with rationale.
+
+A determined adversarial agent that constructs a wildcard delegated execution like
+
+```
+find venv -type f -perm -111 ! -path '*/bin/*' ! -path '*/.pyruntime-real/*' \
+    -exec {} -S script.py \;
+```
+
+could in principle find an executable file outside the substring-detection paths and execute it with `-S`. In our deployment, the only such file is `${venv}/.pyruntime-real/.actual-python`, and the `! -path '*/.pyruntime-real/*'` exclusion above would skip it. A more aggressive form
+
+```
+find / -type f -name '.actual-python' -exec {} -S script.py \;
+```
+
+contains the `.actual-python` substring and is caught by the existing detection. The residual bypass class is filesystem enumeration that targets the hidden binary by `-perm` or other characteristics that do not name the file. This requires:
+
+1. Deliberate adversarial intent (the agent is constructing obscure find patterns specifically to evade telemetry, not solving the eval task).
+2. Use of `-S` to suppress sitecustomize (otherwise sitecustomize loads and the reciprocal pid check catches the missing exec_python).
+3. Reaching `.actual-python` via a `find` form that does not lexically reference any of the bypass tokens.
+
+Realistic agents working on causal-inference tasks do not exhibit this behavior. Successful adversarial bypass produces an event log identical in shape to "agent did not invoke python at all" (no session_start, no exec_python beyond the build-time sentinel). Both populations produce a clean `TelemetryRecord` with `opened_llms_*=False` and `called_get_llm_guide=False`, which is the correct measurement for both: agents that did not engage with Python (or actively evaded measurement) did not discover Python-level guidance surfaces.
+
+The merger does not (and cannot) distinguish "agent did no python" from "agent ran python adversarially with -S via filesystem enumeration": these are observably equivalent under the layered defense. This is a property of measurement, not a defect: behaviors that produce no events cannot be observed. The eval's interpretation - "agent did not discover/use these surfaces" - is correct for both cases.
+
+**Out-of-scope structural defenses (deferred):**
+
+- OS-level mechanisms (setuid, namespaces, seccomp filters): would close the residual class but require privileged setup and platform-specific code.
+- Custom CPython build with site.py forcibly enabled: would eliminate `-S` as a bypass vector at the source but requires per-platform build infrastructure.
+
+Both are larger than the eval's research question warrants.
+
+**Out-of-scope: session-detached descendants (PR #5 R16/R17):**
+
+**Deviation from plan:** PR #5 R16 added post-wait `os.killpg` quiescence to close the same-process-group descendant case. The session-detached case (`setsid`, `daemonize`, `os.setsid()`) requires a structurally different defense (process supervision outside the original group, or shell-parser detection of detachment primitives that cannot cover the in-process variant). Closing it is deferred to a future PR if the threat model changes; documented out-of-scope per-class with rationale below.
+
+`run_one()` puts Claude in a new process group via `start_new_session=True` and, on both timeout and normal exit paths, sends `SIGKILL` to the entire group. This catches descendants spawned via the standard `fork()`/`exec()` chain (e.g., agent `Bash` invocations of `python script.py &`, where the backgrounded process inherits the original process group). It does NOT catch descendants that explicitly detach from the process group:
+
+- `setsid python script.py &` (Bash creates a new session for the child)
+- A Python child that calls `os.setsid()` after fork
+- `nohup` combined with a session-creating call
+- `daemonize` library invocations
+- `disown` after a `setsid`-style detach
+
+A determined adversarial agent that constructs these forms can produce a child process that survives `os.killpg(proc.pid, SIGKILL)` (the call raises `ProcessLookupError` because the child is no longer in the original group), and can write events between `proc.wait()` returning and the runner moving the event log into the final artifact path. The detached child would appear in the merged record with timestamps after the run's nominal end.
+
+This bypass class requires:
+
+1. Deliberate adversarial intent (the agent is constructing session-detachment primitives specifically to evade post-run telemetry quiescence, not solving the eval task).
+2. The detached child must succeed at writing AFTER `run_one()` returns and BEFORE the moved event log is consumed by `merge_layers()` - a small race window that depends on caller scheduling.
+3. The detached child cannot affect the in-tmpdir log inode (once `shutil.move` completes, the post-move file is in `output_dir`; subsequent writes via the inherited fd hit the now-orphaned file path or fail). Realistic exploitation requires the child to also re-resolve the original path (which moved) or write via inherited fd before the move - a narrow window.
+
+The shell-parser's bypass detection in `harness/shell_parser.py::find_python_bypass_invocations` does NOT currently flag `setsid` / `daemonize` / `disown` / similar detachment primitives as fail-closed bypass forms. Adding them would close the visible-form half of the class (an agent that types `setsid python script.py &` in a Bash invocation would be flagged), but cannot close the in-process half (a Python child that calls `os.setsid()` after fork has no visible textual marker).
+
+Realistic agents working on causal-inference tasks do not exhibit this behavior. As with the wildcard delegated execution case above, the residual class is observably equivalent to "agent ran python adversarially in a way the layered defense cannot see post-hoc": the eval's interpretation is correct for both ("agent did not discover/use these surfaces" measured at finalization time).
+
+**Out-of-scope: off-venv Python via delegated/shebang forms (PR #5 R19):**
+
+**Deviation from plan:** the original PR #5 plan claimed the per-run venv + layer-1.5 wrapper provides "one fresh per-run venv" isolation for ALL python invocations. The off-venv delegated/shebang class (`find -exec /usr/bin/python3`, `xargs /usr/bin/python3`, `./script.py` with absolute shebang) bypasses the wrapper because the venv-routed PATH only catches bare `python` / `python3` / `python3.X` tokens. Closing it structurally would require either removing `/usr/bin`/`/bin` from agent PATH (breaks essential agent capabilities) or per-platform sitecustomize installation in the system Python (out of scope for the eval). This deviation is intentional; rationale and threat-model implications documented below.
+
+The runner sanitizes the agent's `PATH` to put the per-run venv's `bin/` first, so any agent typing bare `python` / `python3` / `python3.X` is wrapper-routed. `/usr/bin` and `/bin` remain on the agent PATH (required for `ls` / `cat` / `find` / `mkdir` etc.) which means absolute off-venv Python interpreters at `/usr/bin/python3` are still on the filesystem and reachable. The layer-1 AST parser attributes direct `/usr/bin/python3 script.py` invocations (the basename matcher recognizes `python3`), so those fail closed when no `session_start` follows. But parser-invisible forms can execute the absolute interpreter without the AST parser modeling the invocation:
+
+- `find /usr/bin -name 'python3*' -exec {} script.py \;`
+- `xargs -I {} {} script.py` where the input is `/usr/bin/python3`
+- `parallel /usr/bin/python3 script.py ::: arg1 arg2`
+- `./script.py` where `script.py` has shebang `#!/usr/bin/python3` (or `#!/usr/bin/env python3` resolving via the agent's `/usr/bin` PATH)
+
+These bypass the venv wrapper entirely. The spawned child runs the system interpreter (with NO venv-installed sitecustomize) so layer-2 also produces no event. The merger sees no `exec_python`, no `session_start`, and the AST sees no Python `CommandNode` (the wrapper command is `find` / `xargs` / `parallel` / a script path, not `python`). The sentinel-only path is then accepted as "agent did no Python work".
+
+This bypass class requires:
+
+1. **Deliberate adversarial intent**: the agent constructs a delegated form or installs a shebang script specifically to evade the wrapper, not to solve the eval task. Realistic agents working on causal-inference tasks invoke `python` directly via the Bash tool (which the wrapper handles).
+2. **Knowledge that `/usr/bin/python3` exists at a known absolute path**: the agent has to either guess the path or successfully run a `find` to discover it. Either way the discovery itself is visible in the transcript.
+3. **A meaningful task to run on the off-venv interpreter**: without the per-run `diff_diff` install, the spawned child has no library to invoke. An adversarial agent could `pip install --user diff_diff` first (visible in the transcript), but at that point the eval's interpretation - "agent did not discover/use the bundled guidance surfaces" - is correct: the agent that installed its own copy did not engage with the surface under measurement.
+
+Closing this structurally would require either:
+
+- Removing `/usr/bin` and `/bin` from the agent PATH (breaks essential agent capabilities like `ls`, `cat`, `find`, `mkdir`).
+- Detecting and substringing every absolute Python path in agent argv, plus parsing every script's shebang. The detection surface is unbounded (`/usr/bin/python3`, `/usr/bin/python3.11`, `/usr/local/bin/python3`, `/opt/...`, etc.) and a sufficiently motivated adversary can always copy or rename the binary to evade substring detection.
+- Custom CPython build with `sitecustomize` installed at the system level (would make the off-venv interpreter ALSO emit `session_start`). Requires per-platform build infrastructure - same out-of-scope class as the `-S` bypass mitigation above.
+
+As with the other out-of-scope adversarial bypass classes documented above, the residual class is observably equivalent to "agent did not discover/use the bundled surfaces" at the eval's measurement granularity. The merger does not (and cannot) distinguish "agent did no Python" from "agent ran off-venv Python via delegated/shebang forms": both produce identical telemetry shapes. The eval's interpretation is correct for both populations.

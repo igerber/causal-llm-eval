@@ -20,13 +20,12 @@ spawned agent inherits operator state and the eval is invalid.
 
 Verified by `make smoke` running the inheritance probe.
 
-**Note:** PR #3 runs the spawned agent in whichever venv is active for the
-harness process (no per-arm venv pool yet). The per-arm venv pool — fresh
-venv per run with one library installed (diff-diff XOR statsmodels), with
-PATH prepended to the venv bin — lands in PR #5 (`harness.venv_pool`).
-Until then, `clean_env()` passes operator `PATH` verbatim. The cold-start
-isolation contract for tmpdir, HOME, env allowlist, and CLI flags is
-fully enforced in this PR; only the per-arm venv tier is deferred.
+PR #5 wires the per-arm venv pool: ``run_one()`` builds a fresh venv at
+``tmpdir/venv`` (Phase 1), installs the layer-1.5 ``python`` wrapper +
+sitecustomize shim into it, runs a build-time sentinel to attest wrapper
++ shim wiring, then prepends the venv's ``bin/`` to ``PATH`` so the
+agent's ``python`` resolves to the wrapper. Phase 2 (template-and-clone
+per run) lands in PR #6+ when eval volume justifies the optimization.
 """
 
 from __future__ import annotations
@@ -42,8 +41,16 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from harness.shell_parser import RunValidityError
+from harness.venv_pool import build_arm_template
+
 _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
-    "PATH",
+    # PR #5 R12 P0: ``PATH`` is intentionally NOT passed through. The
+    # operator's PATH may contain operator-local directories (e.g.,
+    # ``/opt/homebrew/bin``, ``~/.cargo/bin``, custom shims) that would
+    # leak operator state into a "cold-start" agent. The runner instead
+    # constructs a sanitized agent PATH explicitly: the per-arm venv's
+    # bin/ followed by a small system-bin allowlist (see _agent_path).
     "LANG",
     # Explicit LC_ enumeration (POSIX-defined keys). No `LC_*` wildcard so an
     # unrelated key like `LC_RPATH` cannot leak through.
@@ -57,14 +64,49 @@ _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
 )
 
+# PR #5 R12 P0 / R15 P1 (EV-2): sanitized agent PATH. The runner
+# prepends the per-run venv bin (so the agent's ``python`` resolves
+# to the wrapper) and follows with a minimal system-bin allowlist
+# (so utilities like ``ls``, ``cat``, ``find`` resolve).
+#
+# Operator-local directories are intentionally excluded:
+#
+#   * ``/opt/homebrew/bin``, ``~/.cargo/bin``, ``~/.local/bin``:
+#     classic operator-installed tool dirs.
+#   * ``/usr/local/bin``: dropped at R15. On macOS Intel Homebrew
+#     (and many developer machines) ``/usr/local/bin`` is the
+#     Homebrew prefix and contains operator-installed Python
+#     shims, CLIs, and project tools. Even on systems where
+#     ``/usr/local/bin`` is conventionally admin-managed, it can
+#     contain locally-built tools the agent should not be able to
+#     resolve. ``ls`` / ``cat`` / ``find`` / ``mkdir`` etc. all
+#     live in ``/usr/bin`` and ``/bin``, which are sufficient for
+#     the cold-start contract.
+#
+# An agent that needs an external tool the venv doesn't provide
+# must fail rather than reach into operator state.
+_AGENT_SYSTEM_PATH_DIRS: tuple[str, ...] = (
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
+
 _TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
 _TELEMETRY_MISSING_MARKER = (
     "=== TELEMETRY MISSING: agent_event_log_path did not exist post-exec ==="
+)
+_DESCENDANTS_LIVE_MARKER = (
+    "=== DESCENDANTS LIVE: agent process group had surviving children "
+    "after main process exited; killed via SIGKILL. Telemetry may be "
+    "incomplete (children could have written events between proc.wait() "
+    "and killpg). Run marked invalid. ==="
 )
 # Exit-code sentinels for fatal harness conditions. Distinct from any real
 # CLI exit code so downstream extractors can branch on them.
 EXIT_CODE_TIMEOUT = -1
 EXIT_CODE_TELEMETRY_MISSING = -2
+EXIT_CODE_DESCENDANTS_LIVE = -3
 
 
 @dataclass
@@ -93,7 +135,12 @@ class RunConfig:
 
 @dataclass
 class RunResult:
-    """Outcome of a single agent run."""
+    """Outcome of a single agent run.
+
+    PR #5 added ``venv_path`` and ``runner_pid`` so the merger can validate
+    layer-1.5 events against the run's actual venv root and partition
+    sentinel-vs-agent events by ppid.
+    """
 
     run_id: str
     arm: str
@@ -105,6 +152,8 @@ class RunResult:
     final_code_path: Path | None
     wall_clock_seconds: float
     exit_code: int
+    venv_path: Path | None = None
+    runner_pid: int | None = None
 
 
 @dataclass
@@ -141,14 +190,29 @@ class RunMetadata:
     arm: str  # "diff_diff" or "statsmodels"
 
 
-def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
+def clean_env(
+    tmpdir: Path,
+    event_log_path: Path,
+    *,
+    venv_bin_dir: Path | None = None,
+) -> dict[str, str]:
     """Construct the allowlisted environment for the spawned process.
 
     Two-tier construction:
-        - Passthrough keys (PATH, LANG, LC_*, ANTHROPIC_API_KEY): copied
+        - Passthrough keys (LANG, LC_*, ANTHROPIC_API_KEY): copied
           verbatim from os.environ if present. Dropped if absent.
-        - Runner-set keys (HOME, _PYRUNTIME_EVENT_LOG): ALWAYS set from
-          runner-computed values; any inherited operator value is IGNORED.
+        - Runner-set keys (HOME, _PYRUNTIME_EVENT_LOG, PATH): ALWAYS
+          set from runner-computed values; any inherited operator
+          value is IGNORED.
+
+    PR #5 R12 P0 / R15 P1 (EV-2): ``PATH`` is RUNNER-SET, not
+    passthrough. The agent receives
+    ``${venv_bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin`` (when
+    ``venv_bin_dir`` is supplied) or just the system bin allowlist
+    (when it's None - probe / test paths). Operator-local directories
+    (``/opt/homebrew/bin``, ``/usr/local/bin``, ``~/.cargo/bin``,
+    custom shims) are intentionally excluded; see
+    ``_AGENT_SYSTEM_PATH_DIRS`` for the rationale on each.
 
     No prefix scan, no wildcard. Anything not in either tier (XDG_CONFIG_HOME,
     CLAUDE_CONFIG_DIR, AWS/MCP/GitHub env, CODEX_*, etc.) is dropped.
@@ -158,6 +222,9 @@ def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
             (NOT the operator's homedir) so any `~` lookup lands in the sandbox.
         event_log_path: path to the per-run in-process event log. Becomes
             _PYRUNTIME_EVENT_LOG so the in-process shim writes there.
+        venv_bin_dir: per-arm venv's bin/ directory. Prepended to the
+            sanitized agent PATH so the agent's ``python`` resolves to
+            the layer-1.5 wrapper.
 
     Returns:
         Dict suitable for subprocess.Popen's env= argument.
@@ -169,10 +236,109 @@ def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
             env[key] = value
     env["HOME"] = str(tmpdir)
     env["_PYRUNTIME_EVENT_LOG"] = str(event_log_path)
+    if venv_bin_dir is not None:
+        env["PATH"] = os.pathsep.join([str(venv_bin_dir), *_AGENT_SYSTEM_PATH_DIRS])
+    else:
+        env["PATH"] = os.pathsep.join(_AGENT_SYSTEM_PATH_DIRS)
     return env
 
 
-def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
+def _resolve_claude_executable() -> str:
+    """Resolve ``claude`` to an absolute path using the operator's PATH.
+
+    PR #5 R12 P0: the spawned agent's PATH is sanitized (operator-local
+    directories are excluded), so the runner must invoke ``claude`` by
+    absolute path - the agent's PATH no longer reaches into operator
+    state to find it. Resolution happens once at runner construction
+    time using the operator's PATH (which DOES contain the directory
+    where claude is installed). Raises ``FileNotFoundError`` if claude
+    is not on the operator's PATH.
+    """
+    claude = shutil.which("claude")
+    if claude is None:
+        raise FileNotFoundError("`claude` not found on operator PATH; install Claude Code first")
+    return claude
+
+
+def _resolve_claude_invocation_prefix(claude_path: str) -> list[str]:
+    """Return the argv prefix to launch Claude under a sanitized PATH.
+
+    PR #5 R19 CQ-1 (P2): when ``claude`` is an npm-installed script
+    starting with ``#!/usr/bin/env node`` (the common Claude Code
+    install shape), the spawned process inherits the runner's
+    sanitized agent PATH (which excludes the operator's
+    ``/opt/homebrew/bin`` / ``/usr/local/bin`` etc.). Kernel shebang
+    resolution then runs ``/usr/bin/env``, which searches the
+    SUBPROCESS PATH for ``node``, finds nothing, and the launch
+    fails with ``env: 'node': No such file or directory``.
+
+    Fix: read the script's shebang line at runner-build time (using
+    the operator PATH for interpreter resolution), then return the
+    explicit interpreter prefix so the kernel does not have to
+    re-resolve it under the sanitized agent PATH:
+
+      * Native binary (no shebang or unresolvable shebang): returns
+        ``[claude_path]`` - kernel exec the binary directly.
+      * Shebang ``#!/usr/local/bin/node``: returns
+        ``["/usr/local/bin/node", claude_path]`` - absolute path,
+        no PATH search needed.
+      * Shebang ``#!/usr/bin/env node``: resolves ``node`` via
+        the operator PATH (``shutil.which("node")``) and returns
+        ``[node_abs_path, claude_path]``. Falls back to
+        ``[claude_path]`` if resolution fails (the launch will
+        then surface the original env-resolution error visibly).
+      * Shebang ``#!/usr/bin/env -S node --some-flag`` or
+        ``#!/usr/bin/node --some-flag``: returns
+        ``[interp_path, "--some-flag", claude_path]`` so script
+        author's interpreter args are preserved.
+
+    The interpreter is recorded as an ABSOLUTE path so its directory
+    does not need to leak into the agent's PATH allowlist.
+    """
+    try:
+        with open(claude_path, "rb") as fh:
+            first_line = fh.readline(1024).decode("utf-8", errors="replace")
+    except OSError:
+        return [claude_path]
+    if not first_line.startswith("#!"):
+        return [claude_path]
+    # Strip the "#!" + trailing whitespace/newline; tokenize on whitespace.
+    shebang = first_line[2:].strip()
+    if not shebang:
+        return [claude_path]
+    parts = shebang.split()
+    interp_spec = parts[0]
+    interp_args = parts[1:]
+    # Handle "/usr/bin/env [-S] <interp> [args...]" by resolving <interp>
+    # via the operator PATH; otherwise treat parts[0] as the absolute
+    # interpreter path.
+    if os.path.basename(interp_spec) == "env":
+        # Skip optional ``-S`` (env -S supports multi-arg shebangs on Linux).
+        if interp_args and interp_args[0] == "-S":
+            interp_args = interp_args[1:]
+        if not interp_args:
+            return [claude_path]
+        interp_name = interp_args[0]
+        interp_args = interp_args[1:]
+        interp_abs = shutil.which(interp_name)
+        if interp_abs is None:
+            # Cannot resolve interpreter via operator PATH; fall back to
+            # the original direct-launch behavior (which will surface the
+            # env-resolution error visibly rather than silently failing).
+            return [claude_path]
+    elif os.path.isabs(interp_spec):
+        interp_abs = interp_spec
+    else:
+        # Relative interpreter path is unusual; resolve via operator PATH.
+        interp_abs = shutil.which(interp_spec)
+        if interp_abs is None:
+            return [claude_path]
+    return [interp_abs, *interp_args, claude_path]
+
+
+def _build_command(
+    claude_invocation: list[str], prompt: str, tmpdir: Path, model: str
+) -> list[str]:
     """Construct the exact locked argv for `claude --bare ...`.
 
     The seven cold-start isolation flags are: --bare, --setting-sources "",
@@ -182,9 +348,18 @@ def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
 
     `--model <id>` is additional: it pins the model so CLI defaults can't
     drift across runs. The value is `RunConfig.model`.
+
+    PR #5 R12 P0 / R19 CQ-1: ``claude_invocation`` is the resolved
+    invocation prefix from ``_resolve_claude_invocation_prefix``. For
+    native binaries it's ``[abs_claude_path]``; for shebang-script
+    Claude installs (npm `#!/usr/bin/env node`) it's
+    ``[abs_interpreter_path, claude_path]`` (or with extra interpreter
+    args if the shebang specified them). The agent's PATH is sanitized
+    and may not include the interpreter's or claude's directory, so
+    both are absolute by construction.
     """
     return [
-        "claude",
+        *claude_invocation,
         "--bare",
         "--setting-sources",
         "",
@@ -255,11 +430,107 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     agent_event_log_path.parent.mkdir(parents=True, exist_ok=True)
     agent_event_log_path.touch()
 
-    env = clean_env(tmpdir, agent_event_log_path)
-    cmd = _build_command(prompt, tmpdir, config.model)
+    # PR #5: build a per-arm venv with the layer-1.5 wrapper + sitecustomize
+    # shim installed. This is the per-run cost of Phase 1 (~10-30s); Phase 2
+    # (PR #6+) replaces this with a clone-from-template.
+    venv_dir = tmpdir / "venv"
+    build_arm_template(config.arm, config.library_version, venv_dir)
+
+    # Build-time python sentinel: prove the wrapper + shim are wired before
+    # the agent ever runs. Closes the implicit-trigger zero-python gap (a
+    # shell-only agent produces zero exec_python events; without this
+    # sentinel the merger cannot distinguish "agent did no python" from
+    # "agent neutered the wrapper"). The sentinel runs WITH
+    # _PYRUNTIME_EVENT_LOG set so the wrapper emits exactly one exec_python
+    # event and sitecustomize emits one session_start + session_end into
+    # the runner's event log, BEFORE the agent subprocess starts. The
+    # merger keys on RunResult.runner_pid to distinguish the sentinel
+    # (ppid == runner_pid) from agent-spawned events (ppid != runner_pid).
+    # PATH for the sentinel must include a system bin dir so the wrapper's
+    # internal calls to ``awk`` / ``date`` / ``basename`` / ``printf`` /
+    # ``sed`` resolve. (The wrapper itself uses ``#!/bin/sh`` absolute
+    # shebang and pins its internal PATH to ``/usr/bin:/bin``, but the
+    # sentinel subprocess's PATH still needs system bins for the wrapper
+    # to find them.) The venv bin is prepended so ``python`` resolves
+    # to the wrapper before reaching system Python.
+    sentinel_path = f"{venv_dir / 'bin'}{os.pathsep}/usr/bin{os.pathsep}/bin"
+    sentinel_result = subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "pass"],
+        env={
+            "PATH": sentinel_path,
+            "_PYRUNTIME_EVENT_LOG": str(agent_event_log_path),
+        },
+        capture_output=True,
+        timeout=30,
+    )
+    if sentinel_result.returncode != 0:
+        raise RunValidityError(
+            f"build-time sentinel failed (exit={sentinel_result.returncode}): "
+            f"wrapper or shim not wired correctly; stderr={sentinel_result.stderr!r}"
+        )
+
+    # PR #5 R14 P2 (EV-1): parse the events log AFTER the sentinel
+    # subprocess returns and before spawning Claude. Exit 0 alone proves
+    # the python interpreter ran, not that the wrapper + shim actually
+    # emitted their layer-1.5 + layer-2 events. Without this check, a
+    # broken shim install (e.g. site machinery skipped sitecustomize)
+    # would still let the sentinel exit 0 and the agent would launch
+    # against a half-wired attestation chain. The merger's
+    # ``_validate_three_layer_consistency`` would catch it post-hoc, but
+    # the cold-start doc claims a pre-agent guarantee. Enforce it here.
+    runner_pid = os.getpid()
+    sentinel_lines = agent_event_log_path.read_text().splitlines()
+    sentinel_events = [json.loads(line) for line in sentinel_lines if line.strip()]
+    sentinel_exec = next(
+        (
+            e
+            for e in sentinel_events
+            if e.get("event") == "exec_python" and e.get("ppid") == runner_pid
+        ),
+        None,
+    )
+    if sentinel_exec is None:
+        raise RunValidityError(
+            f"build-time sentinel did not emit an exec_python event with "
+            f"ppid={runner_pid} (the runner pid); the layer-1.5 wrapper "
+            f"is not wired. Events seen: {sentinel_events!r}"
+        )
+    sentinel_pid = sentinel_exec.get("pid")
+    if not any(
+        e.get("event") == "session_start" and e.get("pid") == sentinel_pid for e in sentinel_events
+    ):
+        raise RunValidityError(
+            f"build-time sentinel emitted exec_python (pid={sentinel_pid}) "
+            f"but no matching session_start; the layer-2 sitecustomize "
+            f"shim is not loaded. Events seen: {sentinel_events!r}"
+        )
+    if not any(
+        e.get("event") == "session_end" and e.get("pid") == sentinel_pid for e in sentinel_events
+    ):
+        raise RunValidityError(
+            f"build-time sentinel emitted exec_python + session_start "
+            f"(pid={sentinel_pid}) but no matching session_end; the "
+            f"layer-2 atexit hook is not registered. "
+            f"Events seen: {sentinel_events!r}"
+        )
+
+    # PR #5 R12 P0: clean_env now sets a sanitized PATH containing only
+    # the per-arm venv bin + system bin allowlist. Operator-local
+    # directories (~/.cargo/bin, /opt/homebrew/bin, etc.) do NOT leak
+    # into the agent's PATH. ``claude`` is invoked by absolute path
+    # below since the agent's PATH may not contain the directory where
+    # it lives.
+    env = clean_env(tmpdir, agent_event_log_path, venv_bin_dir=venv_dir / "bin")
+    cmd = _build_command(
+        _resolve_claude_invocation_prefix(_resolve_claude_executable()),
+        prompt,
+        tmpdir,
+        config.model,
+    )
 
     start = time.monotonic()
     timed_out = False
+    descendants_live = False
     with (
         open(transcript_jsonl_path, "w") as stdout_file,
         open(cli_stderr_log_path, "w") as stderr_file,
@@ -291,9 +562,67 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             timed_out = True
     wall_clock_seconds = time.monotonic() - start
 
+    # PR #5 R16 P1 (EV-1): quiesce the spawned process group on the
+    # NORMAL exit path too. A non-timeout proc.wait() returns when
+    # claude itself exits, but background descendants (e.g. an agent
+    # ``Bash`` invocation that did ``nohup python script.py &``) can
+    # outlive claude and continue writing layer-1.5 / layer-2 events
+    # AFTER ``run_one`` moves the event log into ``output_dir``. That
+    # is a real telemetry race: the merger could see a clean record
+    # at finalization time that gets mutated post-hoc by a surviving
+    # child, or the moved log could miss late writes entirely.
+    #
+    # Try ``killpg(SIGKILL)``: if it succeeds, the PG still had
+    # members (descendants existed), the run is INVALID. Mark
+    # ``descendants_live`` and downgrade ``exit_code`` to
+    # ``EXIT_CODE_DESCENDANTS_LIVE`` (only if not already a
+    # sentinel - timeout takes precedence). If it raises
+    # ``ProcessLookupError``, the kernel has already reaped the PG;
+    # clean exit, no action.
+    if not timed_out:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            descendants_live = True
+        except ProcessLookupError:
+            # PG already empty - claude exited cleanly with no surviving
+            # descendants. No action.
+            pass
+
     if timed_out:
         with open(cli_stderr_log_path, "a") as f:
             f.write(_TIMEOUT_MARKER_FMT.format(timeout=config.timeout_seconds) + "\n")
+    elif descendants_live:
+        with open(cli_stderr_log_path, "a") as f:
+            f.write(_DESCENDANTS_LIVE_MARKER + "\n")
+        exit_code = EXIT_CODE_DESCENDANTS_LIVE
+        # PR #5 R17 P1 (EV-1): also write a fail-closed sentinel
+        # event into the agent event log itself. Without this, a
+        # downstream caller that invokes ``merge_layers`` directly on
+        # the artifact set (without inspecting RunResult.exit_code or
+        # cli_stderr.log) could still produce a clean
+        # ``TelemetryRecord`` for a run the runner explicitly marked
+        # invalid. The merger's existing ``run_invalid`` schema
+        # rejects this event class; this is the same pattern as the
+        # ``telemetry_missing`` sentinel below.
+        if agent_event_log_path.exists():
+            with open(agent_event_log_path, "a") as f:
+                json.dump(
+                    {
+                        "event": "run_invalid",
+                        "fatal": True,
+                        "reason": "descendants_live",
+                        "note": (
+                            "agent process group had surviving children "
+                            "after main process exited; runner killed via "
+                            "SIGKILL but late writes to the event log "
+                            "between proc.wait() and killpg may have "
+                            "produced an incomplete or post-finalization "
+                            "telemetry record"
+                        ),
+                    },
+                    f,
+                )
+                f.write("\n")
 
     # Promote the in-tmpdir event log into output_dir for forensics. A
     # missing file post-exec is fail-closed (R5 P0): the runner touched it
@@ -331,4 +660,6 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         final_code_path=None,
         wall_clock_seconds=wall_clock_seconds,
         exit_code=exit_code,
+        venv_path=venv_dir,
+        runner_pid=os.getpid(),
     )

@@ -55,6 +55,7 @@ def restore_globals():
     builtins.open = original_builtins_open
     io.open = original_io_open
     sys.meta_path[:] = original_meta_path
+    sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
 
 
@@ -72,14 +73,35 @@ def _read_events(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def _import_shim_fresh():
-    """Import `harness.sitecustomize_template` triggering its top-level code.
+_TEMPLATE_PATH = Path(__file__).parent.parent / "harness" / "sitecustomize_template.py"
 
-    Drops any cached copy first so module-load side effects (session_start
-    write, hook install) re-run.
+
+def _import_shim_fresh():
+    """Import the shim with side effects fired AND attribute access available.
+
+    PR #5: sitecustomize_template's top-level side effects are now gated by
+    ``if __name__ == "sitecustomize"`` and factored into
+    ``_install_production_state()``. This helper:
+
+      1. ``importlib.import_module(...)`` returns a module object with all
+         module-level definitions (functions, classes, constants) bound.
+      2. Calls ``module._install_production_state()`` to fire the side
+         effects (session_start, hook install, fd open, atexit register)
+         in the MODULE'S namespace so classes/instances mutated into
+         global state (``sys.meta_path``, ``builtins.open``,
+         ``warnings.warn``) share identity with the attrs tests access
+         via ``shim.<attr>``.
+
+    Direct call (no runpy) means: ``shim._DiffDiffPostImportHook`` is the
+    same class object as the hook inserted into ``sys.meta_path``, and
+    ``shim._diff_diff_guides_dir`` is the global the open hook closes
+    over. Test patches via ``setattr(shim, ...)`` reach the live state.
     """
+    sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
-    return importlib.import_module("harness.sitecustomize_template")
+    module = importlib.import_module("harness.sitecustomize_template")
+    module._install_production_state()
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +120,22 @@ def test_session_start_event_written_on_import(event_log):
 
 
 def test_session_start_hard_exits_without_env_var(monkeypatch, restore_globals, capsys):
-    """R21 P1: when ``_PYRUNTIME_EVENT_LOG`` is unset at shim import, the
-    shim calls ``os._exit(2)`` rather than raising. Python's site machinery
-    catches ordinary exceptions from sitecustomize.py and continues the
-    user program; only a hard exit reliably stops the subprocess. The
-    test mocks ``os._exit`` to capture the exit code instead of killing
-    pytest."""
+    """R21 P1: when ``_PYRUNTIME_EVENT_LOG`` is unset at shim load, the
+    shim calls ``os._exit(2)`` rather than raising. Python's site
+    machinery catches ordinary exceptions from sitecustomize.py and
+    continues the user program; only a hard exit reliably stops the
+    subprocess. The test mocks ``os._exit`` to capture the exit code
+    instead of killing pytest.
+
+    PR #5: the side effects are gated by ``__name__ == "sitecustomize"``,
+    so this test must invoke the shim via ``runpy.run_path`` with
+    ``run_name="sitecustomize"`` to exercise the production load path.
+    Plain ``importlib.import_module(...)`` no longer fires the gate.
+    """
+    import runpy
+
     monkeypatch.delenv("_PYRUNTIME_EVENT_LOG", raising=False)
+    sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
 
     captured_exit_codes: list[int] = []
@@ -116,7 +147,7 @@ def test_session_start_hard_exits_without_env_var(monkeypatch, restore_globals, 
 
     monkeypatch.setattr("os._exit", fake_exit)
     with pytest.raises(SystemExit):
-        importlib.import_module("harness.sitecustomize_template")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -202,10 +233,17 @@ def test_session_start_write_failure_hard_exits(monkeypatch, restore_globals, ca
     is opened, the shim must hard-exit with code 2 rather than let
     Python's site machinery catch the OSError and continue running
     without hooks installed. The fix routes session_start through
-    ``_safe_write`` (the hard-exit path) like hook events."""
+    ``_safe_write`` (the hard-exit path) like hook events.
+
+    PR #5: side effects gated by ``__name__ == "sitecustomize"``; test
+    uses ``runpy.run_path`` to fire the gate.
+    """
+    import runpy
+
     path = tmp_path / "events.jsonl"
     path.touch()
     monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(path))
+    sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
 
     captured_exit_codes: list[int] = []
@@ -224,7 +262,7 @@ def test_session_start_write_failure_hard_exits(monkeypatch, restore_globals, ca
     monkeypatch.setattr("os._exit", fake_exit)
     monkeypatch.setattr("os.write", boom_write)
     with pytest.raises(SystemExit):
-        importlib.import_module("harness.sitecustomize_template")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -232,13 +270,20 @@ def test_session_start_write_failure_hard_exits(monkeypatch, restore_globals, ca
 
 
 def test_event_log_open_failure_hard_exits(monkeypatch, restore_globals, capsys, tmp_path):
-    """R22 P0: when the event-log path cannot be opened at shim import
+    """R22 P0: when the event-log path cannot be opened at shim load
     (parent dir missing / unwritable), the shim hard-exits with code 2.
     Same fail-closed posture as the unset-env-var case: an agent's
-    Python subprocess must not run without telemetry capture."""
+    Python subprocess must not run without telemetry capture.
+
+    PR #5: side effects gated by ``__name__ == "sitecustomize"``; test
+    uses ``runpy.run_path`` to fire the gate.
+    """
+    import runpy
+
     # Path under a non-existent parent directory.
     bogus = tmp_path / "no_such_dir" / "events.jsonl"
     monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(bogus))
+    sys.modules.pop("sitecustomize", None)
     sys.modules.pop("harness.sitecustomize_template", None)
 
     captured_exit_codes: list[int] = []
@@ -249,7 +294,7 @@ def test_event_log_open_failure_hard_exits(monkeypatch, restore_globals, capsys,
 
     monkeypatch.setattr("os._exit", fake_exit)
     with pytest.raises(SystemExit):
-        importlib.import_module("harness.sitecustomize_template")
+        runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
     assert captured_exit_codes == [2]
     captured = capsys.readouterr()
     assert "[pyruntime]" in captured.err
@@ -648,3 +693,104 @@ def test_open_hook_records_guide_file_paths(event_log, tmp_path):
         and e.get("filename") == "llms-practitioner.txt"
     ]
     assert len(open_events) >= 1, events
+
+
+# ---------------------------------------------------------------------------
+# PR #5: __name__ gate behavior
+# ---------------------------------------------------------------------------
+
+
+def test_template_import_does_not_fire_side_effects_without_run_name(
+    monkeypatch, restore_globals, capsys
+):
+    """PR #5: importing the template as ``harness.sitecustomize_template``
+    (not as ``sitecustomize``) does NOT fire the gated side effects. This
+    is what makes the template safe to import from tests / docs tooling /
+    package introspection without hard-exiting on a missing
+    ``_PYRUNTIME_EVENT_LOG``.
+    """
+    monkeypatch.delenv("_PYRUNTIME_EVENT_LOG", raising=False)
+    sys.modules.pop("sitecustomize", None)
+    sys.modules.pop("harness.sitecustomize_template", None)
+    # Importing as the package-qualified name must NOT hard-exit.
+    module = importlib.import_module("harness.sitecustomize_template")
+    # Module loaded successfully; gate-only state stays at sentinel values.
+    assert module._EVENT_LOG_FD == -1
+    assert module._EVENT_LOG_PATH == ""
+    # No [pyruntime] stderr marker (the hard-exit path was skipped).
+    captured = capsys.readouterr()
+    assert "[pyruntime]" not in captured.err
+
+
+def test_runpy_with_sitecustomize_name_fires_side_effects(event_log):
+    """PR #5: the dual-path helper uses runpy with run_name="sitecustomize"
+    to fire side effects. Validate the mechanism directly: a session_start
+    event lands in the event log, mirroring production sitecustomize load.
+    """
+    import runpy
+
+    sys.modules.pop("sitecustomize", None)
+    sys.modules.pop("harness.sitecustomize_template", None)
+    runpy.run_path(str(_TEMPLATE_PATH), run_name="sitecustomize")
+    events = _read_events(event_log)
+    assert any(e.get("event") == "session_start" for e in events), events
+
+
+def test_runpy_with_other_name_does_not_fire_side_effects(monkeypatch, restore_globals, tmp_path):
+    """Defensive: a runpy invocation with a name other than "sitecustomize"
+    must NOT fire the gated side effects, even if ``_PYRUNTIME_EVENT_LOG``
+    is set. The gate keys exclusively on ``__name__ == "sitecustomize"``.
+    """
+    import runpy
+
+    log_path = tmp_path / "should_not_be_written.jsonl"
+    monkeypatch.setenv("_PYRUNTIME_EVENT_LOG", str(log_path))
+    sys.modules.pop("sitecustomize", None)
+    sys.modules.pop("harness.sitecustomize_template", None)
+    runpy.run_path(str(_TEMPLATE_PATH), run_name="not_sitecustomize")
+    # Event log should not exist (gate didn't fire, so the fd open was skipped).
+    assert not log_path.exists()
+
+
+def test_install_production_state_rewrites_base_executable(event_log, monkeypatch, tmp_path):
+    """R15 P1 (EV-1): the side-effect block rewrites BOTH ``sys.executable``
+    AND ``sys._base_executable`` to the venv's wrapper. Without the
+    base-executable rewrite, agent code that does
+    ``subprocess.Popen([sys._base_executable, ...])`` skips the
+    layer-1.5 wrapper entirely (the AST parser sees only an opaque
+    attribute access in argv, no python token to flag).
+
+    This test directly fires the gate via ``_install_production_state``
+    after monkey-patching ``sys.executable`` to the venv-real interpreter
+    path the gate expects, then asserts both attributes get rewritten
+    to the wrapper. Independent of host sitecustomize shadowing.
+    """
+    # Build a fake venv layout that the rewrite block recognizes.
+    # The gate looks for sys.executable ending in /python-real or
+    # /.actual-python and walks up two dirs to find the venv root.
+    fake_venv = tmp_path / "fake-venv"
+    (fake_venv / "bin").mkdir(parents=True)
+    (fake_venv / ".pyruntime-real").mkdir(parents=True)
+    real_path = fake_venv / ".pyruntime-real" / ".actual-python"
+    real_path.touch()
+    wrapper_path = fake_venv / "bin" / "python"
+    wrapper_path.touch()
+
+    # Save original sys attrs so the test fixture can restore them.
+    original_executable = sys.executable
+    original_base = getattr(sys, "_base_executable", None)
+    monkeypatch.setattr(sys, "executable", str(real_path))
+    if hasattr(sys, "_base_executable"):
+        monkeypatch.setattr(sys, "_base_executable", original_base or original_executable)
+
+    _import_shim_fresh()
+
+    assert sys.executable == str(
+        wrapper_path
+    ), f"sys.executable={sys.executable!r} not rewritten to wrapper {wrapper_path!r}"
+    if hasattr(sys, "_base_executable"):
+        assert sys._base_executable == str(wrapper_path), (
+            f"sys._base_executable={sys._base_executable!r} not rewritten to "
+            f"wrapper {wrapper_path!r} (R15 EV-1 regression: agent could "
+            f"spawn [sys._base_executable, ...] and bypass the layer-1.5 wrapper)"
+        )

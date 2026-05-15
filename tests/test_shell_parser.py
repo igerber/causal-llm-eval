@@ -314,10 +314,20 @@ def test_find_python_bypass_invocations_negative(command):
         (["-s", "script.py"], False),  # lowercase
         (["-c", "code"], False),
         (["-", "stdin-mode"], False),
-        # Long flags don't end the interpreter-flag region; -S after a
-        # long flag IS detected (consistent with the original walker).
+        # Long flags don't end the interpreter-flag region.
         (["--config=x", "-S"], True),
-        (["--", "-S"], True),
+        # PR #5 R11 P2: option-aware fixes (mirror strip-S shim semantics):
+        (["--", "-S"], False),  # -- ends options; subsequent -S is argv
+        (["-c", "-S"], False),  # -c CODE; the -S is python code, not flag
+        (["-m", "-S"], False),  # -m MODULE; -S is the module name (rare but valid)
+        (["-W", "ignore", "-S"], True),  # -W consumes ignore, -S still flag
+        (["-X", "dev", "-S"], True),  # -X consumes dev, -S still flag
+        # R12 P2: attached forms -W.../-X... carry payload in same element
+        (["-Werror::SomeWarning", "script.py"], False),  # S in -W payload, not bypass
+        (["-Xdev", "script.py"], False),  # X attached payload
+        (["-Werror::SomeWarning", "-S"], True),  # attached -W, then real -S
+        (["-cprint(1)"], False),  # attached -c payload contains nothing relevant
+        (["-cimport os; print('S')"], False),  # attached -c with S in payload
         # Plain script arg ends the region; -S after script arg is the
         # script's own arg, not an interpreter flag.
         (["script.py", "-S"], False),
@@ -368,3 +378,175 @@ def test_run_validity_error_catches_both_subclasses():
         parse_python_invocations("${PY} script.py")
     with pytest.raises(RunValidityError):
         parse_python_invocations("case x in y) python;; esac")
+
+
+# ---------------------------------------------------------------------------
+# PR #5 R0: python-real / *-real basename detection.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_python_invocations_python_real_treated_as_python():
+    """python-real is the per-arm venv's real interpreter (the wrapper
+    renames the original to python-real). Direct invocation must be
+    parsed as a python invocation so the merger has a hook to fail
+    closed.
+    """
+    argvs = parse_python_invocations("/tmp/venv/bin/python-real script.py")
+    assert argvs == [["/tmp/venv/bin/python-real", "script.py"]]
+
+
+def test_parse_python_invocations_python3X_real_treated_as_python():
+    """python3.11-real (and any python3.X-real) follow the same rule."""
+    argvs = parse_python_invocations("/tmp/venv/bin/python3.11-real script.py")
+    assert argvs == [["/tmp/venv/bin/python3.11-real", "script.py"]]
+
+
+def test_find_python_bypass_python_real_direct_flagged():
+    """Direct invocation of python-real is a bypass primitive: it skips
+    the layer-1.5 wrapper and the wrapper's exec_python event emission.
+    """
+    bypasses = find_python_bypass_invocations("/tmp/venv/bin/python-real script.py")
+    assert bypasses == ["/tmp/venv/bin/python-real script.py"]
+
+
+def test_find_python_bypass_python3X_real_direct_flagged():
+    """python3-real and python3.X-real variants are also bypass primitives."""
+    bypasses = find_python_bypass_invocations("/tmp/venv/bin/python3.11-real -c 'pass'")
+    assert bypasses == ["/tmp/venv/bin/python3.11-real -c 'pass'"]
+
+
+def test_find_python_bypass_detects_find_exec_python_real_delegation():
+    r"""R2 P0 #1: delegated forms like
+    ``find venv -name python-real -exec {} -S script.py \;``
+    don't have python as a CommandNode but reference the real-interpreter
+    location. The substring check fails closed.
+    """
+    cmd = r"find /tmp/venv -name python-real -exec {} -S script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_real_in_xargs():
+    """xargs invoking the real interpreter via .pyruntime-real path."""
+    cmd = "echo /tmp/venv/.pyruntime-real/python-real | xargs -I {} {} -S script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_real_substring():
+    """Any visible reference to .pyruntime-real flags as bypass."""
+    bypasses = find_python_bypass_invocations("ls /tmp/venv/.pyruntime-real/")
+    assert bypasses == ["ls /tmp/venv/.pyruntime-real/"]
+
+
+def test_find_python_bypass_does_not_flag_python_in_other_strings():
+    """``python_setup.sh`` or ``python-doc`` should NOT trigger the
+    word-boundary regex (they aren't python-real).
+    """
+    bypasses = find_python_bypass_invocations("ls /etc/python_setup.sh")
+    assert bypasses == []
+    bypasses = find_python_bypass_invocations("apt show python-doc")
+    assert bypasses == []
+
+
+def test_find_python_bypass_detects_actual_python_substring():
+    """R3 P0 follow-on: ``.actual-python`` is the hidden CPython binary
+    beneath python-real. Any visible reference is a bypass primitive.
+    """
+    cmd = r"find /tmp/venv -name .actual-python -exec {} -S script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_env_prefix():
+    """R6 P0: ``env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py``
+    retargets the shim's event log to a non-runner-owned path. The
+    wrapper + sitecustomize would write events to /tmp/fake while the
+    runner-owned log appears empty; merger would treat this as a
+    shell-only run (false negative). Bypass detection now flags
+    _PYRUNTIME_EVENT_LOG= prefix on env wrappers.
+    """
+    cmd = "env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_export():
+    """``export _PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py``
+    same retarget via shell export.
+    """
+    cmd = "export _PYRUNTIME_EVENT_LOG=/tmp/fake && python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_standalone():
+    """``_PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py``
+    standalone assignment.
+    """
+    cmd = "_PYRUNTIME_EVENT_LOG=/tmp/fake; python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_prefix_on_python():
+    """``_PYRUNTIME_EVENT_LOG=/tmp/fake python script.py`` direct
+    prefix-assignment on the python CommandNode.
+    """
+    cmd = "_PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_find_exec():
+    """R7 P0: ``find -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake python ...``
+    delegated form. The visible reference to _PYRUNTIME_EVENT_LOG is
+    caught by substring detection regardless of how deeply nested the
+    exec is.
+    """
+    cmd = r"find . -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_xargs():
+    """``xargs -I {} env _PYRUNTIME_EVENT_LOG=...`` delegated form."""
+    cmd = "printf 'a\\n' | xargs -I {} env _PYRUNTIME_EVENT_LOG=/tmp/fake " "python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_parallel():
+    """``parallel 'env _PYRUNTIME_EVENT_LOG=...'`` delegated form."""
+    cmd = "parallel 'env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py' ::: a"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_fd():
+    """``fd -x env _PYRUNTIME_EVENT_LOG=...`` delegated form."""
+    cmd = "fd -x env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_unset_via_env():
+    """``find . -exec env -u _PYRUNTIME_EVENT_LOG python ...`` unset
+    variant; same substring catches it.
+    """
+    cmd = r"find . -exec env -u _PYRUNTIME_EVENT_LOG python script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_does_not_flag_pyruntime_event_log_substring_in_path():
+    """A path that happens to contain ``_PYRUNTIME_EVENT_LOG`` as a
+    substring (e.g., ``/tmp/_PYRUNTIME_EVENT_LOG_test``) does match the
+    word-boundary regex and is flagged. This is intentional: the
+    substring is so specific that any non-runner reference is suspect.
+    """
+    # Verify the word-boundary IS triggered by the bare token in any
+    # context.
+    cmd = "echo '_PYRUNTIME_EVENT_LOG is the var name'"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]

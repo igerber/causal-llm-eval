@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os.path
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from harness.shell_parser import (
     RunValidityError,
     ShellCommandIndeterminate,
     ShellCommandParseError,
+    argv_contains_bypass_flag,
     find_python_bypass_invocations,
     parse_python_invocations,
 )
@@ -186,21 +188,52 @@ def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
     return events
 
 
-# Substring marker the shim's `_write_event` prints to stderr when a write
-# fails mid-run. Used by the merger to fail-closed when telemetry events were
-# dropped after the hook deliberately continued executing the wrapped call.
-_SHIM_WRITE_FAILURE_MARKER = "[pyruntime] cannot write event"
+# Substring markers the layer-1.5 wrapper and layer-2 sitecustomize shim
+# print to stderr when an event write fails mid-run. Used by the merger to
+# fail-closed when telemetry events were dropped:
+#
+#   * ``[pyruntime] cannot write event`` - emitted by sitecustomize's
+#     ``_write_event`` (layer-2) when an event-log write fails after
+#     session_start has fired. The hook wrappers catch transient OSError
+#     so the agent's diff_diff call still completes; the marker is the
+#     only signal that an event was dropped.
+#   * ``[pyruntime-wrapper]`` - PR #5 R18 P1 (EV-1): emitted by the
+#     layer-1.5 wrapper script (``harness/python_wrapper.sh``) when its
+#     append to ``_PYRUNTIME_EVENT_LOG`` fails or argv attestation fails
+#     (e.g., embedded newline). The wrapper exits with code 2 in those
+#     cases, but for delegated forms the layer-1 AST parser does not
+#     model (``find -exec python``, ``xargs python``, ``parallel python``)
+#     a forced-zero shell status or stderr suppression could otherwise
+#     produce a clean record with no exec_python event. Both producers'
+#     fatal stderr vocabularies are scanned together.
+_FATAL_TELEMETRY_STDERR_MARKERS = (
+    "[pyruntime] cannot write event",
+    "[pyruntime-wrapper]",
+)
+# Backwards-compat alias for any external code referencing the prior name.
+_SHIM_WRITE_FAILURE_MARKER = _FATAL_TELEMETRY_STDERR_MARKERS[0]
+
+
+def _has_fatal_telemetry_marker(text: str) -> bool:
+    """Return True iff ``text`` contains any layer-1.5/layer-2 fatal
+    telemetry marker (sitecustomize event-write failure or wrapper
+    failure).
+    """
+    return any(marker in text for marker in _FATAL_TELEMETRY_STDERR_MARKERS)
 
 
 def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
-    """Return True if outer Claude CLI stderr contains the shim's event-write
-    failure marker.
+    """Return True if outer Claude CLI stderr contains any layer-1.5 or
+    layer-2 fatal telemetry marker.
 
     The shim's hook wrappers catch transient OSError on event writes so the
     agent's diff_diff call still completes (avoids aborting on telemetry
     hiccups). When that happens, `_write_event` first prints
-    `[pyruntime] cannot write event to <path>: <err>` to stderr. The merger
-    looks for that marker post-hoc: presence means at least one event was
+    `[pyruntime] cannot write event to <path>: <err>` to stderr. PR #5
+    R18 P1 (EV-1): the layer-1.5 wrapper also emits
+    `[pyruntime-wrapper] cannot append ...` / `[pyruntime-wrapper] argv
+    contains embedded newline; cannot attest`. The merger looks for
+    either marker post-hoc: presence means at least one event was
     dropped, so the per-run record may be silently incomplete.
 
     NOTE: this only covers stderr from the outer ``claude --bare`` process.
@@ -216,19 +249,20 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
         # Existence was already validated; a read error here is itself a
         # capture problem worth surfacing.
         return True
-    return _SHIM_WRITE_FAILURE_MARKER in content
+    return _has_fatal_telemetry_marker(content)
 
 
 def _scan_tool_results_for_shim_failures(transcript_entries: list[dict]) -> bool:
-    """Return True if any Bash ``tool_result`` content contains the shim's
-    event-write failure marker.
+    """Return True if any Bash ``tool_result`` content contains a
+    layer-1.5 or layer-2 fatal telemetry marker.
 
-    Most shim event-write failures occur inside an agent-spawned python
+    Most fatal telemetry markers surface inside an agent-spawned python
     subprocess (Claude's Bash tool runs the python child whose stderr is
     captured by Claude into the matching ``tool_result`` block). The
     outer ``cli_stderr.log`` only carries stderr from the ``claude
     --bare`` process itself, which rarely sees inner subprocess output,
-    so a marker emitted by the shim is invisible to the layer-3 scan.
+    so a marker emitted by the shim or wrapper is invisible to the
+    layer-3 scan.
 
     Iterating ``tool_result`` blocks closes that gap. Stringified content
     (Claude sometimes returns a single string) and list-shaped content
@@ -236,20 +270,25 @@ def _scan_tool_results_for_shim_failures(transcript_entries: list[dict]) -> bool
     fail closed; per-block granularity is not needed because the
     per-run record cannot be trusted once a single event is known to
     have been dropped.
+
+    PR #5 R18 P1 (EV-1): also matches the wrapper's ``[pyruntime-wrapper]``
+    failure marker, closing the delegated-form telemetry-loss path
+    (``find -exec python``, ``xargs python``, ``parallel python``)
+    where the layer-1 AST parser does not model the invocation.
     """
     for entry in transcript_entries:
         for block in _iter_tool_result_blocks(entry):
             content = block.get("content")
             if isinstance(content, str):
-                if _SHIM_WRITE_FAILURE_MARKER in content:
+                if _has_fatal_telemetry_marker(content):
                     return True
             elif isinstance(content, list):
                 for sub in content:
                     if isinstance(sub, dict):
                         text = sub.get("text") or sub.get("content") or ""
-                        if isinstance(text, str) and _SHIM_WRITE_FAILURE_MARKER in text:
+                        if isinstance(text, str) and _has_fatal_telemetry_marker(text):
                             return True
-                    elif isinstance(sub, str) and _SHIM_WRITE_FAILURE_MARKER in sub:
+                    elif isinstance(sub, str) and _has_fatal_telemetry_marker(sub):
                         return True
     return False
 
@@ -320,12 +359,16 @@ def _validate_layer_artifacts(stream_json_path: Path, stderr_path: Path) -> list
     return transcript_entries
 
 
-def _read_events(path: Path) -> list[dict]:
+def _read_events(path: Path, *, venv_path: Path | None = None) -> list[dict]:
     """Parse the in-process event log into a list of dicts.
 
     Raises ``TelemetryMergeError`` if the file is missing or contains a
     non-JSON line. An empty (0-byte) file is permitted and returns ``[]``;
     the validity check is the caller's responsibility.
+
+    PR #5: ``venv_path`` is forwarded to ``_validate_event_schemas`` so
+    that ``exec_python`` events can be checked against the run's
+    venv-root-anchored ``executable`` allowlist.
     """
     if not path.exists():
         raise TelemetryMergeError(
@@ -333,7 +376,7 @@ def _read_events(path: Path) -> list[dict]:
             f"the runner should have written a telemetry_missing sentinel"
         )
     events = _parse_jsonl_strict(path, "event log")
-    _validate_event_schemas(events, path)
+    _validate_event_schemas(events, path, venv_path=venv_path)
     return events
 
 
@@ -352,13 +395,42 @@ _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
     "estimator_fit": ("class",),
     "diagnostic_call": ("name",),
     "warning_emitted": ("filename",),
+    # PR #5: layer-1.5 wrapper-emitted exec_python event. Required fields per
+    # the wrapper script + venv-root-anchored executable check applied when
+    # ``venv_path`` is supplied to ``merge_layers``.
+    "exec_python": ("pid", "ppid", "ts", "executable", "argv"),
     # telemetry_missing sentinel has no required fields; the merger raises on
     # its presence regardless of payload.
     "telemetry_missing": (),
+    # PR #5 R17 P1 (EV-1): run_invalid sentinel also has no required
+    # fields; merger raises on its presence regardless of payload. The
+    # runner writes it (with ``reason`` + ``note`` keys) when post-spawn
+    # invariants like the descendants-live check fail.
+    "run_invalid": (),
 }
 
 
-def _validate_event_schemas(events: list[dict], path: Path) -> None:
+def _expected_exec_python_executable(venv_path: Path) -> str:
+    """The canonical ``executable`` value for an ``exec_python`` event
+    given a known venv root, in ``os.path.normpath`` form.
+
+    PR #5 R1: the real interpreter lives at
+    ``${venv}/.pyruntime-real/python-real`` so it stays off the agent's
+    PATH. The wrapper records the path as
+    ``$(dirname "$0")/../.pyruntime-real/python-real`` (with an embedded
+    ``/..`` segment); the merger normalizes both sides before comparing,
+    so the wrapper's literal form and the resolved form both compare
+    equal to this canonical value.
+    """
+    return os.path.normpath(str(venv_path / ".pyruntime-real" / "python-real"))
+
+
+def _validate_event_schemas(
+    events: list[dict],
+    path: Path,
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Reject malformed known-event records.
 
     Validates two layers per known event type:
@@ -375,6 +447,13 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
     Unknown event types are ignored (forward-compatibility: a future shim
     may emit new event types, and we don't want old mergers to reject
     them outright). Only KNOWN event types are schema-checked.
+
+    PR #5: when ``venv_path`` is supplied, ``exec_python`` events are
+    additionally validated against the run's venv-root-anchored allowlist
+    (mirrors the rename set produced by ``harness.venv_pool._install_python_wrapper``).
+    Forged executables outside the venv root fail validation. When
+    ``venv_path`` is None (legacy fixture mode), only the type checks
+    apply.
     """
     valid_filenames = set(_VARIANT_TO_FILENAME.values())
     valid_variants = set(_VARIANT_TO_FILENAME.keys())
@@ -453,6 +532,38 @@ def _validate_event_schemas(events: list[dict], path: Path) -> None:
             filename = event["filename"]
             if not isinstance(filename, str):
                 _bail(f"filename must be str, got " f"{type(filename).__name__}={filename!r}")
+        elif event_type == "exec_python":
+            pid = event["pid"]
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                _bail(f"pid must be int, got {type(pid).__name__}={pid!r}")
+            ppid = event["ppid"]
+            if not isinstance(ppid, int) or isinstance(ppid, bool):
+                _bail(f"ppid must be int, got {type(ppid).__name__}={ppid!r}")
+            ts = event["ts"]
+            if not isinstance(ts, str):
+                _bail(f"ts must be str, got {type(ts).__name__}={ts!r}")
+            executable = event["executable"]
+            if not isinstance(executable, str):
+                _bail(f"executable must be str, got " f"{type(executable).__name__}={executable!r}")
+            argv = event["argv"]
+            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                _bail(f"argv must be list[str], got {type(argv).__name__}={argv!r}")
+            # Venv-root-anchored exact match (PR #5): structurally rejects
+            # agent-forged exec_python events whose `executable` points
+            # outside the run's venv root. Both sides normalized through
+            # os.path.normpath so the wrapper's literal
+            # ``${venv}/bin/../.pyruntime-real/python-real`` and the
+            # resolved form ``${venv}/.pyruntime-real/python-real``
+            # compare equal. Skipped when venv_path is None (legacy
+            # fixture mode).
+            if venv_path is not None:
+                expected = _expected_exec_python_executable(venv_path)
+                if os.path.normpath(executable) != expected:
+                    _bail(
+                        f"executable {executable!r} is not the run's venv "
+                        f"real interpreter; expected {expected!r}. This "
+                        f"guards against agent-forged exec_python events."
+                    )
 
 
 def _iter_tool_result_blocks(entry):
@@ -1046,7 +1157,12 @@ def _iter_tool_use_blocks(entry):
         yield entry
 
 
-def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list[str]) -> bool:
+def _session_argv_matches_invocation(
+    session_argv: list[str],
+    visible_argv: list[str],
+    *,
+    venv_path: Path | None = None,
+) -> bool:
     """Return True iff a session_start's argv matches a transcript-visible
     python invocation's argv.
 
@@ -1056,13 +1172,13 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
     Interpreter argv[0] matching:
 
     - If the VISIBLE argv[0] contains any path separator (``/``), require
-      exact equality with the session's argv[0]. This covers absolute
-      paths (``/usr/bin/python3``) AND relative paths
-      (``./venv/bin/python``, ``../venv/bin/python``, ``venv/bin/python``).
-      Basename-only fallback for any of these would silently attribute an
-      off-venv interpreter to a same-args per-arm-venv session and lose
-      telemetry for the off-venv invocation. The visible path is
-      unambiguous and must identify the exact interpreter.
+      exact equality with the session's argv[0]. EXCEPTION (PR #5 R3 P1):
+      when ``venv_path`` is supplied AND both the session's argv[0] and
+      the visible argv[0] resolve to python-family executables under the
+      same venv root, treat them as equivalent. This bridges valid
+      ``${venv}/bin/python script.py`` invocations to their session
+      ``${venv}/.pyruntime-real/python-real script.py`` while still
+      rejecting off-venv absolute paths like ``/usr/bin/python``.
     - If the VISIBLE argv[0] is a bare token with no path separator
       (``python`` / ``python3`` / ``python3.11``), allow path-vs-basename
       fallback. The shell PATH-resolves the bare name to an absolute
@@ -1075,16 +1191,85 @@ def _session_argv_matches_invocation(session_argv: list[str], visible_argv: list
         return False
     if session_argv[0] == visible_argv[0]:
         return True
-    # Fallback ONLY when the visible argv[0] is a bare interpreter token
-    # (no path separators). Any path separator - leading, trailing, or
-    # embedded - implies the agent identified a specific interpreter and
-    # must match the session exactly.
     if "/" in visible_argv[0]:
+        # PR #5 R3 P1: bridge venv-internal path-qualified invocations.
+        # ``${venv}/bin/python script.py`` is the wrapper; the session's
+        # argv[0] is ``${venv}/.pyruntime-real/python-real script.py``.
+        # Both resolve under the same venv root; both are python-family.
+        if venv_path is not None and _both_under_same_venv_python(
+            session_argv[0], visible_argv[0], venv_path
+        ):
+            return True
         return False
-    return Path(session_argv[0]).name == Path(visible_argv[0]).name
+    session_basename = Path(session_argv[0]).name
+    visible_basename = Path(visible_argv[0]).name
+    # PR #5 R2: after the wrapper's ``exec "$real" "$@"`` the real python
+    # records ``sys.orig_argv[0]`` as the path to ``python-real``,
+    # regardless of which alias (``python`` / ``python3`` / ``python3.X``)
+    # the agent originally typed. The merger uses pid-keyed matching as
+    # the canonical bridge (see _validate_three_layer_consistency), but
+    # the legacy attribution still runs first. Treat any python-family
+    # basename (``python``, ``python3``, ``python3.X``, plus the
+    # ``-real`` variants) as equivalent for argv[0] matching: a visible
+    # ``python3 script.py`` should attribute to the session
+    # ``${venv}/.pyruntime-real/python-real script.py`` because the
+    # wrapper routed the invocation.
+    if _is_python_family_basename(session_basename) and _is_python_family_basename(
+        visible_basename
+    ):
+        return True
+    return session_basename == visible_basename
 
 
-def _attribute_python_invocations(transcript_entries: list[dict], events: list[dict]) -> None:
+_PYTHON_FAMILY_BASENAME_RE = re.compile(r"^(?:python(?:3(?:\.\d+)?)?(?:-real)?|\.actual-python)$")
+
+
+def _is_python_family_basename(name: str) -> bool:
+    """Return True if ``name`` is any python interpreter alias the
+    venv may produce: ``python``, ``python3``, ``python3.11``,
+    ``python-real``, ``python3-real``, ``python3.11-real``, or
+    ``.actual-python`` (the R3 two-stage hidden binary).
+    """
+    return bool(_PYTHON_FAMILY_BASENAME_RE.match(name))
+
+
+def _both_under_same_venv_python(session_argv0: str, visible_argv0: str, venv_path: Path) -> bool:
+    """Return True iff both paths resolve to a python-family executable
+    under ``venv_path``.
+
+    Used by ``_session_argv_matches_invocation`` to bridge
+    ``${venv}/bin/python script.py`` (visible) to the session's
+    ``${venv}/.pyruntime-real/python-real script.py``. Both paths must
+    normalize to a location inside ``venv_path`` AND have a
+    python-family basename.
+    """
+    venv_root = os.path.normpath(str(venv_path))
+    sess_norm = os.path.normpath(session_argv0)
+    if not sess_norm.startswith(venv_root + os.sep):
+        return False
+    # Visible may be absolute or relative. PR #5 R5 P1: relative visible
+    # paths like ``venv/bin/python`` and ``./venv/bin/python`` resolve
+    # against the run cwd (= venv_path.parent, since the runner sets
+    # cwd=tmpdir and the venv lives at tmpdir/venv). After resolution
+    # the path lands inside the venv root iff the relative form named
+    # the venv's own bin/.
+    if os.path.isabs(visible_argv0):
+        vis_norm = os.path.normpath(visible_argv0)
+    else:
+        vis_norm = os.path.normpath(str(venv_path.parent / visible_argv0))
+    if not vis_norm.startswith(venv_root + os.sep):
+        return False
+    return _is_python_family_basename(Path(sess_norm).name) and _is_python_family_basename(
+        Path(vis_norm).name
+    )
+
+
+def _attribute_python_invocations(
+    transcript_entries: list[dict],
+    events: list[dict],
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Per-invocation cross-check by argv matching.
 
     Every transcript-visible python invocation must match an unused
@@ -1128,7 +1313,7 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
             session_argv = sessions[idx].get("argv")
             if not isinstance(session_argv, list):
                 continue
-            if _session_argv_matches_invocation(session_argv, visible_argv):
+            if _session_argv_matches_invocation(session_argv, visible_argv, venv_path=venv_path):
                 matched_idx = idx
                 break
         if matched_idx is None:
@@ -1146,6 +1331,203 @@ def _attribute_python_invocations(transcript_entries: list[dict], events: list[d
         # reach attribution here, all session_starts are guaranteed to
         # have matching session_ends - no per-invocation check needed.
         available_idx.remove(matched_idx)
+
+
+def _partition_exec_python_events(
+    events: list[dict], runner_pid: int
+) -> tuple[list[dict], list[dict]]:
+    """Split ``exec_python`` events into ``(sentinel, agent)`` lists by ppid.
+
+    The wrapper records ``ppid`` as the parent of the wrapper invocation:
+        - The build-time sentinel runs as a direct child of the runner
+          process (``subprocess.run`` from ``run_one``), so its ppid equals
+          ``runner_pid``.
+        - Agent-spawned python invocations run under the ``claude --bare``
+          subprocess tree (``ppid != runner_pid``).
+
+    Binary partition by ``ppid == runner_pid`` - no process-tree
+    introspection needed.
+    """
+    sentinels: list[dict] = []
+    agents: list[dict] = []
+    for event in events:
+        if event.get("event") != "exec_python":
+            continue
+        if event.get("ppid") == runner_pid:
+            sentinels.append(event)
+        else:
+            agents.append(event)
+    return sentinels, agents
+
+
+def _validate_three_layer_consistency(
+    transcript_entries: list[dict],
+    events: list[dict],
+    runner_pid: int,
+) -> None:
+    """Three-layer cross-check: AST ↔ wrapper ↔ sitecustomize.
+
+    Rules (PR #5):
+
+    1. **Build-time sentinel demand**: the merged log MUST contain ≥1
+       sentinel ``exec_python`` event (``ppid == runner_pid``). Zero
+       sentinel events → ``RunValidityError``. Closes the shell-only-agent
+       gap: even a run with no agent-invoked python passes attestation if
+       the sentinel proves the wrapper was correctly wired before agent
+       spawn.
+
+    2. **Cardinality**: for each layer-1 invocation extracted by the AST
+       parser, require AT LEAST ONE matching agent ``exec_python`` event
+       AND AT LEAST ONE matching ``session_start`` event. (Agent events
+       only; sentinel events are excluded from cardinality match.) Surplus
+       runtime events are allowed (xargs/find/parallel spawn N children;
+       ``subprocess.Popen`` from a parent python spawns surplus).
+
+    3. **Match key**: ``argv[1:]`` equality. argv[0] differs by construction
+       (wrapper records ``argv[0] = "python"`` resolved by PATH; layer-2's
+       ``sys.orig_argv[0]`` is ``${venv}/.pyruntime-real/python-real`` after the
+       wrapper's ``exec``). The load-bearing tokens for attribution are
+       the script path + flags, not the interpreter.
+
+    4. **Failure messages** quote the failing layer name so audits can
+       grep by class.
+
+    5. **Bypass priority**: callers run bypass detection BEFORE this check
+       (see ``merge_layers`` orchestration). If layer-1 flags a bypass
+       invocation, the merger fails-closed on the bypass first; this
+       function does not get a chance to emit a "missing layer-1.5"
+       duplicate error.
+    """
+    sentinels, agent_exec_events = _partition_exec_python_events(events, runner_pid)
+    if not sentinels:
+        raise RunValidityError(
+            f"build-time sentinel missing: zero exec_python events with "
+            f"ppid={runner_pid} found in event log. Either the wrapper was "
+            f"not installed in the venv, the shim was not installed, or the "
+            f"sentinel subprocess failed silently. The cold-start eval is "
+            f"invalid."
+        )
+
+    sessions: list[dict] = [e for e in events if e.get("event") == "session_start"]
+    sessions_by_pid: dict[int, list[dict]] = {}
+    for s in sessions:
+        pid = s.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            sessions_by_pid.setdefault(pid, []).append(s)
+
+    all_exec_pids: set[int] = set()
+    for evt in sentinels + agent_exec_events:
+        pid = evt.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            all_exec_pids.add(pid)
+
+    # Reciprocal check #1 (R0 P0 #2): every exec_python event - sentinel
+    # and agent alike - MUST have a matching session_start by pid. The
+    # wrapper exec's into the real python, which loads sitecustomize and
+    # emits session_start with the SAME pid. A missing session_start
+    # means sitecustomize failed to load (e.g., the agent invoked the
+    # real python with ``-S`` which skips ``site.py`` import).
+    for evt in sentinels + agent_exec_events:
+        pid = evt.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if pid not in sessions_by_pid:
+            label = "sentinel" if evt in sentinels else "agent"
+            raise RunValidityError(
+                f"layer-2 attestation missing for {label} exec_python "
+                f"pid={pid}: no session_start event with matching pid. "
+                f"The wrapper recorded a python invocation but sitecustomize "
+                f"did not load (likely a ``-S`` flag or otherwise neutered "
+                f"site.py import). Cold-start eval is invalid."
+            )
+
+    # Reciprocal check #2 (R1 P0 #1): every session_start MUST have a
+    # matching exec_python by pid. The wrapper fires BEFORE sitecustomize
+    # (wrapper writes exec_python then exec's the real python which loads
+    # sitecustomize and emits session_start), so a session_start without
+    # a matching exec_python proves sitecustomize loaded on an interpreter
+    # the wrapper did NOT see. The only way that happens is the agent
+    # invoked the real interpreter directly (e.g.,
+    # ``${venv}/.pyruntime-real/python-real script.py`` via filesystem
+    # discovery, or a ``find -exec`` delegated form that found the real
+    # binary). The merger fails closed.
+    for s in sessions:
+        pid = s.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if pid not in all_exec_pids:
+            raise RunValidityError(
+                f"layer-1.5 attestation missing for session_start pid={pid}: "
+                f"no exec_python event with matching pid. Sitecustomize "
+                f"loaded but the layer-1.5 wrapper did NOT fire for this "
+                f"interpreter invocation. Likely a direct exec of the real "
+                f"interpreter that bypassed the wrapper. Cold-start eval "
+                f"is invalid."
+            )
+
+    # Reciprocal check: any exec_python.argv containing ``-S`` (or compact
+    # ``-Sc`` / ``-IS``) fails closed regardless of whether layer-1 saw the
+    # invocation. Catches ``find -exec python -S script.py \\;`` and other
+    # delegated forms the AST parser cannot model.
+    for evt in agent_exec_events:
+        argv = evt.get("argv")
+        if isinstance(argv, list) and argv_contains_bypass_flag(argv[1:]):
+            raise RunValidityError(
+                f"layer-1.5 bypass detected: agent exec_python argv={argv!r} "
+                f"contains ``-S`` (sitecustomize-disabling flag). The wrapper "
+                f"recorded the invocation but sitecustomize would not have "
+                f"loaded. Cold-start eval is invalid."
+            )
+
+    visible_invocations: list[tuple[str, list[str]]] = []
+    for entry in transcript_entries:
+        for block in _iter_tool_use_blocks(entry):
+            if block.get("name") != "Bash":
+                continue
+            tool_input = block.get("input") or block.get("tool_input")
+            if not isinstance(tool_input, dict):
+                continue
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                continue
+            try:
+                argvs = parse_python_invocations(command)
+            except (ShellCommandIndeterminate, ShellCommandParseError):
+                # Indeterminate or parse-failure commands are caught at the
+                # bypass / shell-parser layer; not our problem here.
+                continue
+            for argv in argvs:
+                if argv:
+                    visible_invocations.append((command, argv))
+
+    for command, visible_argv in visible_invocations:
+        # argv[1:] match against agent exec_python events.
+        wanted_argv_tail = visible_argv[1:]
+        layer15_match = any(
+            isinstance(e.get("argv"), list) and e["argv"][1:] == wanted_argv_tail
+            for e in agent_exec_events
+        )
+        if not layer15_match:
+            raise RunValidityError(
+                f"layer-1.5 attestation missing for layer-1 invocation: "
+                f"argv[1:]={wanted_argv_tail!r} in command {command[:160]!r}. "
+                f"The AST parser saw a python invocation but no agent "
+                f"exec_python event matched argv[1:]. Either the wrapper "
+                f"was bypassed (e.g., direct exec of python-real) or the "
+                f"event log was truncated."
+            )
+        # argv[1:] match against session_start events.
+        layer2_match = any(
+            isinstance(s.get("argv"), list) and s["argv"][1:] == wanted_argv_tail for s in sessions
+        )
+        if not layer2_match:
+            raise RunValidityError(
+                f"layer-2 attestation missing for layer-1 invocation: "
+                f"argv[1:]={wanted_argv_tail!r} in command {command[:160]!r}. "
+                f"The AST parser saw a python invocation but no session_start "
+                f"event matched argv[1:]. Sitecustomize did not load for this "
+                f"invocation."
+            )
 
 
 def _find_python_bypass_invocations_in_entries(entries: list[dict]) -> list[str]:
@@ -1239,7 +1621,12 @@ def _count_python_invocations(stream_json_path: Path) -> int:
     return count
 
 
-def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) -> None:
+def _validate_shim_loaded(
+    events: list[dict],
+    transcript_entries: list[dict],
+    *,
+    venv_path: Path | None = None,
+) -> None:
     """Cross-layer fail-closed check before building the record.
 
     Cases:
@@ -1265,6 +1652,23 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
                 "telemetry_missing sentinel present in event log; "
                 "the agent's event log disappeared post-exec and the run "
                 "is invalid for evaluation"
+            )
+        # PR #5 R17 P1 (EV-1): runner-written ``run_invalid`` sentinel
+        # marks runs the runner itself flagged as invalid post-spawn
+        # (e.g. ``descendants_live`` from R16 P1). Without this check,
+        # a downstream caller invoking ``merge_layers`` directly on
+        # the artifact set (without inspecting RunResult.exit_code or
+        # cli_stderr.log) could still produce a clean
+        # ``TelemetryRecord`` for a run the runner explicitly marked
+        # invalid. Mirror of the ``telemetry_missing`` rejection above.
+        if event.get("event") == "run_invalid":
+            reason = event.get("reason", "<reason missing>")
+            note = event.get("note", "")
+            raise TelemetryMergeError(
+                f"run_invalid sentinel present in event log "
+                f"(reason={reason!r}); the runner marked this run "
+                f"invalid post-spawn and it cannot be merged into a "
+                f"clean TelemetryRecord. note: {note}"
             )
     # A genuine shim-produced event log always writes `session_start`
     # before any hook events. Nonempty event log + zero session_starts
@@ -1321,7 +1725,7 @@ def _validate_shim_loaded(events: list[dict], transcript_entries: list[dict]) ->
             f"and bypasses the in-process shim, leaving layer-2 silently "
             f"incomplete."
         )
-    _attribute_python_invocations(transcript_entries, events)
+    _attribute_python_invocations(transcript_entries, events, venv_path=venv_path)
 
 
 def _build_diff_diff_record(
@@ -1434,8 +1838,20 @@ def merge_layers(
     stream_json_path: Path,
     in_process_events_path: Path,
     stderr_path: Path,
+    *,
+    runner_pid: int | None = None,
+    venv_path: Path | None = None,
 ) -> TelemetryRecord:
     """Merge the three telemetry layers into a single record.
+
+    Production-mode invocation requires BOTH ``runner_pid`` and
+    ``venv_path``: the former enables the three-layer sentinel demand
+    + reciprocal session_start <-> exec_python check; the latter enables
+    the venv-root-anchored ``executable`` allowlist on exec_python events.
+    Supplying only one is a validity footgun (the merger silently skips
+    the missing check); the merger raises ``ValueError`` instead.
+    Legacy fixture mode supplies neither and skips both checks.
+
 
     `arm` drives the sentinel semantics on guide-discovery fields (see
     TelemetryRecord docstring): for arm == "statsmodels", `opened_llms_*`
@@ -1505,6 +1921,15 @@ def merge_layers(
     guide-read scan, completeness check, and bypass detection all
     consume the parsed entries).
     """
+    # PR #5 R6 P2: production mode requires runner_pid + venv_path
+    # together. Each enables a different validity check; supplying one
+    # without the other silently skips the missing check.
+    if (runner_pid is None) != (venv_path is None):
+        raise ValueError(
+            "merge_layers production mode requires both runner_pid and "
+            "venv_path together (or neither for legacy fixture mode); "
+            f"got runner_pid={runner_pid!r}, venv_path={venv_path!r}"
+        )
     transcript_entries = _validate_layer_artifacts(stream_json_path, stderr_path)
     _validate_bash_tool_results_complete(transcript_entries)
     _validate_tool_use_ids_unique(transcript_entries)
@@ -1523,8 +1948,28 @@ def merge_layers(
             "was dropped mid-run and the per-run record may be silently "
             "incomplete"
         )
-    events = _read_events(in_process_events_path)
-    _validate_shim_loaded(events, transcript_entries)
+    events = _read_events(in_process_events_path, venv_path=venv_path)
+    # PR #5 R13 P1 (EV-1): legacy mode (runner_pid/venv_path both None)
+    # is reserved for fixture-style logs that contain ZERO exec_python
+    # events. If the log contains any exec_python event, the wrapper
+    # fired and the venv-root allowlist + three-layer consistency check
+    # MUST run. Fail closed rather than silently producing a clean
+    # TelemetryRecord that ignored layer-1.5.
+    if runner_pid is None and any(e.get("event") == "exec_python" for e in events):
+        raise TelemetryMergeError(
+            "merge_layers received an event log containing exec_python "
+            "events but runner_pid/venv_path were not supplied; layer-1.5 "
+            "validation (venv-root executable allowlist + three-layer "
+            "cross-check) would be silently skipped. Pass runner_pid + "
+            "venv_path together (production mode), or use a log with "
+            "zero exec_python events (legacy fixture mode)."
+        )
+    _validate_shim_loaded(events, transcript_entries, venv_path=venv_path)
+    # PR #5: three-layer cross-check fires only when the runner has
+    # supplied its pid (production path). Direct-call test fixtures that
+    # don't supply runner_pid stay in legacy mode (layer-1 + layer-2 only).
+    if runner_pid is not None:
+        _validate_three_layer_consistency(transcript_entries, events, runner_pid)
     if arm == "diff_diff":
         return _build_diff_diff_record(
             events,
