@@ -45,7 +45,12 @@ from harness.shell_parser import RunValidityError
 from harness.venv_pool import build_arm_template
 
 _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
-    "PATH",
+    # PR #5 R12 P0: ``PATH`` is intentionally NOT passed through. The
+    # operator's PATH may contain operator-local directories (e.g.,
+    # ``/opt/homebrew/bin``, ``~/.cargo/bin``, custom shims) that would
+    # leak operator state into a "cold-start" agent. The runner instead
+    # constructs a sanitized agent PATH explicitly: the per-arm venv's
+    # bin/ followed by a small system-bin allowlist (see _agent_path).
     "LANG",
     # Explicit LC_ enumeration (POSIX-defined keys). No `LC_*` wildcard so an
     # unrelated key like `LC_RPATH` cannot leak through.
@@ -57,6 +62,21 @@ _ALLOWLISTED_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "LC_COLLATE",
     "LC_MONETARY",
     "ANTHROPIC_API_KEY",
+)
+
+# PR #5 R12 P0: sanitized agent PATH. The runner prepends the per-run
+# venv bin (so the agent's ``python`` resolves to the wrapper) and
+# follows with a minimal system-bin allowlist (so utilities like
+# ``ls``, ``cat``, ``find`` resolve). Operator-local directories like
+# ``/opt/homebrew/bin``, ``~/.cargo/bin``, ``~/.local/bin`` are
+# intentionally excluded; an agent that needs an external tool the
+# venv doesn't provide must fail rather than reach into operator state.
+_AGENT_SYSTEM_PATH_DIRS: tuple[str, ...] = (
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
 )
 
 _TIMEOUT_MARKER_FMT = "=== TIMEOUT after {timeout}s; process killed ==="
@@ -150,14 +170,27 @@ class RunMetadata:
     arm: str  # "diff_diff" or "statsmodels"
 
 
-def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
+def clean_env(
+    tmpdir: Path,
+    event_log_path: Path,
+    *,
+    venv_bin_dir: Path | None = None,
+) -> dict[str, str]:
     """Construct the allowlisted environment for the spawned process.
 
     Two-tier construction:
-        - Passthrough keys (PATH, LANG, LC_*, ANTHROPIC_API_KEY): copied
+        - Passthrough keys (LANG, LC_*, ANTHROPIC_API_KEY): copied
           verbatim from os.environ if present. Dropped if absent.
-        - Runner-set keys (HOME, _PYRUNTIME_EVENT_LOG): ALWAYS set from
-          runner-computed values; any inherited operator value is IGNORED.
+        - Runner-set keys (HOME, _PYRUNTIME_EVENT_LOG, PATH): ALWAYS
+          set from runner-computed values; any inherited operator
+          value is IGNORED.
+
+    PR #5 R12 P0: ``PATH`` is RUNNER-SET, not passthrough. The agent
+    receives ``${venv_bin_dir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin``
+    (when ``venv_bin_dir`` is supplied) or just the system bin allowlist
+    (when it's None - probe / test paths). Operator-local directories
+    (``/opt/homebrew/bin``, ``~/.cargo/bin``, custom shims) are
+    intentionally excluded.
 
     No prefix scan, no wildcard. Anything not in either tier (XDG_CONFIG_HOME,
     CLAUDE_CONFIG_DIR, AWS/MCP/GitHub env, CODEX_*, etc.) is dropped.
@@ -167,6 +200,9 @@ def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
             (NOT the operator's homedir) so any `~` lookup lands in the sandbox.
         event_log_path: path to the per-run in-process event log. Becomes
             _PYRUNTIME_EVENT_LOG so the in-process shim writes there.
+        venv_bin_dir: per-arm venv's bin/ directory. Prepended to the
+            sanitized agent PATH so the agent's ``python`` resolves to
+            the layer-1.5 wrapper.
 
     Returns:
         Dict suitable for subprocess.Popen's env= argument.
@@ -178,10 +214,31 @@ def clean_env(tmpdir: Path, event_log_path: Path) -> dict[str, str]:
             env[key] = value
     env["HOME"] = str(tmpdir)
     env["_PYRUNTIME_EVENT_LOG"] = str(event_log_path)
+    if venv_bin_dir is not None:
+        env["PATH"] = os.pathsep.join([str(venv_bin_dir), *_AGENT_SYSTEM_PATH_DIRS])
+    else:
+        env["PATH"] = os.pathsep.join(_AGENT_SYSTEM_PATH_DIRS)
     return env
 
 
-def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
+def _resolve_claude_executable() -> str:
+    """Resolve ``claude`` to an absolute path using the operator's PATH.
+
+    PR #5 R12 P0: the spawned agent's PATH is sanitized (operator-local
+    directories are excluded), so the runner must invoke ``claude`` by
+    absolute path - the agent's PATH no longer reaches into operator
+    state to find it. Resolution happens once at runner construction
+    time using the operator's PATH (which DOES contain the directory
+    where claude is installed). Raises ``FileNotFoundError`` if claude
+    is not on the operator's PATH.
+    """
+    claude = shutil.which("claude")
+    if claude is None:
+        raise FileNotFoundError("`claude` not found on operator PATH; install Claude Code first")
+    return claude
+
+
+def _build_command(claude_path: str, prompt: str, tmpdir: Path, model: str) -> list[str]:
     """Construct the exact locked argv for `claude --bare ...`.
 
     The seven cold-start isolation flags are: --bare, --setting-sources "",
@@ -191,9 +248,14 @@ def _build_command(prompt: str, tmpdir: Path, model: str) -> list[str]:
 
     `--model <id>` is additional: it pins the model so CLI defaults can't
     drift across runs. The value is `RunConfig.model`.
+
+    PR #5 R12 P0: ``claude_path`` is the absolute path to the claude
+    binary, resolved once via ``_resolve_claude_executable()``. The
+    agent's PATH is sanitized and may not include the directory where
+    claude lives, so the runner invokes claude by absolute path.
     """
     return [
-        "claude",
+        claude_path,
         "--bare",
         "--setting-sources",
         "",
@@ -303,11 +365,14 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             f"wrapper or shim not wired correctly; stderr={sentinel_result.stderr!r}"
         )
 
-    env = clean_env(tmpdir, agent_event_log_path)
-    # Prepend the venv's bin/ to PATH so the agent's `python` resolves to
-    # the wrapper, not the operator's interpreter.
-    env["PATH"] = f"{venv_dir / 'bin'}{os.pathsep}{env.get('PATH', '')}"
-    cmd = _build_command(prompt, tmpdir, config.model)
+    # PR #5 R12 P0: clean_env now sets a sanitized PATH containing only
+    # the per-arm venv bin + system bin allowlist. Operator-local
+    # directories (~/.cargo/bin, /opt/homebrew/bin, etc.) do NOT leak
+    # into the agent's PATH. ``claude`` is invoked by absolute path
+    # below since the agent's PATH may not contain the directory where
+    # it lives.
+    env = clean_env(tmpdir, agent_event_log_path, venv_bin_dir=venv_dir / "bin")
+    cmd = _build_command(_resolve_claude_executable(), prompt, tmpdir, config.model)
 
     start = time.monotonic()
     timed_out = False

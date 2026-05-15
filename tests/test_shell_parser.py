@@ -322,6 +322,12 @@ def test_find_python_bypass_invocations_negative(command):
         (["-m", "-S"], False),  # -m MODULE; -S is the module name (rare but valid)
         (["-W", "ignore", "-S"], True),  # -W consumes ignore, -S still flag
         (["-X", "dev", "-S"], True),  # -X consumes dev, -S still flag
+        # R12 P2: attached forms -W.../-X... carry payload in same element
+        (["-Werror::SomeWarning", "script.py"], False),  # S in -W payload, not bypass
+        (["-Xdev", "script.py"], False),  # X attached payload
+        (["-Werror::SomeWarning", "-S"], True),  # attached -W, then real -S
+        (["-cprint(1)"], False),  # attached -c payload contains nothing relevant
+        (["-cimport os; print('S')"], False),  # attached -c with S in payload
         # Plain script arg ends the region; -S after script arg is the
         # script's own arg, not an interpreter flag.
         (["script.py", "-S"], False),

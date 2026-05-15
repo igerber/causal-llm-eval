@@ -7,6 +7,7 @@ flow without spawning live agents. Live tests are in test_runner_live.py
 
 from __future__ import annotations
 
+import os
 import subprocess
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -77,7 +78,14 @@ def test_clean_env_returns_only_allowlist(tmp_path, monkeypatch):
 
     env = clean_env(tmp_path, tmp_path / "events.jsonl")
 
-    expected_max = set(_ALLOWLISTED_PASSTHROUGH_KEYS) | {"HOME", "_PYRUNTIME_EVENT_LOG"}
+    # PR #5 R12 P0: PATH is now runner-set (not in
+    # _ALLOWLISTED_PASSTHROUGH_KEYS) so the expected key set explicitly
+    # includes it as a runner-set key.
+    expected_max = set(_ALLOWLISTED_PASSTHROUGH_KEYS) | {
+        "HOME",
+        "_PYRUNTIME_EVENT_LOG",
+        "PATH",
+    }
     leaks = set(env) - expected_max
     assert not leaks, f"clean_env leaked non-allowlisted keys: {leaks}"
     for forbidden in (
@@ -144,7 +152,7 @@ def test_clean_env_lc_keys_explicit_no_wildcard(tmp_path, monkeypatch):
 
 def test_build_command_includes_all_seven_locked_flags(tmp_path):
     """The seven required cold-start flags are all present, with exact tokens."""
-    cmd = _build_command("test prompt", tmp_path, "claude-opus-4-7")
+    cmd = _build_command("/usr/local/bin/claude", "test prompt", tmp_path, "claude-opus-4-7")
     assert "--bare" in cmd
     assert "--setting-sources" in cmd
     idx = cmd.index("--setting-sources")
@@ -164,14 +172,18 @@ def test_build_command_includes_all_seven_locked_flags(tmp_path):
 
 def test_build_command_uses_bare_first(tmp_path):
     """--bare must precede other flags (CLI semantics)."""
-    cmd = _build_command("p", tmp_path, "claude-opus-4-7")
-    assert cmd[0] == "claude"
+    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-opus-4-7")
+    # PR #5 R12 P0: cmd[0] is now the absolute claude path (resolved
+    # before invocation since the agent's PATH is sanitized and may not
+    # contain claude's directory). Assert basename is "claude" rather
+    # than literal equality.
+    assert os.path.basename(cmd[0]) == "claude"
     assert cmd[1] == "--bare"
 
 
 def test_build_command_includes_model_flag(tmp_path):
     """--model pins the model so CLI defaults can't drift across runs."""
-    cmd = _build_command("p", tmp_path, "claude-opus-4-7")
+    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-opus-4-7")
     assert "--model" in cmd
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "claude-opus-4-7"
@@ -179,7 +191,7 @@ def test_build_command_includes_model_flag(tmp_path):
 
 def test_build_command_passes_through_arbitrary_model_string(tmp_path):
     """The model string is whatever RunConfig.model holds, not hardcoded."""
-    cmd = _build_command("p", tmp_path, "claude-sonnet-4-6")
+    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-sonnet-4-6")
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "claude-sonnet-4-6"
 
@@ -455,3 +467,47 @@ def test_run_one_on_timeout_handles_already_dead_process_group(tmp_path):
     assert result.exit_code == -1
     stderr_content = (output_dir / "cli_stderr.log").read_text()
     assert "TIMEOUT" in stderr_content
+
+
+# -- PR #5 R12 P0: sanitized agent PATH --
+
+
+def test_clean_env_path_excludes_operator_path(tmp_path, monkeypatch):
+    """R12 P0: clean_env's PATH must NOT pass operator PATH through.
+    Operator-local directories (~/.cargo/bin, /opt/homebrew/bin, etc.)
+    cannot leak into the agent's PATH.
+    """
+    monkeypatch.setenv(
+        "PATH",
+        "/Users/operator/.cargo/bin:/opt/homebrew/bin:/Users/operator/.local/bin:/usr/bin",
+    )
+    env = clean_env(tmp_path, tmp_path / "events.jsonl")
+    # Operator-local entries dropped.
+    assert "/Users/operator/.cargo/bin" not in env["PATH"]
+    assert "/opt/homebrew/bin" not in env["PATH"]
+    assert "/Users/operator/.local/bin" not in env["PATH"]
+    # System bins present.
+    assert "/usr/bin" in env["PATH"]
+
+
+def test_clean_env_path_includes_venv_bin_when_supplied(tmp_path):
+    """When venv_bin_dir is supplied, it's PREPENDED to the sanitized
+    PATH so the agent's `python` resolves to the wrapper first.
+    """
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    env = clean_env(tmp_path, tmp_path / "events.jsonl", venv_bin_dir=venv_bin)
+    parts = env["PATH"].split(os.pathsep)
+    assert parts[0] == str(venv_bin)
+    assert "/usr/bin" in parts
+
+
+def test_clean_env_path_is_runner_set_not_passthrough(tmp_path, monkeypatch):
+    """Operator's PATH cannot influence the agent's PATH at all -
+    even setting an empty operator PATH yields the runner-computed
+    sanitized agent PATH.
+    """
+    monkeypatch.setenv("PATH", "")
+    env = clean_env(tmp_path, tmp_path / "events.jsonl")
+    assert env["PATH"]  # non-empty (runner-set)
+    assert "/usr/bin" in env["PATH"]

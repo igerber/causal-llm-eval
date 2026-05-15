@@ -738,12 +738,23 @@ def argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
             # End-of-options; subsequent tokens are non-flag argv.
             return False
         if tok in ("-c", "-m"):
-            # Consume next token verbatim (script payload); then end of
-            # interpreter-flag region.
+            # Consume next argv element verbatim (script payload); then
+            # end of interpreter-flag region.
+            return False
+        if tok.startswith("-c") or tok.startswith("-m"):
+            # Attached forms ``-cCODE`` / ``-mMODULE`` are also valid; the
+            # rest of the element is the script payload, no extra
+            # consumption.
             return False
         if tok in ("-W", "-X"):
-            # Consume next token verbatim; flag scanning continues.
+            # Consume next argv element verbatim; flag scanning continues.
             i += 2
+            continue
+        if tok.startswith("-W") or tok.startswith("-X"):
+            # Attached forms ``-Werror::SomeWarning`` / ``-Xdev`` carry
+            # the option payload in the same argv element. Skip without
+            # scanning the payload for ``S``.
+            i += 1
             continue
         if tok.startswith("--"):
             # Long flag - python has none that contain ``S`` in the

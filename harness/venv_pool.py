@@ -218,9 +218,9 @@ while [ $i -lt $orig_count ]; do
                 continue
                 ;;
             -c|-m)
-                # -c CODE / -m MODULE: next token is the script payload.
-                # After this token+arg, remaining args are sys.argv to the
-                # script and must NOT be S-stripped.
+                # -c CODE / -m MODULE: next argv element is the script
+                # payload. After this element+arg, remaining args are
+                # sys.argv to the script and must NOT be S-stripped.
                 set -- "$@" "$a"
                 if [ $i -lt $((orig_count - 1)) ]; then
                     next="$1"
@@ -233,9 +233,17 @@ while [ $i -lt $orig_count ]; do
                 seen_script=1
                 continue
                 ;;
+            -c*|-m*)
+                # Attached form -cCODE / -mMODULE: rest of the element
+                # is the script payload, no extra consumption.
+                set -- "$@" "$a"
+                i=$((i + 1))
+                seen_script=1
+                continue
+                ;;
             -W|-X)
-                # -W FILTER / -X OPTION: consumes next token verbatim,
-                # but interpreter flag scanning continues afterward.
+                # -W FILTER / -X OPTION (separate form): consumes next
+                # argv element verbatim; flag scanning continues.
                 set -- "$@" "$a"
                 if [ $i -lt $((orig_count - 1)) ]; then
                     next="$1"
@@ -245,6 +253,14 @@ while [ $i -lt $orig_count ]; do
                 else
                     i=$((i + 1))
                 fi
+                continue
+                ;;
+            -W*|-X*)
+                # Attached form -Werror::SomeWarning / -Xdev: payload
+                # is in the same element. Pass through without scanning
+                # the payload for ``S``.
+                set -- "$@" "$a"
+                i=$((i + 1))
                 continue
                 ;;
             -*S*)
