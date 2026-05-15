@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/bin/sh
 # Layer-1.5 exec wrapper around the per-arm venv's python interpreter.
 #
 # Installed by harness.venv_pool._install_python_wrapper. For every invocation
@@ -23,6 +23,17 @@
 # POSIX-only: no bashisms (no [[ ]], no arrays, no ${var//pat/repl}).
 # Tested compatible with dash, mawk/gawk/busybox awk, macOS bash 3.2 in
 # POSIX mode.
+#
+# PR #5 R9 P0: pin internal command resolution to a trusted system PATH
+# so an agent that drops malicious files into ${venv}/bin/ (e.g.,
+# venv/bin/sh, venv/bin/awk, venv/bin/dirname, venv/bin/date) cannot
+# hijack the wrapper's helper utilities. We save the agent's PATH
+# (which the runner prepends with ${venv}/bin) and restore it just
+# before exec'ing python-real, so the agent's own python invocations
+# still resolve correctly.
+agent_path="${PATH-}"
+PATH="/usr/bin:/bin"
+export PATH
 
 # Resolve $0 to its absolute directory so the recorded ``executable``
 # path is canonical regardless of how the wrapper was invoked
@@ -113,5 +124,13 @@ if [ -n "$log" ]; then
         exit 2
     }
 fi
+
+# PR #5 R9 P0: restore the agent's PATH (which the runner prepended
+# with ${venv}/bin) before exec'ing python-real. Agent code that
+# spawns subprocesses via PATH resolution still gets the same view it
+# had on entry. Only the wrapper's INTERNAL command resolution was
+# pinned to /usr/bin:/bin.
+PATH="$agent_path"
+export PATH
 
 exec "$real" "$@"

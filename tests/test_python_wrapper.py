@@ -295,3 +295,70 @@ def test_wrapper_overrides_inherited_event_log_with_canonical_path(venv_layout_f
     assert evt["event"] == "exec_python"
     # Fake retarget destination remains empty.
     assert not fake_log.exists() or fake_log.read_text() == ""
+
+
+def test_wrapper_uses_absolute_shebang_not_path_resolved(venv_layout_fake):
+    """R9 P0: wrapper shebang must be ``#!/bin/sh`` (absolute path),
+    not ``#!/usr/bin/env sh`` (PATH-resolved). Otherwise an agent that
+    writes ``${venv}/bin/sh`` could hijack the wrapper invocation.
+    """
+    runner_root, venv_dir, _ = venv_layout_fake
+    wrapper = venv_dir / "bin" / "python"
+    first_line = wrapper.read_text().splitlines()[0]
+    assert first_line == "#!/bin/sh", (
+        f"wrapper shebang must be absolute (#!/bin/sh) to prevent "
+        f"agent-shadowed sh in venv/bin/; got {first_line!r}"
+    )
+
+
+def test_wrapper_resists_shadowed_sh_in_venv_bin(venv_layout_fake, tmp_path):
+    """R9 P0: agent drops a malicious ``${venv}/bin/sh`` (e.g., ``exit 1``).
+    Because the wrapper's shebang is ``#!/bin/sh`` (absolute), the
+    malicious shadow is never used. Telemetry still lands.
+    """
+    runner_root, venv_dir, canonical_log = venv_layout_fake
+    # Agent shadows venv/bin/sh.
+    bad_sh = venv_dir / "bin" / "sh"
+    bad_sh.write_text("#!/bin/sh\nexit 1\n")
+    bad_sh.chmod(0o755)
+    canonical_log.write_text("")  # reset
+    subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "pass"],
+        check=True,
+        env={
+            "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(canonical_log),  # ignored; canonical override applies
+        },
+        capture_output=True,
+    )
+    events = canonical_log.read_text().strip()
+    assert events, "wrapper failed to write event despite shadowed venv/bin/sh"
+    evt = json.loads(events.splitlines()[0])
+    assert evt["event"] == "exec_python"
+
+
+def test_wrapper_resists_shadowed_awk_in_venv_bin(venv_layout_fake):
+    """R9 P0: agent drops a malicious ``${venv}/bin/awk``. Because the
+    wrapper internally pins PATH=/usr/bin:/bin, the shadow is never
+    used.
+    """
+    runner_root, venv_dir, canonical_log = venv_layout_fake
+    bad_awk = venv_dir / "bin" / "awk"
+    bad_awk.write_text("#!/bin/sh\necho '[hijacked]'\nexit 0\n")
+    bad_awk.chmod(0o755)
+    canonical_log.write_text("")
+    subprocess.run(
+        [str(venv_dir / "bin" / "python"), "-c", "pass"],
+        check=True,
+        env={
+            "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+            "_PYRUNTIME_EVENT_LOG": str(canonical_log),
+        },
+        capture_output=True,
+    )
+    events = canonical_log.read_text().strip()
+    assert events, "wrapper failed despite shadowed venv/bin/awk"
+    evt = json.loads(events.splitlines()[0])
+    # Real awk produced a real JSON event, not the hijacked output.
+    assert evt["event"] == "exec_python"
+    assert "argv" in evt

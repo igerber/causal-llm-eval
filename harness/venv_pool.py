@@ -184,7 +184,7 @@ _REAL_INTERPRETER_FILENAME = "python-real"
 _ACTUAL_INTERPRETER_FILENAME = ".actual-python"
 
 _PYTHON_REAL_STRIP_S_SCRIPT = """\
-#!/usr/bin/env sh
+#!/bin/sh
 # Layer-1.5 strip-S shim. Sits between the wrapper (or any direct
 # invoker) and the real CPython binary at
 # ``${VENV}/.pyruntime-real/.actual-python``. Strips ``-S`` (and compact
@@ -194,6 +194,13 @@ _PYTHON_REAL_STRIP_S_SCRIPT = """\
 # Argv preservation: rebuilds positional parameters via ``set --`` rather
 # than string flattening, so quoted args containing spaces / globs / tabs
 # pass through unchanged.
+#
+# PR #5 R9 P0: pin internal command resolution to /usr/bin:/bin so
+# ``dirname`` / ``sed`` cannot be hijacked by agent files in
+# ``${venv}/bin/``. Restore the agent's PATH before exec.
+agent_path="${PATH-}"
+PATH="/usr/bin:/bin"
+export PATH
 actual="$(dirname "$0")/.actual-python"
 seen_script=0
 orig_count=$#
@@ -238,6 +245,8 @@ while [ $i -lt $orig_count ]; do
     set -- "$@" "$a"
     i=$((i + 1))
 done
+PATH="$agent_path"
+export PATH
 exec "$actual" "$@"
 """
 
