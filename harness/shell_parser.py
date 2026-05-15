@@ -488,6 +488,15 @@ def parse_python_invocations(command: str) -> list[list[str]]:
 _REAL_INTERPRETER_BYPASS_RE = re.compile(
     r"\.pyruntime-real\b|\bpython(?:3(?:\.\d+)?)?-real\b|\.actual-python\b"
 )
+# PR #5 R7 P0: substring detection for any visible reference to the
+# shim's event-log env var. Covers delegated retarget forms the AST
+# walker cannot model (``find -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake
+# python ...``, ``xargs -I {} env _PYRUNTIME_EVENT_LOG=...``, etc.).
+# The runner sets ``_PYRUNTIME_EVENT_LOG`` once at agent spawn; any
+# subsequent visible reference to this name in a Bash command IS an
+# attempt to retarget or unset the shim's log destination, regardless
+# of how deeply nested the exec is.
+_PYRUNTIME_EVENT_LOG_REF_RE = re.compile(r"\b_PYRUNTIME_EVENT_LOG\b")
 
 
 def find_python_bypass_invocations(command: str) -> list[str]:
@@ -525,6 +534,12 @@ def find_python_bypass_invocations(command: str) -> list[str]:
     # the token sits inside a delegated execution argv (find -exec,
     # xargs, fd -x, parallel) that the AST walker cannot model.
     if _REAL_INTERPRETER_BYPASS_RE.search(command):
+        return [command]
+    # PR #5 R7 P0: any visible reference to ``_PYRUNTIME_EVENT_LOG`` is
+    # also a bypass primitive. The runner sets this env var once at
+    # agent spawn; the agent has no legitimate reason to mention it.
+    # Catches delegated retarget forms the AST cannot model.
+    if _PYRUNTIME_EVENT_LOG_REF_RE.search(command):
         return [command]
     nodes = _parse(command)
     has_activation = False

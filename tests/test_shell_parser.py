@@ -486,3 +486,57 @@ def test_find_python_bypass_detects_pyruntime_event_log_prefix_on_python():
     cmd = "_PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
     bypasses = find_python_bypass_invocations(cmd)
     assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_find_exec():
+    """R7 P0: ``find -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake python ...``
+    delegated form. The visible reference to _PYRUNTIME_EVENT_LOG is
+    caught by substring detection regardless of how deeply nested the
+    exec is.
+    """
+    cmd = r"find . -exec env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_xargs():
+    """``xargs -I {} env _PYRUNTIME_EVENT_LOG=...`` delegated form."""
+    cmd = "printf 'a\\n' | xargs -I {} env _PYRUNTIME_EVENT_LOG=/tmp/fake " "python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_parallel():
+    """``parallel 'env _PYRUNTIME_EVENT_LOG=...'`` delegated form."""
+    cmd = "parallel 'env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py' ::: a"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_delegated_pyruntime_event_log_fd():
+    """``fd -x env _PYRUNTIME_EVENT_LOG=...`` delegated form."""
+    cmd = "fd -x env _PYRUNTIME_EVENT_LOG=/tmp/fake python script.py"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_detects_pyruntime_event_log_unset_via_env():
+    """``find . -exec env -u _PYRUNTIME_EVENT_LOG python ...`` unset
+    variant; same substring catches it.
+    """
+    cmd = r"find . -exec env -u _PYRUNTIME_EVENT_LOG python script.py \;"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
+
+
+def test_find_python_bypass_does_not_flag_pyruntime_event_log_substring_in_path():
+    """A path that happens to contain ``_PYRUNTIME_EVENT_LOG`` as a
+    substring (e.g., ``/tmp/_PYRUNTIME_EVENT_LOG_test``) does match the
+    word-boundary regex and is flagged. This is intentional: the
+    substring is so specific that any non-runner reference is suspect.
+    """
+    # Verify the word-boundary IS triggered by the bare token in any
+    # context.
+    cmd = "echo '_PYRUNTIME_EVENT_LOG is the var name'"
+    bypasses = find_python_bypass_invocations(cmd)
+    assert bypasses == [cmd]
