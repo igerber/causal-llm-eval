@@ -188,21 +188,52 @@ def _parse_jsonl_strict(path: Path, label: str) -> list[dict]:
     return events
 
 
-# Substring marker the shim's `_write_event` prints to stderr when a write
-# fails mid-run. Used by the merger to fail-closed when telemetry events were
-# dropped after the hook deliberately continued executing the wrapped call.
-_SHIM_WRITE_FAILURE_MARKER = "[pyruntime] cannot write event"
+# Substring markers the layer-1.5 wrapper and layer-2 sitecustomize shim
+# print to stderr when an event write fails mid-run. Used by the merger to
+# fail-closed when telemetry events were dropped:
+#
+#   * ``[pyruntime] cannot write event`` - emitted by sitecustomize's
+#     ``_write_event`` (layer-2) when an event-log write fails after
+#     session_start has fired. The hook wrappers catch transient OSError
+#     so the agent's diff_diff call still completes; the marker is the
+#     only signal that an event was dropped.
+#   * ``[pyruntime-wrapper]`` - PR #5 R18 P1 (EV-1): emitted by the
+#     layer-1.5 wrapper script (``harness/python_wrapper.sh``) when its
+#     append to ``_PYRUNTIME_EVENT_LOG`` fails or argv attestation fails
+#     (e.g., embedded newline). The wrapper exits with code 2 in those
+#     cases, but for delegated forms the layer-1 AST parser does not
+#     model (``find -exec python``, ``xargs python``, ``parallel python``)
+#     a forced-zero shell status or stderr suppression could otherwise
+#     produce a clean record with no exec_python event. Both producers'
+#     fatal stderr vocabularies are scanned together.
+_FATAL_TELEMETRY_STDERR_MARKERS = (
+    "[pyruntime] cannot write event",
+    "[pyruntime-wrapper]",
+)
+# Backwards-compat alias for any external code referencing the prior name.
+_SHIM_WRITE_FAILURE_MARKER = _FATAL_TELEMETRY_STDERR_MARKERS[0]
+
+
+def _has_fatal_telemetry_marker(text: str) -> bool:
+    """Return True iff ``text`` contains any layer-1.5/layer-2 fatal
+    telemetry marker (sitecustomize event-write failure or wrapper
+    failure).
+    """
+    return any(marker in text for marker in _FATAL_TELEMETRY_STDERR_MARKERS)
 
 
 def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
-    """Return True if outer Claude CLI stderr contains the shim's event-write
-    failure marker.
+    """Return True if outer Claude CLI stderr contains any layer-1.5 or
+    layer-2 fatal telemetry marker.
 
     The shim's hook wrappers catch transient OSError on event writes so the
     agent's diff_diff call still completes (avoids aborting on telemetry
     hiccups). When that happens, `_write_event` first prints
-    `[pyruntime] cannot write event to <path>: <err>` to stderr. The merger
-    looks for that marker post-hoc: presence means at least one event was
+    `[pyruntime] cannot write event to <path>: <err>` to stderr. PR #5
+    R18 P1 (EV-1): the layer-1.5 wrapper also emits
+    `[pyruntime-wrapper] cannot append ...` / `[pyruntime-wrapper] argv
+    contains embedded newline; cannot attest`. The merger looks for
+    either marker post-hoc: presence means at least one event was
     dropped, so the per-run record may be silently incomplete.
 
     NOTE: this only covers stderr from the outer ``claude --bare`` process.
@@ -218,19 +249,20 @@ def _scan_stderr_for_shim_failures(stderr_path: Path) -> bool:
         # Existence was already validated; a read error here is itself a
         # capture problem worth surfacing.
         return True
-    return _SHIM_WRITE_FAILURE_MARKER in content
+    return _has_fatal_telemetry_marker(content)
 
 
 def _scan_tool_results_for_shim_failures(transcript_entries: list[dict]) -> bool:
-    """Return True if any Bash ``tool_result`` content contains the shim's
-    event-write failure marker.
+    """Return True if any Bash ``tool_result`` content contains a
+    layer-1.5 or layer-2 fatal telemetry marker.
 
-    Most shim event-write failures occur inside an agent-spawned python
+    Most fatal telemetry markers surface inside an agent-spawned python
     subprocess (Claude's Bash tool runs the python child whose stderr is
     captured by Claude into the matching ``tool_result`` block). The
     outer ``cli_stderr.log`` only carries stderr from the ``claude
     --bare`` process itself, which rarely sees inner subprocess output,
-    so a marker emitted by the shim is invisible to the layer-3 scan.
+    so a marker emitted by the shim or wrapper is invisible to the
+    layer-3 scan.
 
     Iterating ``tool_result`` blocks closes that gap. Stringified content
     (Claude sometimes returns a single string) and list-shaped content
@@ -238,20 +270,25 @@ def _scan_tool_results_for_shim_failures(transcript_entries: list[dict]) -> bool
     fail closed; per-block granularity is not needed because the
     per-run record cannot be trusted once a single event is known to
     have been dropped.
+
+    PR #5 R18 P1 (EV-1): also matches the wrapper's ``[pyruntime-wrapper]``
+    failure marker, closing the delegated-form telemetry-loss path
+    (``find -exec python``, ``xargs python``, ``parallel python``)
+    where the layer-1 AST parser does not model the invocation.
     """
     for entry in transcript_entries:
         for block in _iter_tool_result_blocks(entry):
             content = block.get("content")
             if isinstance(content, str):
-                if _SHIM_WRITE_FAILURE_MARKER in content:
+                if _has_fatal_telemetry_marker(content):
                     return True
             elif isinstance(content, list):
                 for sub in content:
                     if isinstance(sub, dict):
                         text = sub.get("text") or sub.get("content") or ""
-                        if isinstance(text, str) and _SHIM_WRITE_FAILURE_MARKER in text:
+                        if isinstance(text, str) and _has_fatal_telemetry_marker(text):
                             return True
-                    elif isinstance(sub, str) and _SHIM_WRITE_FAILURE_MARKER in sub:
+                    elif isinstance(sub, str) and _has_fatal_telemetry_marker(sub):
                         return True
     return False
 

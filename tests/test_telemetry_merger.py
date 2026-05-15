@@ -2372,6 +2372,79 @@ def test_merge_layers_diff_diff_raises_on_tool_result_marker_in_list_content(tmp
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_raises_on_tool_result_wrapper_failure_marker(tmp_path):
+    """R18 P1 (EV-1): the layer-1.5 wrapper script emits
+    ``[pyruntime-wrapper] cannot append ...`` to stderr on event-log
+    write failure. Pre-R18 the merger only scanned for the layer-2
+    sitecustomize marker (``[pyruntime] cannot write event``), so a
+    delegated form like ``find . -name '*.py' -exec python {} \\;``
+    that triggered a wrapper append failure would emit no
+    ``exec_python``, no ``session_start``, no recognized marker -> a
+    clean shell-only-looking record. Post-R18 both producers'
+    failure markers are scanned together. This test simulates the
+    delegated-form failure by placing the wrapper marker in a
+    tool_result.content (as it would arrive when the wrapper's
+    stderr is captured by Claude's Bash tool).
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    transcript_entries = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": "bash_1",
+                        "input": {"command": "find . -name '*.py' -exec python {} \\;"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "bash_1",
+                        "is_error": False,
+                        "content": (
+                            "[pyruntime-wrapper] cannot append to "
+                            "/tmp/run123/.pyruntime/events.jsonl: "
+                            "[Errno 28] No space left on device\n"
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    _write_transcript_entries(transcript, transcript_entries)
+    with pytest.raises(TelemetryMergeError, match="shim event-write failure marker.*tool_result"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_raises_on_stderr_wrapper_failure_marker(tmp_path):
+    """R18 P1 (EV-1) mirror: wrapper failure marker in
+    ``cli_stderr.log`` (outer claude --bare stderr) is also scanned
+    and rejected. Mirrors the existing
+    ``test_merge_layers_diff_diff_raises_on_shim_write_failure_marker``
+    pattern for the layer-1.5 producer.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(events_path, [_session_start_event()])
+    _write_transcript(transcript, [])
+    stderr_log.write_text(
+        "some unrelated output\n"
+        "[pyruntime-wrapper] argv contains embedded newline; cannot attest\n"
+    )
+    with pytest.raises(TelemetryMergeError, match="shim event-write failure marker"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_heredoc_body_not_treated_as_invocation(tmp_path):
     """R13 P2: a heredoc body like ``cat <<'EOF'\\npython x.py\\nEOF`` is
     cat-creates-file data, not a python invocation. Pre-R13 the regex
