@@ -393,6 +393,59 @@ def test_merge_layers_diff_diff_raises_on_telemetry_missing_sentinel(tmp_path):
         merge_layers("diff_diff", transcript, events_path, stderr_log)
 
 
+def test_merge_layers_raises_on_run_invalid_descendants_live_sentinel(tmp_path):
+    """R17 P1 (EV-1): runner-written ``run_invalid`` sentinel (with
+    reason=``descendants_live`` from the R16 P1 fix) must make the run
+    unmergeable. Without this, a downstream caller invoking
+    ``merge_layers`` directly on the artifact set (without inspecting
+    RunResult.exit_code or cli_stderr.log) could produce a clean
+    ``TelemetryRecord`` for a run the runner explicitly marked invalid.
+    Mirror of the telemetry_missing rejection above.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            # A normal session_start to demonstrate the run_invalid
+            # rejection fires REGARDLESS of other telemetry presence.
+            _session_start_event(),
+            {
+                "event": "run_invalid",
+                "fatal": True,
+                "reason": "descendants_live",
+                "note": "agent process group had surviving children after main process exited",
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="run_invalid sentinel.*descendants_live"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_merge_layers_raises_on_run_invalid_with_arbitrary_reason(tmp_path):
+    """R17 P1 (EV-1): the run_invalid rejection is reason-agnostic;
+    any future invariant the runner adds (e.g., a new post-spawn
+    quiescence check) gets rejection for free as long as it writes
+    the run_invalid sentinel.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            {
+                "event": "run_invalid",
+                "fatal": True,
+                "reason": "future_post_spawn_invariant_X",
+                "note": "hypothetical future invariant violation",
+            },
+        ],
+    )
+    with pytest.raises(
+        TelemetryMergeError,
+        match="run_invalid sentinel.*future_post_spawn_invariant_X",
+    ):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
 def test_merge_layers_diff_diff_raises_on_malformed_jsonl(tmp_path):
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     events_path.write_text("{not valid json\n")

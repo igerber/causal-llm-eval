@@ -834,6 +834,22 @@ def test_run_one_marks_run_invalid_when_descendants_survive_normal_exit(tmp_path
     assert (
         "DESCENDANTS LIVE" in stderr_text
     ), f"expected DESCENDANTS LIVE marker in cli_stderr.log; got: {stderr_text!r}"
+    # PR #5 R17 P1 (EV-1): the runner ALSO writes a run_invalid
+    # sentinel into the event log so downstream callers invoking
+    # merge_layers directly cannot produce a clean TelemetryRecord
+    # for this run.
+    events = [
+        json.loads(line)
+        for line in result.in_process_events_path.read_text().splitlines()
+        if line.strip()
+    ]
+    run_invalid_events = [e for e in events if e.get("event") == "run_invalid"]
+    assert (
+        run_invalid_events
+    ), f"expected run_invalid sentinel in moved event log; got events: {events!r}"
+    assert (
+        run_invalid_events[0]["reason"] == "descendants_live"
+    ), f"run_invalid reason mismatch; got: {run_invalid_events[0]!r}"
 
 
 def test_run_one_clean_exit_when_no_descendants_survive(tmp_path):

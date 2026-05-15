@@ -365,6 +365,11 @@ _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
     # telemetry_missing sentinel has no required fields; the merger raises on
     # its presence regardless of payload.
     "telemetry_missing": (),
+    # PR #5 R17 P1 (EV-1): run_invalid sentinel also has no required
+    # fields; merger raises on its presence regardless of payload. The
+    # runner writes it (with ``reason`` + ``note`` keys) when post-spawn
+    # invariants like the descendants-live check fail.
+    "run_invalid": (),
 }
 
 
@@ -1610,6 +1615,23 @@ def _validate_shim_loaded(
                 "telemetry_missing sentinel present in event log; "
                 "the agent's event log disappeared post-exec and the run "
                 "is invalid for evaluation"
+            )
+        # PR #5 R17 P1 (EV-1): runner-written ``run_invalid`` sentinel
+        # marks runs the runner itself flagged as invalid post-spawn
+        # (e.g. ``descendants_live`` from R16 P1). Without this check,
+        # a downstream caller invoking ``merge_layers`` directly on
+        # the artifact set (without inspecting RunResult.exit_code or
+        # cli_stderr.log) could still produce a clean
+        # ``TelemetryRecord`` for a run the runner explicitly marked
+        # invalid. Mirror of the ``telemetry_missing`` rejection above.
+        if event.get("event") == "run_invalid":
+            reason = event.get("reason", "<reason missing>")
+            note = event.get("note", "")
+            raise TelemetryMergeError(
+                f"run_invalid sentinel present in event log "
+                f"(reason={reason!r}); the runner marked this run "
+                f"invalid post-spawn and it cannot be merged into a "
+                f"clean TelemetryRecord. note: {note}"
             )
     # A genuine shim-produced event log always writes `session_start`
     # before any hook events. Nonempty event log + zero session_starts

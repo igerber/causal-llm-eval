@@ -206,3 +206,25 @@ The merger does not (and cannot) distinguish "agent did no python" from "agent r
 - Custom CPython build with site.py forcibly enabled: would eliminate `-S` as a bypass vector at the source but requires per-platform build infrastructure.
 
 Both are larger than the eval's research question warrants.
+
+**Out-of-scope: session-detached descendants (PR #5 R16/R17):**
+
+`run_one()` puts Claude in a new process group via `start_new_session=True` and, on both timeout and normal exit paths, sends `SIGKILL` to the entire group. This catches descendants spawned via the standard `fork()`/`exec()` chain (e.g., agent `Bash` invocations of `python script.py &`, where the backgrounded process inherits the original process group). It does NOT catch descendants that explicitly detach from the process group:
+
+- `setsid python script.py &` (Bash creates a new session for the child)
+- A Python child that calls `os.setsid()` after fork
+- `nohup` combined with a session-creating call
+- `daemonize` library invocations
+- `disown` after a `setsid`-style detach
+
+A determined adversarial agent that constructs these forms can produce a child process that survives `os.killpg(proc.pid, SIGKILL)` (the call raises `ProcessLookupError` because the child is no longer in the original group), and can write events between `proc.wait()` returning and the runner moving the event log into the final artifact path. The detached child would appear in the merged record with timestamps after the run's nominal end.
+
+This bypass class requires:
+
+1. Deliberate adversarial intent (the agent is constructing session-detachment primitives specifically to evade post-run telemetry quiescence, not solving the eval task).
+2. The detached child must succeed at writing AFTER `run_one()` returns and BEFORE the moved event log is consumed by `merge_layers()` - a small race window that depends on caller scheduling.
+3. The detached child cannot affect the in-tmpdir log inode (once `shutil.move` completes, the post-move file is in `output_dir`; subsequent writes via the inherited fd hit the now-orphaned file path or fail). Realistic exploitation requires the child to also re-resolve the original path (which moved) or write via inherited fd before the move - a narrow window.
+
+The shell-parser's bypass detection in `harness/shell_parser.py::find_python_bypass_invocations` does NOT currently flag `setsid` / `daemonize` / `disown` / similar detachment primitives as fail-closed bypass forms. Adding them would close the visible-form half of the class (an agent that types `setsid python script.py &` in a Bash invocation would be flagged), but cannot close the in-process half (a Python child that calls `os.setsid()` after fork has no visible textual marker).
+
+Realistic agents working on causal-inference tasks do not exhibit this behavior. As with the wildcard delegated execution case above, the residual class is observably equivalent to "agent ran python adversarially in a way the layered defense cannot see post-hoc": the eval's interpretation is correct for both ("agent did not discover/use these surfaces" measured at finalization time).

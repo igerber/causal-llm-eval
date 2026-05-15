@@ -508,6 +508,34 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         with open(cli_stderr_log_path, "a") as f:
             f.write(_DESCENDANTS_LIVE_MARKER + "\n")
         exit_code = EXIT_CODE_DESCENDANTS_LIVE
+        # PR #5 R17 P1 (EV-1): also write a fail-closed sentinel
+        # event into the agent event log itself. Without this, a
+        # downstream caller that invokes ``merge_layers`` directly on
+        # the artifact set (without inspecting RunResult.exit_code or
+        # cli_stderr.log) could still produce a clean
+        # ``TelemetryRecord`` for a run the runner explicitly marked
+        # invalid. The merger's existing ``run_invalid`` schema
+        # rejects this event class; this is the same pattern as the
+        # ``telemetry_missing`` sentinel below.
+        if agent_event_log_path.exists():
+            with open(agent_event_log_path, "a") as f:
+                json.dump(
+                    {
+                        "event": "run_invalid",
+                        "fatal": True,
+                        "reason": "descendants_live",
+                        "note": (
+                            "agent process group had surviving children "
+                            "after main process exited; runner killed via "
+                            "SIGKILL but late writes to the event log "
+                            "between proc.wait() and killpg may have "
+                            "produced an incomplete or post-finalization "
+                            "telemetry record"
+                        ),
+                    },
+                    f,
+                )
+                f.write("\n")
 
     # Promote the in-tmpdir event log into output_dir for forensics. A
     # missing file post-exec is fail-closed (R5 P0): the runner touched it
