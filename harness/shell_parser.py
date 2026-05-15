@@ -755,6 +755,6 @@ def argv_contains_bypass_flag(args_tokens: list[str]) -> bool:
                 return True
             i += 1
             continue
-        # First non-flag token: end of interpreter-flag region.
+        # First non-flag word ends the interpreter-flag region.
         return False
     return False
