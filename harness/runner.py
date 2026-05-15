@@ -260,7 +260,85 @@ def _resolve_claude_executable() -> str:
     return claude
 
 
-def _build_command(claude_path: str, prompt: str, tmpdir: Path, model: str) -> list[str]:
+def _resolve_claude_invocation_prefix(claude_path: str) -> list[str]:
+    """Return the argv prefix to launch Claude under a sanitized PATH.
+
+    PR #5 R19 CQ-1 (P2): when ``claude`` is an npm-installed script
+    starting with ``#!/usr/bin/env node`` (the common Claude Code
+    install shape), the spawned process inherits the runner's
+    sanitized agent PATH (which excludes the operator's
+    ``/opt/homebrew/bin`` / ``/usr/local/bin`` etc.). Kernel shebang
+    resolution then runs ``/usr/bin/env``, which searches the
+    SUBPROCESS PATH for ``node``, finds nothing, and the launch
+    fails with ``env: 'node': No such file or directory``.
+
+    Fix: read the script's shebang line at runner-build time (using
+    the operator PATH for interpreter resolution), then return the
+    explicit interpreter prefix so the kernel does not have to
+    re-resolve it under the sanitized agent PATH:
+
+      * Native binary (no shebang or unresolvable shebang): returns
+        ``[claude_path]`` - kernel exec the binary directly.
+      * Shebang ``#!/usr/local/bin/node``: returns
+        ``["/usr/local/bin/node", claude_path]`` - absolute path,
+        no PATH search needed.
+      * Shebang ``#!/usr/bin/env node``: resolves ``node`` via
+        the operator PATH (``shutil.which("node")``) and returns
+        ``[node_abs_path, claude_path]``. Falls back to
+        ``[claude_path]`` if resolution fails (the launch will
+        then surface the original env-resolution error visibly).
+      * Shebang ``#!/usr/bin/env -S node --some-flag`` or
+        ``#!/usr/bin/node --some-flag``: returns
+        ``[interp_path, "--some-flag", claude_path]`` so script
+        author's interpreter args are preserved.
+
+    The interpreter is recorded as an ABSOLUTE path so its directory
+    does not need to leak into the agent's PATH allowlist.
+    """
+    try:
+        with open(claude_path, "rb") as fh:
+            first_line = fh.readline(1024).decode("utf-8", errors="replace")
+    except OSError:
+        return [claude_path]
+    if not first_line.startswith("#!"):
+        return [claude_path]
+    # Strip the "#!" + trailing whitespace/newline; tokenize on whitespace.
+    shebang = first_line[2:].strip()
+    if not shebang:
+        return [claude_path]
+    parts = shebang.split()
+    interp_spec = parts[0]
+    interp_args = parts[1:]
+    # Handle "/usr/bin/env [-S] <interp> [args...]" by resolving <interp>
+    # via the operator PATH; otherwise treat parts[0] as the absolute
+    # interpreter path.
+    if os.path.basename(interp_spec) == "env":
+        # Skip optional ``-S`` (env -S supports multi-arg shebangs on Linux).
+        if interp_args and interp_args[0] == "-S":
+            interp_args = interp_args[1:]
+        if not interp_args:
+            return [claude_path]
+        interp_name = interp_args[0]
+        interp_args = interp_args[1:]
+        interp_abs = shutil.which(interp_name)
+        if interp_abs is None:
+            # Cannot resolve interpreter via operator PATH; fall back to
+            # the original direct-launch behavior (which will surface the
+            # env-resolution error visibly rather than silently failing).
+            return [claude_path]
+    elif os.path.isabs(interp_spec):
+        interp_abs = interp_spec
+    else:
+        # Relative interpreter path is unusual; resolve via operator PATH.
+        interp_abs = shutil.which(interp_spec)
+        if interp_abs is None:
+            return [claude_path]
+    return [interp_abs, *interp_args, claude_path]
+
+
+def _build_command(
+    claude_invocation: list[str], prompt: str, tmpdir: Path, model: str
+) -> list[str]:
     """Construct the exact locked argv for `claude --bare ...`.
 
     The seven cold-start isolation flags are: --bare, --setting-sources "",
@@ -271,13 +349,17 @@ def _build_command(claude_path: str, prompt: str, tmpdir: Path, model: str) -> l
     `--model <id>` is additional: it pins the model so CLI defaults can't
     drift across runs. The value is `RunConfig.model`.
 
-    PR #5 R12 P0: ``claude_path`` is the absolute path to the claude
-    binary, resolved once via ``_resolve_claude_executable()``. The
-    agent's PATH is sanitized and may not include the directory where
-    claude lives, so the runner invokes claude by absolute path.
+    PR #5 R12 P0 / R19 CQ-1: ``claude_invocation`` is the resolved
+    invocation prefix from ``_resolve_claude_invocation_prefix``. For
+    native binaries it's ``[abs_claude_path]``; for shebang-script
+    Claude installs (npm `#!/usr/bin/env node`) it's
+    ``[abs_interpreter_path, claude_path]`` (or with extra interpreter
+    args if the shebang specified them). The agent's PATH is sanitized
+    and may not include the interpreter's or claude's directory, so
+    both are absolute by construction.
     """
     return [
-        claude_path,
+        *claude_invocation,
         "--bare",
         "--setting-sources",
         "",
@@ -439,7 +521,12 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     # below since the agent's PATH may not contain the directory where
     # it lives.
     env = clean_env(tmpdir, agent_event_log_path, venv_bin_dir=venv_dir / "bin")
-    cmd = _build_command(_resolve_claude_executable(), prompt, tmpdir, config.model)
+    cmd = _build_command(
+        _resolve_claude_invocation_prefix(_resolve_claude_executable()),
+        prompt,
+        tmpdir,
+        config.model,
+    )
 
     start = time.monotonic()
     timed_out = False

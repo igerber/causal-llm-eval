@@ -21,6 +21,7 @@ from harness.runner import (
     RunConfig,
     _build_command,
     _resolve_claude_executable,
+    _resolve_claude_invocation_prefix,
     clean_env,
     run_one,
 )
@@ -131,6 +132,18 @@ def _mock_venv_setup():
                 return_value="/usr/local/bin/claude",
             )
         )
+        # PR #5 R19 CQ-1: ``_resolve_claude_invocation_prefix`` reads
+        # the resolved claude path's shebang to decide whether to
+        # prepend a script interpreter. Tests use a fake
+        # ``/usr/local/bin/claude`` path that does not exist; patch
+        # the prefix resolver to return the bare path, mirroring the
+        # native-binary code path.
+        stack.enter_context(
+            patch(
+                "harness.runner._resolve_claude_invocation_prefix",
+                return_value=["/usr/local/bin/claude"],
+            )
+        )
         yield
 
 
@@ -224,7 +237,7 @@ def test_clean_env_lc_keys_explicit_no_wildcard(tmp_path, monkeypatch):
 
 def test_build_command_includes_all_seven_locked_flags(tmp_path):
     """The seven required cold-start flags are all present, with exact tokens."""
-    cmd = _build_command("/usr/local/bin/claude", "test prompt", tmp_path, "claude-opus-4-7")
+    cmd = _build_command(["/usr/local/bin/claude"], "test prompt", tmp_path, "claude-opus-4-7")
     assert "--bare" in cmd
     assert "--setting-sources" in cmd
     idx = cmd.index("--setting-sources")
@@ -244,7 +257,7 @@ def test_build_command_includes_all_seven_locked_flags(tmp_path):
 
 def test_build_command_uses_bare_first(tmp_path):
     """--bare must precede other flags (CLI semantics)."""
-    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-opus-4-7")
+    cmd = _build_command(["/usr/local/bin/claude"], "p", tmp_path, "claude-opus-4-7")
     # PR #5 R12 P0: cmd[0] is now the absolute claude path (resolved
     # before invocation since the agent's PATH is sanitized and may not
     # contain claude's directory). Assert basename is "claude" rather
@@ -255,7 +268,7 @@ def test_build_command_uses_bare_first(tmp_path):
 
 def test_build_command_includes_model_flag(tmp_path):
     """--model pins the model so CLI defaults can't drift across runs."""
-    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-opus-4-7")
+    cmd = _build_command(["/usr/local/bin/claude"], "p", tmp_path, "claude-opus-4-7")
     assert "--model" in cmd
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "claude-opus-4-7"
@@ -263,9 +276,107 @@ def test_build_command_includes_model_flag(tmp_path):
 
 def test_build_command_passes_through_arbitrary_model_string(tmp_path):
     """The model string is whatever RunConfig.model holds, not hardcoded."""
-    cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-sonnet-4-6")
+    cmd = _build_command(["/usr/local/bin/claude"], "p", tmp_path, "claude-sonnet-4-6")
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "claude-sonnet-4-6"
+
+
+def test_build_command_includes_interpreter_prefix_for_script_install(tmp_path):
+    """R19 CQ-1: when claude_invocation has an interpreter prefix
+    (script-style install), the full prefix lands at the front of cmd
+    so the kernel does not have to re-resolve the shebang under the
+    sanitized agent PATH.
+    """
+    cmd = _build_command(["/abs/path/node", "/path/to/claude"], "p", tmp_path, "claude-opus-4-7")
+    # Interpreter is cmd[0], claude script is cmd[1], --bare is cmd[2].
+    assert cmd[0] == "/abs/path/node"
+    assert cmd[1] == "/path/to/claude"
+    assert cmd[2] == "--bare"
+
+
+# -- _resolve_claude_invocation_prefix tests (R19 CQ-1) -----------------------
+
+
+def _make_fake_claude(tmp_path: Path, shebang: str | None) -> Path:
+    """Write a fake claude file with the given shebang line (or no
+    shebang for native-binary mode). Returns the path."""
+    fake = tmp_path / "fake-claude"
+    if shebang is None:
+        fake.write_bytes(b"\x7fELF binary stub\n")  # no shebang
+    else:
+        fake.write_text(shebang + "\nconsole.log('hi');\n")
+    fake.chmod(0o755)
+    return fake
+
+
+def test_resolve_invocation_prefix_native_binary_returns_bare_path(tmp_path):
+    """No shebang -> native binary code path; prefix is just [claude_path]."""
+    fake = _make_fake_claude(tmp_path, shebang=None)
+    prefix = _resolve_claude_invocation_prefix(str(fake))
+    assert prefix == [str(fake)]
+
+
+def test_resolve_invocation_prefix_absolute_shebang(tmp_path, monkeypatch):
+    """Shebang with an absolute interpreter path is returned verbatim
+    (no PATH search needed)."""
+    # Use an interpreter path that exists; /usr/bin/true is universally
+    # available on macOS + Linux.
+    fake = _make_fake_claude(tmp_path, shebang="#!/usr/bin/true")
+    prefix = _resolve_claude_invocation_prefix(str(fake))
+    assert prefix == ["/usr/bin/true", str(fake)]
+
+
+def test_resolve_invocation_prefix_env_resolves_via_operator_path(tmp_path, monkeypatch):
+    """``#!/usr/bin/env <interp>`` resolves <interp> via the operator
+    PATH and prepends it as the absolute path. Closes the
+    npm-installed-claude case where the spawned process's sanitized
+    PATH would otherwise lose track of node.
+    """
+    # Set up an interpreter discoverable on the operator PATH.
+    fake_node_dir = tmp_path / "operator-bin"
+    fake_node_dir.mkdir()
+    fake_node = fake_node_dir / "node-test"
+    fake_node.write_text("#!/bin/sh\nexit 0\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_node_dir) + os.pathsep + "/usr/bin:/bin")
+    fake = _make_fake_claude(tmp_path, shebang="#!/usr/bin/env node-test")
+    prefix = _resolve_claude_invocation_prefix(str(fake))
+    assert prefix[0].endswith("/node-test")
+    assert prefix[-1] == str(fake)
+    # The interpreter must be an ABSOLUTE path so it doesn't need to
+    # re-resolve under the sanitized agent PATH.
+    assert os.path.isabs(prefix[0])
+
+
+def test_resolve_invocation_prefix_env_dash_S_strips_flag(tmp_path, monkeypatch):
+    """``#!/usr/bin/env -S <interp> <arg>`` should strip the ``-S`` and
+    forward <arg> as an interpreter argument. Linux env -S allows
+    multi-arg shebangs; the prefix preserves <arg> in front of the
+    script path.
+    """
+    fake_node_dir = tmp_path / "operator-bin"
+    fake_node_dir.mkdir()
+    fake_node = fake_node_dir / "node-test"
+    fake_node.write_text("#!/bin/sh\nexit 0\n")
+    fake_node.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_node_dir) + os.pathsep + "/usr/bin:/bin")
+    fake = _make_fake_claude(tmp_path, shebang="#!/usr/bin/env -S node-test --custom-flag")
+    prefix = _resolve_claude_invocation_prefix(str(fake))
+    assert prefix[0].endswith("/node-test")
+    assert prefix[1] == "--custom-flag"
+    assert prefix[-1] == str(fake)
+
+
+def test_resolve_invocation_prefix_env_unresolvable_interp_falls_back(tmp_path, monkeypatch):
+    """If ``#!/usr/bin/env <interp>`` resolves to no PATH entry, fall
+    back to the bare ``[claude_path]`` so the launch surfaces the
+    original env-resolution error visibly rather than silently
+    succeeding with the wrong interpreter.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # no node here
+    fake = _make_fake_claude(tmp_path, shebang="#!/usr/bin/env definitely-not-installed-xyz")
+    prefix = _resolve_claude_invocation_prefix(str(fake))
+    assert prefix == [str(fake)]
 
 
 # -- _resolve_claude_executable tests -----------------------------------------

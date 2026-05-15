@@ -228,3 +228,28 @@ This bypass class requires:
 The shell-parser's bypass detection in `harness/shell_parser.py::find_python_bypass_invocations` does NOT currently flag `setsid` / `daemonize` / `disown` / similar detachment primitives as fail-closed bypass forms. Adding them would close the visible-form half of the class (an agent that types `setsid python script.py &` in a Bash invocation would be flagged), but cannot close the in-process half (a Python child that calls `os.setsid()` after fork has no visible textual marker).
 
 Realistic agents working on causal-inference tasks do not exhibit this behavior. As with the wildcard delegated execution case above, the residual class is observably equivalent to "agent ran python adversarially in a way the layered defense cannot see post-hoc": the eval's interpretation is correct for both ("agent did not discover/use these surfaces" measured at finalization time).
+
+**Out-of-scope: off-venv Python via delegated/shebang forms (PR #5 R19):**
+
+The runner sanitizes the agent's `PATH` to put the per-run venv's `bin/` first, so any agent typing bare `python` / `python3` / `python3.X` is wrapper-routed. `/usr/bin` and `/bin` remain on the agent PATH (required for `ls` / `cat` / `find` / `mkdir` etc.) which means absolute off-venv Python interpreters at `/usr/bin/python3` are still on the filesystem and reachable. The layer-1 AST parser attributes direct `/usr/bin/python3 script.py` invocations (the basename matcher recognizes `python3`), so those fail closed when no `session_start` follows. But parser-invisible forms can execute the absolute interpreter without the AST parser modeling the invocation:
+
+- `find /usr/bin -name 'python3*' -exec {} script.py \;`
+- `xargs -I {} {} script.py` where the input is `/usr/bin/python3`
+- `parallel /usr/bin/python3 script.py ::: arg1 arg2`
+- `./script.py` where `script.py` has shebang `#!/usr/bin/python3` (or `#!/usr/bin/env python3` resolving via the agent's `/usr/bin` PATH)
+
+These bypass the venv wrapper entirely. The spawned child runs the system interpreter (with NO venv-installed sitecustomize) so layer-2 also produces no event. The merger sees no `exec_python`, no `session_start`, and the AST sees no Python `CommandNode` (the wrapper command is `find` / `xargs` / `parallel` / a script path, not `python`). The sentinel-only path is then accepted as "agent did no Python work".
+
+This bypass class requires:
+
+1. **Deliberate adversarial intent**: the agent constructs a delegated form or installs a shebang script specifically to evade the wrapper, not to solve the eval task. Realistic agents working on causal-inference tasks invoke `python` directly via the Bash tool (which the wrapper handles).
+2. **Knowledge that `/usr/bin/python3` exists at a known absolute path**: the agent has to either guess the path or successfully run a `find` to discover it. Either way the discovery itself is visible in the transcript.
+3. **A meaningful task to run on the off-venv interpreter**: without the per-run `diff_diff` install, the spawned child has no library to invoke. An adversarial agent could `pip install --user diff_diff` first (visible in the transcript), but at that point the eval's interpretation - "agent did not discover/use the bundled guidance surfaces" - is correct: the agent that installed its own copy did not engage with the surface under measurement.
+
+Closing this structurally would require either:
+
+- Removing `/usr/bin` and `/bin` from the agent PATH (breaks essential agent capabilities like `ls`, `cat`, `find`, `mkdir`).
+- Detecting and substringing every absolute Python path in agent argv, plus parsing every script's shebang. The detection surface is unbounded (`/usr/bin/python3`, `/usr/bin/python3.11`, `/usr/local/bin/python3`, `/opt/...`, etc.) and a sufficiently motivated adversary can always copy or rename the binary to evade substring detection.
+- Custom CPython build with `sitecustomize` installed at the system level (would make the off-venv interpreter ALSO emit `session_start`). Requires per-platform build infrastructure - same out-of-scope class as the `-S` bypass mitigation above.
+
+As with the other out-of-scope adversarial bypass classes documented above, the residual class is observably equivalent to "agent did not discover/use the bundled surfaces" at the eval's measurement granularity. The merger does not (and cannot) distinguish "agent did no Python" from "agent ran off-venv Python via delegated/shebang forms": both produce identical telemetry shapes. The eval's interpretation is correct for both populations.
