@@ -19,6 +19,7 @@ from harness.runner import (
     _ALLOWLISTED_PASSTHROUGH_KEYS,
     RunConfig,
     _build_command,
+    _resolve_claude_executable,
     clean_env,
     run_one,
 )
@@ -26,7 +27,7 @@ from harness.runner import (
 
 @contextmanager
 def _mock_venv_setup():
-    """Patch build_arm_template + the build-time sentinel subprocess.run.
+    """Patch build_arm_template + sentinel subprocess.run + claude resolver.
 
     PR #5 added a per-arm venv build + sentinel invocation inside
     ``run_one``. Unit tests that mock ``subprocess.Popen`` (to avoid
@@ -38,6 +39,12 @@ def _mock_venv_setup():
     directory at the requested path (so ``venv_path`` checks in
     downstream merger code work) and returns it. The mocked
     ``subprocess.run`` returns a completed process with exit code 0.
+
+    PR #5 R13 P1 (DT-1): also patch ``_resolve_claude_executable`` so
+    the default unit suite does NOT require Claude Code to be installed
+    locally (CI's ``.github/workflows/tests.yml`` installs Python deps
+    only). The resolver is exercised directly in a separate focused
+    test below.
     """
     with ExitStack() as stack:
 
@@ -59,6 +66,12 @@ def _mock_venv_setup():
 
         stack.enter_context(patch("harness.runner.build_arm_template", fake_build))
         stack.enter_context(patch("harness.runner.subprocess.run", fake_run))
+        stack.enter_context(
+            patch(
+                "harness.runner._resolve_claude_executable",
+                return_value="/usr/local/bin/claude",
+            )
+        )
         yield
 
 
@@ -194,6 +207,33 @@ def test_build_command_passes_through_arbitrary_model_string(tmp_path):
     cmd = _build_command("/usr/local/bin/claude", "p", tmp_path, "claude-sonnet-4-6")
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "claude-sonnet-4-6"
+
+
+# -- _resolve_claude_executable tests -----------------------------------------
+
+
+def test_resolve_claude_executable_returns_absolute_path(tmp_path, monkeypatch):
+    """R13 P1 (DT-1): the resolver returns an absolute path when claude
+    is on the operator PATH. Direct shutil.which contract.
+    """
+    fake_claude = tmp_path / "fake-bin" / "claude"
+    fake_claude.parent.mkdir()
+    fake_claude.write_text("#!/bin/sh\n")
+    fake_claude.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_claude.parent))
+    resolved = _resolve_claude_executable()
+    assert Path(resolved).is_absolute()
+    assert Path(resolved).resolve() == fake_claude.resolve()
+
+
+def test_resolve_claude_executable_raises_when_not_on_path(tmp_path, monkeypatch):
+    """R13 P1 (DT-1): the resolver raises FileNotFoundError when the
+    operator's PATH does not contain a claude binary, with a message
+    pointing at the missing dependency.
+    """
+    monkeypatch.setenv("PATH", str(tmp_path))  # empty dir, no claude
+    with pytest.raises(FileNotFoundError, match="claude.*not found"):
+        _resolve_claude_executable()
 
 
 # -- run_one tests ------------------------------------------------------------

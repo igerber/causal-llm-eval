@@ -1890,6 +1890,21 @@ def merge_layers(
             "incomplete"
         )
     events = _read_events(in_process_events_path, venv_path=venv_path)
+    # PR #5 R13 P1 (EV-1): legacy mode (runner_pid/venv_path both None)
+    # is reserved for fixture-style logs that contain ZERO exec_python
+    # events. If the log contains any exec_python event, the wrapper
+    # fired and the venv-root allowlist + three-layer consistency check
+    # MUST run. Fail closed rather than silently producing a clean
+    # TelemetryRecord that ignored layer-1.5.
+    if runner_pid is None and any(e.get("event") == "exec_python" for e in events):
+        raise TelemetryMergeError(
+            "merge_layers received an event log containing exec_python "
+            "events but runner_pid/venv_path were not supplied; layer-1.5 "
+            "validation (venv-root executable allowlist + three-layer "
+            "cross-check) would be silently skipped. Pass runner_pid + "
+            "venv_path together (production mode), or use a log with "
+            "zero exec_python events (legacy fixture mode)."
+        )
     _validate_shim_loaded(events, transcript_entries, venv_path=venv_path)
     # PR #5: three-layer cross-check fires only when the runner has
     # supplied its pid (production path). Direct-call test fixtures that

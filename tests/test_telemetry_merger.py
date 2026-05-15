@@ -3843,3 +3843,38 @@ def test_merge_layers_requires_runner_pid_and_venv_path_together(tmp_path):
             venv_path=tmp_path / "venv",
             # runner_pid missing
         )
+
+
+def test_merge_layers_legacy_mode_rejects_log_with_exec_python_events(tmp_path):
+    """R13 P1 (EV-1): legacy mode (runner_pid/venv_path both None) is
+    only valid for fixture-style logs that contain ZERO exec_python
+    events. A real PR #5 production log always contains at least one
+    sentinel exec_python event; calling ``merge_layers`` with the old
+    pre-PR-#5 signature on such a log would silently skip the venv-root
+    allowlist + three-layer cross-check. Fail-closed instead.
+    """
+    events_path, transcript, stderr_log, venv = _make_paths_with_venv(tmp_path)
+    exe = str(venv / ".pyruntime-real" / "python-real")
+    # Production-shaped log: sentinel + agent exec_python + matching
+    # session_start. Calling merge_layers WITHOUT runner_pid/venv_path
+    # must reject the log rather than silently produce a clean record.
+    _write_events_jsonl(
+        events_path,
+        [
+            *_sentinel_events(executable=exe),
+            _session_start_event(argv=["python", "script.py"], pid=12345),
+            _exec_python_event(pid=12345, argv=["python", "script.py"], ppid=22222, executable=exe),
+        ],
+    )
+    _write_transcript(transcript, ["python script.py"])
+    with pytest.raises(
+        TelemetryMergeError, match="exec_python events but runner_pid/venv_path were not supplied"
+    ):
+        merge_layers(
+            "diff_diff",
+            transcript,
+            events_path,
+            stderr_log,
+            # runner_pid + venv_path both omitted -> legacy fixture mode,
+            # but the log contains exec_python events -> fail closed.
+        )
