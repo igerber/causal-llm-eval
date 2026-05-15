@@ -508,6 +508,15 @@ def _build_command(
     and may not include the interpreter's or claude's directory, so
     both are absolute by construction.
     """
+    # CRITICAL argv ordering: ``--add-dir <dirs...>`` is variadic
+    # (claude CLI 2.1.143+; possibly earlier). If the prompt immediately
+    # follows ``--add-dir <tmpdir>``, claude consumes the prompt as a
+    # second directory, leaving --print with no prompt and silently
+    # blocking on stdin for ~30s before exiting 0 with a 0-byte
+    # transcript. Placing --add-dir BEFORE a non-positional flag
+    # (here: --model) terminates the variadic consumption at the next
+    # flag, so the prompt at the end of argv is the unambiguous
+    # positional prompt argument.
     return [
         *claude_invocation,
         "--bare",
@@ -525,10 +534,10 @@ def _build_command(
         # would still exit 0 but produce a 0-byte transcript, which the
         # merger has no way to distinguish from "agent emitted nothing".
         "--verbose",
-        "--model",
-        model,
         "--add-dir",
         str(tmpdir),
+        "--model",
+        model,
         prompt,
     ]
 
@@ -724,6 +733,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             cmd,
             cwd=str(tmpdir),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
             text=True,

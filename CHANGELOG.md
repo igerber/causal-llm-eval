@@ -89,6 +89,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fail-closed.
 
 ### Fixed (PR #6)
+- Locked invocation argv reordered: `--add-dir <tmpdir>` is now followed
+  by `--model <model>` rather than the prompt. Claude CLI's `--add-dir
+  <dirs...>` is variadic; with the prompt immediately after `--add-dir
+  <tmpdir>`, claude was consuming the prompt as a second directory,
+  leaving `--print` with no prompt arg and blocking on stdin for ~30s
+  before exiting 0 with a 0-byte transcript. Reordering forces the
+  variadic to terminate at the next flag. Defense-in-depth:
+  `subprocess.Popen(..., stdin=subprocess.DEVNULL)` so any future
+  variadic-args regression causes claude to bail immediately rather
+  than hang.
 - Locked invocation now passes `--verbose` alongside `--print
   --output-format stream-json`. Claude CLI 2.1.143+ requires this flag
   combination; without it the CLI produces a 0-byte transcript and

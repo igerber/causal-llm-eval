@@ -357,6 +357,18 @@ def test_build_command_includes_all_seven_locked_flags(tmp_path):
     # --output-format=stream-json; without it the CLI emits no transcript.
     assert "--verbose" in cmd
     assert "--add-dir" in cmd
+    # PR #6: --add-dir <dirs...> is variadic. The prompt MUST NOT
+    # immediately follow --add-dir <tmpdir> or it gets consumed as a
+    # second directory and claude blocks on stdin waiting for the
+    # missing prompt (silent 30s timeout, 0-byte transcript). Ensure
+    # --add-dir is followed by a non-positional flag (here: --model).
+    add_dir_idx = cmd.index("--add-dir")
+    assert cmd[add_dir_idx + 1] == str(tmp_path), "--add-dir value mismatch"
+    next_token = cmd[add_dir_idx + 2]
+    assert next_token.startswith("--"), (
+        f"--add-dir <dir> must be followed by a flag (got {next_token!r}); "
+        f"otherwise variadic --add-dir consumes the prompt"
+    )
     idx = cmd.index("--add-dir")
     assert cmd[idx + 1] == str(tmp_path)
     # The prompt is the LAST argv element.
