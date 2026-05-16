@@ -80,10 +80,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `<ClassName>.<method>` to disambiguate them from module-level functions).
   Filename-substring filter for warnings replaced by structural
   `library == "statsmodels"` check.
-- `harness/telemetry.py::_build_diff_diff_record` now defensively filters
-  events by `library in ("diff_diff", missing)` so a cross-arm bleed-through
-  doesn't pollute the record. Backward-compat default preserves PR #5/#6
-  record readability.
+- `harness/telemetry.py::_build_diff_diff_record` now strictly filters
+  events by `library == "diff_diff"` so a cross-arm bleed-through
+  doesn't pollute the record. The schema validator
+  (`_validate_event_schemas`) REJECTS library-surface records that omit
+  `library` or carry an unrecognized arm, fail-closed at parse time, so
+  the builder never sees malformed records. (R1 originally landed a
+  defensive backward-compat default for PR #5/#6 records on disk; that
+  was removed in favor of fail-closed validation since no production
+  runs pre-date the field.)
 - `_caller_is_from_diff_diff` renamed and generalized to
   `_caller_is_from_library(start_frame, prefixes)`; returns the matched
   prefix so the warning hook can stamp the `library` field without a
