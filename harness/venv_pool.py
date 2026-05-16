@@ -47,8 +47,13 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
         1. Create a fresh venv at ``template_dir`` (no system site packages).
         2. ``pip install`` the arm library at the pinned version.
         3. Copy ``harness/sitecustomize_template.py`` into the venv's
-           ``site-packages`` as ``sitecustomize.py``. Python's site machinery
-           auto-loads this file on every interpreter start.
+           ``site-packages`` as ``_pyruntime_shim.py`` and write a
+           ``_pyruntime_shim.pth`` next to it (PR #6 fix; see
+           ``_install_shim_into_venv`` for the rationale on why .pth-based
+           load is required on Homebrew Python). Python's site machinery
+           processes the .pth file during site init; our shim loads even
+           when the operator's system Python ships its own
+           stdlib-level ``sitecustomize.py``.
         4. Install the layer-1.5 ``python`` wrapper: rename
            ``${venv}/bin/python`` to ``python-real`` and replace with a copy
            of ``harness/python_wrapper.sh``. Repeat for ``python3`` and

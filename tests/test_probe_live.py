@@ -31,4 +31,14 @@ def test_probe_returns_pass_on_cold_start(tmp_path):
         f"Probe failed with findings: {result.assessment.findings}\n"
         f"Response: {result.assessment.agent_response!r}"
     )
-    assert result.assessment.findings == []
+    # PR #6: ``no_affirmative_no_statement`` is a SOFT finding (recorded
+    # for diagnostics but does not fail the probe). Assert no HARD
+    # findings rather than findings == []. Hard findings are: blacklist
+    # hits, structural-layer findings (cwd/home/env), and structural
+    # block missing.
+    _SOFT_FINDINGS = {"no_affirmative_no_statement"}
+    hard_findings = [f for f in result.assessment.findings if f not in _SOFT_FINDINGS]
+    assert hard_findings == [], (
+        f"Probe has unexpected hard findings: {hard_findings}\n"
+        f"All findings: {result.assessment.findings}"
+    )

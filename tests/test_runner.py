@@ -72,7 +72,7 @@ def test_run_metadata_post_init_rejects_bad_dataset_sha():
 
 
 def test_run_metadata_post_init_rejects_empty_claude_code_version():
-    with pytest.raises(ValueError, match="claude_code_version must be non-empty"):
+    with pytest.raises(ValueError, match="claude_code_version"):
         _metadata(claude_code_version="   ")
 
 
@@ -99,6 +99,56 @@ def test_run_metadata_random_seed_accepts_none():
 def test_run_metadata_random_seed_accepts_int():
     md = _metadata(random_seed=42)
     assert md.random_seed == 42
+
+
+# PR #6 R1 P1: extended __post_init__ rejects empty/whitespace versions,
+# empty run_id, and bool/non-int random_seed. Each negative test asserts
+# the specific malformation is caught.
+
+
+def test_run_metadata_post_init_rejects_empty_library_version():
+    with pytest.raises(ValueError, match="library_version"):
+        _metadata(library_version="")
+
+
+def test_run_metadata_post_init_rejects_whitespace_model_version():
+    with pytest.raises(ValueError, match="model_version"):
+        _metadata(model_version="   ")
+
+
+def test_run_metadata_post_init_rejects_empty_prompt_version():
+    with pytest.raises(ValueError, match="prompt_version"):
+        _metadata(prompt_version="")
+
+
+def test_run_metadata_post_init_rejects_empty_rubric_version():
+    with pytest.raises(ValueError, match="rubric_version"):
+        _metadata(rubric_version="")
+
+
+def test_run_metadata_post_init_rejects_empty_run_id():
+    with pytest.raises(ValueError, match="run_id"):
+        _metadata(run_id="")
+
+
+def test_run_metadata_post_init_rejects_bool_random_seed_true():
+    with pytest.raises(ValueError, match="random_seed"):
+        _metadata(random_seed=True)
+
+
+def test_run_metadata_post_init_rejects_bool_random_seed_false():
+    with pytest.raises(ValueError, match="random_seed"):
+        _metadata(random_seed=False)
+
+
+def test_run_metadata_post_init_rejects_non_int_random_seed():
+    with pytest.raises(ValueError, match="random_seed"):
+        _metadata(random_seed="42")  # string, not int
+
+
+def test_run_metadata_post_init_rejects_float_random_seed():
+    with pytest.raises(ValueError, match="random_seed"):
+        _metadata(random_seed=42.0)
 
 
 @contextmanager

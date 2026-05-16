@@ -3,7 +3,9 @@
 Spawns standalone `claude --bare` processes in isolated tmpdirs with a per-run
 venv carrying one library at a time (diff-diff XOR statsmodels for Phase 1).
 
-The locked invocation:
+The locked invocation (PR #6 added --verbose, --permission-mode
+bypassPermissions, --model, and the --add-dir-before---model ordering;
+see _build_command for per-flag rationale):
 
     claude --bare \\
            --setting-sources "" \\
@@ -12,7 +14,9 @@ The locked invocation:
            --print \\
            --output-format stream-json \\
            --verbose \\
+           --permission-mode bypassPermissions \\
            --add-dir <tmpdir> \\
+           --model <model> \\
            <prompt>
 
 The `--bare` flag is load-bearing: it suppresses CLAUDE.md auto-discovery,
@@ -206,7 +210,13 @@ class RunMetadata:
     arm: str  # "diff_diff" or "statsmodels"
 
     def __post_init__(self) -> None:
-        """Lightweight format validation so a malformed record can't be silently constructed."""
+        """Format validation so a malformed record can't be silently constructed.
+
+        Every locked reproducibility field that PINS a run (versions, registry
+        ids, identity, seed) is checked. Empty/whitespace strings are rejected
+        because they would let a clean ``run_one()`` exit emit a metadata.json
+        that does not actually pin the run.
+        """
         import re
 
         if not re.fullmatch(r"[0-9a-f]{40}(-dirty)?", self.harness_version):
@@ -215,8 +225,27 @@ class RunMetadata:
             )
         if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_sha):
             raise ValueError(f"dataset_sha must be 64-hex sha256: {self.dataset_sha!r}")
-        if not self.claude_code_version.strip():
-            raise ValueError("claude_code_version must be non-empty")
+        # Required-non-empty version/registry-id strings. Any of these being
+        # blank means the run isn't actually pinned to a reproducible source.
+        for field_name in (
+            "library_version",
+            "claude_code_version",
+            "model_version",
+            "prompt_version",
+            "rubric_version",
+            "run_id",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string (got {value!r})")
+        # random_seed is int | None. ``bool`` is an int subclass in Python; we
+        # explicitly reject it because a True/False seed almost certainly means
+        # a config bug (someone passed a flag where a seed was expected).
+        if self.random_seed is not None:
+            if isinstance(self.random_seed, bool) or not isinstance(self.random_seed, int):
+                raise ValueError(
+                    f"random_seed must be int or None (got {type(self.random_seed).__name__}: {self.random_seed!r})"
+                )
         if self.arm not in ("diff_diff", "statsmodels"):
             raise ValueError(f"arm must be 'diff_diff' or 'statsmodels': {self.arm!r}")
 

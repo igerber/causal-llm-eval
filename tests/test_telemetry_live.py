@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from harness.probe import _materialize_placeholder_dataset
 from harness.runner import RunConfig, run_one
 from harness.telemetry import merge_layers
 
@@ -33,10 +34,13 @@ def test_run_one_attests_across_all_three_layers(tmp_path):
         pytest.skip("ANTHROPIC_API_KEY not set")
 
     output_dir = tmp_path / "live_attestation"
+    # PR #6 R1 P2: dataset_path must be a regular file (strict-reject
+    # validation). Reuse the probe's placeholder helper.
+    dataset_path = _materialize_placeholder_dataset(tmp_path / "fixture")
     config = RunConfig(
         arm="diff_diff",
         library_version="3.3.2",
-        dataset_path=Path("/dev/null"),
+        dataset_path=dataset_path,
         prompt_path=Path("/dev/null"),
         prompt_version="test_telemetry_live/v1",
         rubric_version="test_telemetry_live/v1",

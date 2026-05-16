@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.probe import _extract_final_assistant_text
+from harness.probe import _extract_final_assistant_text, _materialize_placeholder_dataset
 from harness.runner import RunConfig, run_one
 
 
@@ -24,10 +24,14 @@ def test_run_one_spawns_real_agent_with_trivial_prompt(tmp_path):
         pytest.skip("ANTHROPIC_API_KEY not set")
 
     output_dir = tmp_path / "live_run"
+    # PR #6 R1 P2: dataset_path must be a regular file (the runner now
+    # rejects /dev/null as a character device). Reuse the probe's
+    # placeholder-parquet helper for a deterministic 1-row fixture.
+    dataset_path = _materialize_placeholder_dataset(tmp_path / "fixture")
     config = RunConfig(
         arm="diff_diff",
         library_version="3.3.2",
-        dataset_path=Path("/dev/null"),
+        dataset_path=dataset_path,
         prompt_path=Path("/dev/null"),
         prompt_version="test_live/v1",
         rubric_version="test_live/v1",
