@@ -6,6 +6,103 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (PR #7)
+- Statsmodels arm instrumentation in `harness/sitecustomize_template.py`:
+  hooks for `OLS`, `WLS`, `GLS`, `GLSAR`, `RLM`, `GLM`, `MixedLM`, `Logit`,
+  `Probit` (estimator `__init__` + `fit`); statsmodels-relevant diagnostic
+  functions (`het_breuschpagan`, `het_white`, `linear_reset`,
+  `acorr_breusch_godfrey`, `acorr_ljungbox`, `durbin_watson`); and post-fit
+  results methods (`RegressionResults.summary` and
+  `RegressionResults.get_robustcov_results` cover the OLS / WLS / GLS /
+  GLSAR family via MRO; explicit `RLMResults.summary`,
+  `GLMResults.summary`, `MixedLMResults.summary`, and `BinaryResults.summary`
+  cover the LikelihoodModelResults-family classes that don't inherit from
+  `RegressionResults`, so RLM / GLM / MixedLM / Logit / Probit are also
+  tracked). Result-method wrapper records `type(self).__name__` at call
+  time, so the runtime leaf class (e.g. `LogitResults`) surfaces in the
+  event without enumerating every subclass. `_attach_statsmodels_hooks`
+  walks each submodule and patches the target attribute;
+  `_StatsmodelsPostImportHook` (mirrored architecture of
+  `_DiffDiffPostImportHook`) triggers attachment when `statsmodels` is
+  imported.
+- `library: str` attribution field on every library-surface event the
+  shim emits — `estimator_init`, `estimator_fit`, `diagnostic_call`,
+  `estimator_diagnostic_method`, `warning_emitted`, `guide_file_read`
+  (`"diff_diff"` or `"statsmodels"`). Structural events
+  (`session_start`, `session_end`, `module_import`) do NOT carry
+  `library`. The merger's schema validator REJECTS library-surface
+  records that omit `library` or carry an unrecognized arm, fail-closed
+  at parse time so cross-arm bleed-through cannot silently filter out of
+  the arm-keyed record builders. (Originally this PR documented a
+  backward-compat default for PR #5/#6 records on disk; that was
+  removed in R1 in favor of fail-closed validation — no production runs
+  pre-date the field, so the backward-compat path was both unused and a
+  silent-loss footgun.)
+- New event type `estimator_diagnostic_method` (distinct from
+  `estimator_init` / `estimator_fit` / `diagnostic_call`) for post-fit
+  results-method calls.
+- `prompts/case_study/v2.txt`: Phase 1 case-study task prompt. Task-only
+  by design — names no library and no estimator-class so both arms see
+  identical text. Properties asserted by `tests/test_case_study_prompt.py`.
+- `prompts/case_study/README.md`: documents v1 reserved-stub state, v2
+  active prompt, and the new-version-on-edit policy.
+- `rubrics/case_study_v2.yaml`: Phase 1 grading rubric (6 pre-defined
+  criteria covering estimator classification, evidence, diagnostics,
+  reasoning quality, confidence intervals, and final ATT estimate). The
+  estimator-classification enum covers both arms in one rubric so a
+  TWFE choice resolves correctly regardless of arm.
+- `rubrics/README.md`: documents the v2 schema shape.
+- ~15 new tests in `tests/test_sitecustomize.py` covering statsmodels
+  hooks (OLS/OLSResults/het_breuschpagan), warning attribution via stack
+  walk for both libraries, library-field presence on diff_diff events,
+  result-method runtime-class recording, idempotency, and bidirectional
+  constants regression.
+- 7 new tests in `tests/test_telemetry_merger.py` covering
+  `_build_statsmodels_record` field population (estimator classes,
+  diagnostics from both event types, fit-time warnings), cross-arm
+  event filtering, and the sentinel-fields-stay-None invariant. Plus
+  6 R1 follow-up tests for the strict-library-required validator
+  (missing-library rejection, unknown-arm rejection,
+  `estimator_diagnostic_method` malformed-event rejection × 3,
+  shim-event-types-have-schema-entry regression).
+- 3 new `@pytest.mark.slow` tests in `tests/test_venv_pool.py` covering
+  the statsmodels-arm template build end-to-end (correct library version
+  installed, `_pyruntime_shim.py` + `_pyruntime_shim.pth` present,
+  `module_import` event fires on `import statsmodels`).
+- New test files `tests/test_case_study_prompt.py` (5 tests) and
+  `tests/test_case_study_rubric.py` (8 tests).
+
+### Changed (PR #7)
+- `harness/venv_pool.py::_ARM_TO_PIP_PACKAGE` now includes
+  `"statsmodels": "statsmodels"`; `build_arm_template` no longer raises
+  `NotImplementedError` for `arm="statsmodels"`.
+- `harness/telemetry.py::_build_statsmodels_record` now populates
+  `estimator_classes_instantiated`, `diagnostic_methods_invoked`, and
+  `saw_fit_time_warning` from real statsmodels-attributed events (was:
+  hard-coded `False`/`()` since PR #4). `diagnostic_methods_invoked`
+  aggregates both module-level `diagnostic_call` events and post-fit
+  `estimator_diagnostic_method` events (the latter prefixed
+  `<ClassName>.<method>` to disambiguate them from module-level functions).
+  Filename-substring filter for warnings replaced by structural
+  `library == "statsmodels"` check.
+- `harness/telemetry.py::_build_diff_diff_record` now strictly filters
+  events by `library == "diff_diff"` so a cross-arm bleed-through
+  doesn't pollute the record. The schema validator
+  (`_validate_event_schemas`) REJECTS library-surface records that omit
+  `library` or carry an unrecognized arm, fail-closed at parse time, so
+  the builder never sees malformed records. (R1 originally landed a
+  defensive backward-compat default for PR #5/#6 records on disk; that
+  was removed in favor of fail-closed validation since no production
+  runs pre-date the field.)
+- `_caller_is_from_diff_diff` renamed and generalized to
+  `_caller_is_from_library(start_frame, prefixes)`; returns the matched
+  prefix so the warning hook can stamp the `library` field without a
+  second stack walk. Called for both diff_diff and statsmodels frames.
+- `_wrap_estimator_init` / `_wrap_estimator_fit` / `_wrap_diagnostic`
+  decorators now take a keyword-only `library: str = "diff_diff"` argument;
+  the diff_diff attach call sites pass it explicitly. The default
+  preserves backward compatibility with any external caller.
+
 ### Added (PR #6)
 - `harness/dgp.py`: synthetic data-generating process for the Phase 1
   case study. Wraps `diff_diff.generate_staggered_data` with locked

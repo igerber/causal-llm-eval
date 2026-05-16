@@ -795,3 +795,429 @@ def test_install_production_state_rewrites_base_executable(event_log, monkeypatc
             f"wrapper {wrapper_path!r} (R15 EV-1 regression: agent could "
             f"spawn [sys._base_executable, ...] and bypass the layer-1.5 wrapper)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Statsmodels arm (PR #7)
+# ---------------------------------------------------------------------------
+
+
+_HAVE_STATSMODELS = importlib.util.find_spec("statsmodels") is not None
+
+
+def _drop_statsmodels_from_sys_modules() -> None:
+    """Remove cached statsmodels modules so the meta_path hook fires on
+    the next ``import statsmodels``. Mirrors the diff_diff test pattern."""
+    for name in list(sys.modules):
+        if name == "statsmodels" or name.startswith("statsmodels."):
+            del sys.modules[name]
+
+
+def _tiny_ols_data():
+    """Return (endog, exog) numpy arrays for a 5-row OLS fit. Small enough
+    to keep tests fast; large enough to fit without raising."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    n = 20
+    x = rng.normal(size=(n, 2))
+    y = x @ np.array([1.0, -0.5]) + rng.normal(size=n) * 0.1
+    return y, x
+
+
+def test_StatsmodelsPostImportHook_returns_none_for_non_statsmodels_names(event_log):
+    shim = _import_shim_fresh()
+    hook = shim._StatsmodelsPostImportHook()
+    assert hook.find_spec("numpy", None, None) is None
+    assert hook.find_spec("os", None, None) is None
+    assert hook.find_spec("diff_diff", None, None) is None
+    # statsmodels SUBMODULES should not trigger; only the parent.
+    assert hook.find_spec("statsmodels.regression.linear_model", None, None) is None
+
+
+def test_StatsmodelsPostImportHook_present_in_meta_path(event_log):
+    shim = _import_shim_fresh()
+    instances = [f for f in sys.meta_path if isinstance(f, shim._StatsmodelsPostImportHook)]
+    assert len(instances) == 1, (
+        f"expected exactly one _StatsmodelsPostImportHook in sys.meta_path, "
+        f"got {len(instances)}; meta_path={sys.meta_path}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_meta_path_hook_records_module_import(event_log):
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+
+    events = _read_events(event_log)
+    assert any(
+        e.get("event") == "module_import" and e.get("module") == "statsmodels" for e in events
+    ), events
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_meta_path_hook_survives_find_spec_call(event_log):
+    """Mirror of the diff_diff R12 P0 regression: a plain ``find_spec``
+    availability check must not consume the hook (would lose attachment
+    for a later real import)."""
+    _drop_statsmodels_from_sys_modules()
+    shim = _import_shim_fresh()
+
+    spec = importlib.util.find_spec("statsmodels")
+    assert spec is not None
+    assert any(
+        isinstance(finder, shim._StatsmodelsPostImportHook) for finder in sys.meta_path
+    ), "statsmodels hook was consumed by find_spec; re-import would be uninstrumented"
+
+    import statsmodels  # noqa: F401
+
+    events = _read_events(event_log)
+    module_import_count = sum(
+        1 for e in events if e.get("event") == "module_import" and e.get("module") == "statsmodels"
+    )
+    assert module_import_count == 1, (
+        f"expected exactly 1 module_import event for statsmodels, got "
+        f"{module_import_count}: {events}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_OLS_init_emits_event_with_library_field(event_log):
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401  (triggers attach via meta_path hook)
+    from statsmodels.regression.linear_model import OLS
+
+    y, x = _tiny_ols_data()
+    OLS(y, x)
+
+    events = _read_events(event_log)
+    init_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_init"
+        and e.get("class") == "OLS"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(init_events) >= 1, f"no OLS estimator_init/library=statsmodels in {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_OLS_fit_emits_event_with_library_field(event_log):
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.regression.linear_model import OLS
+
+    y, x = _tiny_ols_data()
+    OLS(y, x).fit()
+
+    events = _read_events(event_log)
+    fit_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_fit"
+        and e.get("class") == "OLS"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(fit_events) >= 1, f"no OLS estimator_fit/library=statsmodels in {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_OLSResults_summary_emits_diagnostic_method_event(event_log):
+    """Result-method wrapper records ``type(self).__name__`` at call time,
+    so an OLSResults instance produces ``class="OLSResults"`` even though
+    only RegressionResults (the parent) is patched."""
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.regression.linear_model import OLS
+
+    y, x = _tiny_ols_data()
+    result = OLS(y, x).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(method_events) >= 1, f"no estimator_diagnostic_method/summary in {events}"
+    # Runtime class is OLSResults (not RegressionResults, where the patch lives).
+    assert method_events[-1]["class"] == "OLSResults", (
+        f"expected class=OLSResults (runtime type), got {method_events[-1]['class']!r}; "
+        f"_wrap_results_method must record type(self).__name__, not the patched class"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_GLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R1 EV-2 regression: GLMResults inherits from
+    LikelihoodModelResults, NOT RegressionResults, so the original
+    RegressionResults-only patch missed it. The expanded
+    ``_STATSMODELS_RESULTS_METHODS`` now patches GLMResults explicitly;
+    this test proves the wiring actually fires."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.genmod.families import Gaussian
+    from statsmodels.genmod.generalized_linear_model import GLM
+
+    y, x = _tiny_ols_data()
+    x_with_const = np.column_stack([np.ones(len(x)), x])
+    result = GLM(y, x_with_const, family=Gaussian()).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "GLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(method_events) >= 1, (
+        f"GLMResults.summary() did not fire estimator_diagnostic_method; "
+        f"the RegressionResults-only patch missed it. Events: {events}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_RLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: RLMResults inherits from
+    LikelihoodModelResults (not RegressionResults), so the explicit
+    RLMResults entry in ``_STATSMODELS_RESULTS_METHODS`` is required.
+    This test proves the wiring fires."""
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.robust.robust_linear_model import RLM
+
+    y, x = _tiny_ols_data()
+    result = RLM(y, x).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "RLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert (
+        len(method_events) >= 1
+    ), f"RLMResults.summary() did not fire estimator_diagnostic_method: {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_MixedLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: MixedLMResults inherits from
+    LikelihoodModelResults + ResultMixin (not RegressionResults). Explicit
+    MixedLMResults entry required; this test proves wiring fires."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.regression.mixed_linear_model import MixedLM
+
+    rng = np.random.default_rng(42)
+    n_groups = 5
+    n_per_group = 8
+    n = n_groups * n_per_group
+    groups = np.repeat(np.arange(n_groups), n_per_group)
+    x = rng.normal(size=(n, 2))
+    y = x @ np.array([1.0, -0.5]) + rng.normal(size=n) * 0.5
+    result = MixedLM(y, x, groups=groups).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "MixedLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert (
+        len(method_events) >= 1
+    ), f"MixedLMResults.summary() did not fire estimator_diagnostic_method: {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_LogitResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: LogitResults inherits from BinaryResults
+    (which inherits from DiscreteResults → LikelihoodModelResults). The
+    shim patches BinaryResults.summary so both Logit AND Probit instances
+    surface correctly via MRO; the wrapper records ``type(self).__name__``
+    so the class name is the runtime leaf, not the patched parent."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.discrete.discrete_model import Logit
+
+    rng = np.random.default_rng(0)
+    n = 50
+    x = np.column_stack([np.ones(n), rng.normal(size=n)])
+    # Binary outcomes from a logistic relationship
+    logits = x @ np.array([0.0, 1.0])
+    y = (rng.uniform(size=n) < (1 / (1 + np.exp(-logits)))).astype(int)
+    result = Logit(y, x).fit(disp=False)
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "LogitResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(method_events) >= 1, (
+        f"LogitResults.summary() did not fire estimator_diagnostic_method; "
+        f"BinaryResults patch should catch it via MRO. Events: {events}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_het_breuschpagan_emits_diagnostic_call(event_log):
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import numpy as np
+    import statsmodels  # noqa: F401
+    from statsmodels.regression.linear_model import OLS
+    from statsmodels.stats.diagnostic import het_breuschpagan
+
+    y, x = _tiny_ols_data()
+    # het_breuschpagan requires exog to have a constant column
+    x_with_const = np.column_stack([np.ones(len(x)), x])
+    result = OLS(y, x_with_const).fit()
+    het_breuschpagan(result.resid, x_with_const)
+
+    events = _read_events(event_log)
+    diag_events = [
+        e
+        for e in events
+        if e.get("event") == "diagnostic_call"
+        and e.get("name") == "het_breuschpagan"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(diag_events) >= 1, f"no het_breuschpagan diagnostic_call in {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_warning_hook_records_statsmodels_warning(event_log):
+    """A warning emitted from a frame whose module is ``statsmodels.*``
+    is recorded with ``library="statsmodels"`` (mirror of the diff_diff
+    warning-attribution test)."""
+    shim = _import_shim_fresh()
+    shim._install_warning_hook()
+    statsmodels_globals = {"__name__": "statsmodels.regression.linear_model", "warnings": warnings}
+    exec("warnings.warn('statsmodels collinearity')", statsmodels_globals)
+
+    events = _read_events(event_log)
+    warn_events = [
+        e
+        for e in events
+        if e.get("event") == "warning_emitted" and e.get("library") == "statsmodels"
+    ]
+    assert len(warn_events) >= 1, f"no warning_emitted/library=statsmodels in {events}"
+    assert warn_events[-1]["message"].startswith("statsmodels collinearity")
+
+
+def test_warning_hook_attribution_works_for_diff_diff_too(event_log):
+    """The generalized warning hook still attributes diff_diff frames
+    correctly; the new ``library`` field is set to ``"diff_diff"`` on
+    those events (was: missing in PR #5/#6 records)."""
+    shim = _import_shim_fresh()
+    shim._install_warning_hook()
+    diff_diff_globals = {"__name__": "diff_diff.estimators", "warnings": warnings}
+    exec("warnings.warn('diff_diff with library field')", diff_diff_globals)
+
+    events = _read_events(event_log)
+    warn_events = [
+        e for e in events if e.get("event") == "warning_emitted" and e.get("library") == "diff_diff"
+    ]
+    assert len(warn_events) >= 1
+    assert warn_events[-1]["message"].startswith("diff_diff with library field")
+
+
+def test_warning_hook_ignores_non_tracked_library_warning(event_log):
+    """Warnings from frames whose module prefix is neither diff_diff nor
+    statsmodels are not recorded — including numpy, scipy, etc."""
+    shim = _import_shim_fresh()
+    shim._install_warning_hook()
+    pre = len([e for e in _read_events(event_log) if e.get("event") == "warning_emitted"])
+    scipy_globals = {"__name__": "scipy.stats", "warnings": warnings}
+    exec("warnings.warn('scipy warning')", scipy_globals)
+    post = len([e for e in _read_events(event_log) if e.get("event") == "warning_emitted"])
+    assert post == pre, "warning from scipy frame should not be recorded"
+
+
+def test_results_method_wrapper_idempotent(event_log):
+    """Double-wrapping ``_wrap_results_method`` returns the same object,
+    so a re-attach (e.g. ``import statsmodels`` after a re-import) does
+    not double-fire ``estimator_diagnostic_method`` events."""
+    shim = _import_shim_fresh()
+
+    def fake_method(self):  # noqa: ARG001
+        return "result"
+
+    once = shim._wrap_results_method(fake_method, "fake_method")
+    twice = shim._wrap_results_method(once, "fake_method")
+    assert once is twice
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_estimator_classes_constant_resolves(event_log):
+    """Bidirectional regression mirror for diff_diff's constant test: every
+    (submodule, class) in ``_STATSMODELS_ESTIMATOR_CLASSES`` resolves to a
+    real class in the installed statsmodels distribution. Catches API drift
+    (e.g., statsmodels renaming/removing a class) before a real eval run."""
+    shim = _import_shim_fresh()
+    for submodule_path, class_name in shim._STATSMODELS_ESTIMATOR_CLASSES:
+        submodule = importlib.import_module(submodule_path)
+        cls = getattr(submodule, class_name, None)
+        assert cls is not None, (
+            f"_STATSMODELS_ESTIMATOR_CLASSES references {submodule_path}.{class_name} "
+            f"but statsmodels does not export it; check API drift"
+        )
+        assert isinstance(cls, type), f"{submodule_path}.{class_name} is not a class"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_diagnostic_functions_constant_resolves(event_log):
+    shim = _import_shim_fresh()
+    for submodule_path, func_name in shim._STATSMODELS_DIAGNOSTIC_FUNCTIONS:
+        submodule = importlib.import_module(submodule_path)
+        func = getattr(submodule, func_name, None)
+        assert func is not None, (
+            f"_STATSMODELS_DIAGNOSTIC_FUNCTIONS references "
+            f"{submodule_path}.{func_name} but statsmodels does not export it"
+        )
+        assert callable(func), f"{submodule_path}.{func_name} is not callable"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_results_methods_constant_resolves(event_log):
+    shim = _import_shim_fresh()
+    for submodule_path, class_name, method_name in shim._STATSMODELS_RESULTS_METHODS:
+        submodule = importlib.import_module(submodule_path)
+        cls = getattr(submodule, class_name, None)
+        assert cls is not None, f"missing {submodule_path}.{class_name}"
+        assert hasattr(
+            cls, method_name
+        ), f"{submodule_path}.{class_name} has no method {method_name}"

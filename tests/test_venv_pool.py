@@ -38,6 +38,7 @@ from harness import venv_pool
 pytestmark = pytest.mark.slow
 
 _DIFF_DIFF_VERSION = "3.3.2"
+_STATSMODELS_VERSION = "0.14.6"
 
 
 def _file_sha256(path: Path) -> str:
@@ -57,6 +58,19 @@ def shared_venv(tmp_path_factory):
     """
     template_dir = tmp_path_factory.mktemp("shared_venv")
     return venv_pool.build_arm_template("diff_diff", _DIFF_DIFF_VERSION, template_dir)
+
+
+@pytest.fixture(scope="session")
+def shared_statsmodels_venv(tmp_path_factory):
+    """Session-scoped statsmodels-arm venv. PR #7: validates that
+    ``build_arm_template`` works for ``arm="statsmodels"`` end-to-end.
+
+    Cost: ~20-30s for one statsmodels wheel install (numpy + scipy +
+    patsy are already wheels). Shared across the 3 statsmodels-arm
+    tests so the per-file slow budget stays bounded.
+    """
+    template_dir = tmp_path_factory.mktemp("shared_statsmodels_venv")
+    return venv_pool.build_arm_template("statsmodels", _STATSMODELS_VERSION, template_dir)
 
 
 def _site_packages(venv_path: Path) -> Path:
@@ -294,12 +308,92 @@ def test_wrapper_argv_with_newlines_fails_closed(shared_venv, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_arm_template_statsmodels_arm_not_implemented(tmp_path):
-    """``arm="statsmodels"`` raises ``NotImplementedError`` with a PR #7
-    pointer (no venv built).
+def _direct_venv_site_packages(venv_path: Path) -> Path:
+    """Resolve the venv's site-packages by direct path lookup.
+
+    Bypasses the ``.actual-python -S`` ``sysconfig`` probe used by
+    ``_site_packages``: on Python 3.13 ``-S`` skips ``pyvenv.cfg``
+    processing entirely, so ``sys.prefix`` resolves to the base
+    interpreter, not the venv. (Pre-existing bug in ``_site_packages``;
+    tracked separately. The venv layout is standardized by
+    ``venv.create``, so direct path lookup is robust.)
     """
-    with pytest.raises(NotImplementedError, match="PR #7"):
-        venv_pool.build_arm_template("statsmodels", _DIFF_DIFF_VERSION, tmp_path / "venv")
+    minor = sys.version_info.minor
+    return venv_path / "lib" / f"python3.{minor}" / "site-packages"
+
+
+def test_build_arm_template_statsmodels_installs_correct_library_version(
+    shared_statsmodels_venv,
+):
+    """PR #7: ``arm="statsmodels"`` builds a venv with the pinned
+    statsmodels version installed and importable.
+
+    Uses the venv's wrapper ``bin/python`` rather than ``-S`` invocation
+    (which doesn't see venv site-packages on Python 3.13). Sets
+    ``_PYRUNTIME_EVENT_LOG`` to a tmp file so the shim doesn't hard-exit.
+    """
+    log_path = shared_statsmodels_venv.parent / "version_probe_events.jsonl"
+    log_path.touch()
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "_PYRUNTIME_EVENT_LOG": str(log_path),
+    }
+    result = subprocess.run(
+        [
+            str(shared_statsmodels_venv / "bin" / "python"),
+            "-c",
+            "import statsmodels; print(statsmodels.__version__)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    assert result.stdout.strip() == _STATSMODELS_VERSION
+
+
+def test_build_arm_template_statsmodels_installs_pyruntime_shim(shared_statsmodels_venv):
+    """The same shim install path (``_pyruntime_shim.py`` + ``_pyruntime_shim.pth``)
+    fires for the statsmodels arm as for diff_diff."""
+    site_packages = _direct_venv_site_packages(shared_statsmodels_venv)
+    shim_py = site_packages / "_pyruntime_shim.py"
+    shim_pth = site_packages / "_pyruntime_shim.pth"
+    assert shim_py.exists(), f"{shim_py} missing — shim not installed in statsmodels-arm venv"
+    assert shim_pth.exists(), f"{shim_pth} missing — .pth load not installed"
+    assert shim_pth.read_text() == "import _pyruntime_shim\n"
+
+
+def test_build_arm_template_statsmodels_shim_records_module_import(
+    shared_statsmodels_venv, tmp_path
+):
+    """End-to-end attestation: invoking the venv's python with the event-log
+    env-var set causes the statsmodels post-import hook to record a
+    ``module_import/module=statsmodels`` event when statsmodels is imported.
+    """
+    log_path = tmp_path / "events.jsonl"
+    log_path.touch()
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "_PYRUNTIME_EVENT_LOG": str(log_path),
+    }
+    subprocess.run(
+        [
+            str(shared_statsmodels_venv / "bin" / "python"),
+            "-c",
+            "import statsmodels",
+        ],
+        check=True,
+        capture_output=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+    events = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    module_imports = [
+        e for e in events if e.get("event") == "module_import" and e.get("module") == "statsmodels"
+    ]
+    assert (
+        len(module_imports) >= 1
+    ), f"expected at least one module_import/statsmodels event, got {events}"
 
 
 def test_build_arm_template_unknown_arm_raises(tmp_path):

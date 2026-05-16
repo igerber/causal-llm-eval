@@ -54,6 +54,66 @@ _DIAGNOSTIC_FUNCTION_NAMES: tuple[str, ...] = (
 )
 
 
+# Statsmodels (arm 2). Statsmodels' submodule layout is not flattened the
+# way diff_diff's is, so each entry is (submodule_path, class_name); the
+# attach hook imports each submodule and patches the class on it.
+_STATSMODELS_ESTIMATOR_CLASSES: tuple[tuple[str, str], ...] = (
+    ("statsmodels.regression.linear_model", "OLS"),
+    ("statsmodels.regression.linear_model", "WLS"),
+    ("statsmodels.regression.linear_model", "GLS"),
+    ("statsmodels.regression.linear_model", "GLSAR"),
+    ("statsmodels.robust.robust_linear_model", "RLM"),
+    ("statsmodels.genmod.generalized_linear_model", "GLM"),
+    ("statsmodels.regression.mixed_linear_model", "MixedLM"),
+    ("statsmodels.discrete.discrete_model", "Logit"),
+    ("statsmodels.discrete.discrete_model", "Probit"),
+)
+
+
+# (submodule_path, function_name) — diagnostics a panel-data analyst plausibly
+# invokes during ATT methodology selection. Excludes the long tail of
+# specialty (multivariate, time-series) diagnostics that don't apply.
+_STATSMODELS_DIAGNOSTIC_FUNCTIONS: tuple[tuple[str, str], ...] = (
+    ("statsmodels.stats.diagnostic", "het_breuschpagan"),
+    ("statsmodels.stats.diagnostic", "het_white"),
+    ("statsmodels.stats.diagnostic", "linear_reset"),
+    ("statsmodels.stats.diagnostic", "acorr_breusch_godfrey"),
+    ("statsmodels.stats.diagnostic", "acorr_ljungbox"),
+    ("statsmodels.stats.stattools", "durbin_watson"),
+)
+
+
+# (submodule_path, class_name, method_name) for post-fit results inspection.
+# Each entry's wrapper records ``type(self).__name__`` at call time, so
+# subclasses surface as the correct runtime class (e.g. ``OLSResults`` even
+# when ``RegressionResults`` is the patched class).
+#
+# PR #7 R1 EV-2: statsmodels' result-class graph is forked at
+# ``LikelihoodModelResults`` — ``OLSResults`` / ``WLSResults`` /
+# ``GLSResults`` inherit from ``RegressionResults``, but ``RLMResults`` /
+# ``GLMResults`` / ``MixedLMResults`` inherit directly from
+# ``LikelihoodModelResults`` (not from RegressionResults), and
+# ``LogitResults`` / ``ProbitResults`` inherit from ``BinaryResults``.
+# Patching only ``RegressionResults`` would silently undercount the
+# non-linear arms. The list below patches at the smallest parent class for
+# each tracked-estimator family so every subclass-call resolves via MRO to
+# the wrapped method.
+_STATSMODELS_RESULTS_METHODS: tuple[tuple[str, str, str], ...] = (
+    # OLS / WLS / GLS / GLSAR → RegressionResults
+    ("statsmodels.regression.linear_model", "RegressionResults", "summary"),
+    ("statsmodels.regression.linear_model", "RegressionResults", "get_robustcov_results"),
+    # RLM (robust) → RLMResults (own .summary)
+    ("statsmodels.robust.robust_linear_model", "RLMResults", "summary"),
+    # GLM (genmod) → GLMResults (own .summary)
+    ("statsmodels.genmod.generalized_linear_model", "GLMResults", "summary"),
+    # MixedLM → MixedLMResults (own .summary)
+    ("statsmodels.regression.mixed_linear_model", "MixedLMResults", "summary"),
+    # Logit / Probit → BinaryResults (parent of both LogitResults and
+    # ProbitResults; .summary defined on BinaryResults / DiscreteResults).
+    ("statsmodels.discrete.discrete_model", "BinaryResults", "summary"),
+)
+
+
 # The four bundled guide file names. The `builtins.open` hook records reads
 # whose path ends in any of these (and which lie under a diff_diff guides
 # directory).
@@ -136,7 +196,13 @@ def _safe_write(event: dict) -> None:
 
 def _wrap_get_llm_guide(original):
     """Wrap `get_llm_guide(variant)` to record successful reads. The event is
-    emitted AFTER the underlying call returns, so failed reads don't count."""
+    emitted AFTER the underlying call returns, so failed reads don't count.
+
+    Only meaningful for diff_diff (statsmodels ships no LLM guides); the
+    ``library`` field is fixed to ``"diff_diff"`` so the merger's
+    library-attribution filter handles the event uniformly with other
+    diff_diff-attributed events.
+    """
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
@@ -148,6 +214,7 @@ def _wrap_get_llm_guide(original):
                 "event": "guide_file_read",
                 "via": "get_llm_guide",
                 "variant": variant,
+                "library": "diff_diff",
                 "ts": _utc_iso_now(),
             }
         )
@@ -157,7 +224,7 @@ def _wrap_get_llm_guide(original):
     return wrapper
 
 
-def _wrap_estimator_init(original, class_name: str):
+def _wrap_estimator_init(original, class_name: str, *, library: str = "diff_diff"):
     """Wrap an estimator class `__init__` to record SUCCESSFUL construction.
 
     The event is emitted only if the constructor returns; a constructor
@@ -165,6 +232,9 @@ def _wrap_estimator_init(original, class_name: str):
     that attempts `CallawaySantAnna(...)` with bad arguments should not
     have CallawaySantAnna in `estimator_classes_instantiated` — the
     attempt failed.
+
+    ``library`` (kw-only) is attached to the event so the merger's
+    record-builder filters by arm without re-walking the call stack.
     """
     if getattr(original, "_pyruntime_wrapped", False):
         return original
@@ -176,6 +246,7 @@ def _wrap_estimator_init(original, class_name: str):
             {
                 "event": "estimator_init",
                 "class": class_name,
+                "library": library,
                 "ts": _utc_iso_now(),
             }
         )
@@ -185,9 +256,9 @@ def _wrap_estimator_init(original, class_name: str):
     return wrapper
 
 
-def _wrap_estimator_fit(original, class_name: str):
+def _wrap_estimator_fit(original, class_name: str, *, library: str = "diff_diff"):
     """Wrap `fit` method; record AFTER successful return so failed fits
-    don't count as use."""
+    don't count as use. ``library`` (kw-only) is attached to the event."""
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
@@ -198,6 +269,7 @@ def _wrap_estimator_fit(original, class_name: str):
             {
                 "event": "estimator_fit",
                 "class": class_name,
+                "library": library,
                 "ts": _utc_iso_now(),
             }
         )
@@ -207,9 +279,10 @@ def _wrap_estimator_fit(original, class_name: str):
     return wrapper
 
 
-def _wrap_diagnostic(original, name: str):
+def _wrap_diagnostic(original, name: str, *, library: str = "diff_diff"):
     """Wrap a module-level diagnostic function; record AFTER successful
-    return so failed diagnostic calls don't count."""
+    return so failed diagnostic calls don't count. ``library`` (kw-only)
+    is attached to the event."""
     if getattr(original, "_pyruntime_wrapped", False):
         return original
 
@@ -220,6 +293,40 @@ def _wrap_diagnostic(original, name: str):
             {
                 "event": "diagnostic_call",
                 "name": name,
+                "library": library,
+                "ts": _utc_iso_now(),
+            }
+        )
+        return result
+
+    wrapper._pyruntime_wrapped = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _wrap_results_method(original, method_name: str, *, library: str = "statsmodels"):
+    """Wrap a post-fit results method (e.g. ``OLSResults.summary``) to record
+    SUCCESSFUL inspection. Records ``type(self).__name__`` at call time so
+    a single patch on the parent class (e.g. ``RegressionResults``) attributes
+    correctly across subclasses (``OLSResults``, ``RLMResults``,
+    ``MixedLMResults``, …) without enumerating them.
+
+    Event type ``estimator_diagnostic_method`` is distinct from
+    ``estimator_init`` / ``estimator_fit`` / ``diagnostic_call`` so the
+    merger can route them cleanly. Recording is AFTER successful return;
+    a call that raises does not produce telemetry.
+    """
+    if getattr(original, "_pyruntime_wrapped", False):
+        return original
+
+    @functools.wraps(original)
+    def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        _safe_write(
+            {
+                "event": "estimator_diagnostic_method",
+                "class": type(self).__name__,
+                "method": method_name,
+                "library": library,
                 "ts": _utc_iso_now(),
             }
         )
@@ -319,6 +426,11 @@ def _install_open_hook() -> None:
                         "event": "guide_file_read",
                         "via": "open",
                         "filename": filename,
+                        # PR #7 R1 EV-1: open-based guide reads are always
+                        # diff_diff (statsmodels ships no guides under
+                        # tracked filenames). Required for library
+                        # attribution invariant.
+                        "library": "diff_diff",
                         "ts": _utc_iso_now(),
                     }
                 )
@@ -329,25 +441,44 @@ def _install_open_hook() -> None:
     io.open = _pyruntime_open  # type: ignore[assignment]
 
 
-def _caller_is_from_diff_diff(start_frame) -> tuple[bool, str, int]:
-    """Walk the call stack looking for a frame whose module is diff_diff.
+# Library prefixes the warning hook attributes against. Order matters: the
+# stack walk returns the FIRST matching prefix, so more-specific names should
+# come first (none currently — diff_diff and statsmodels share no prefix).
+_WARNING_LIBRARY_PREFIXES: tuple[str, ...] = ("diff_diff", "statsmodels")
 
-    Returns (matched, filename, lineno). When matched, the returned filename
-    and lineno point at the actual diff_diff frame in the call stack, not
-    whatever the caller's `stacklevel` argument designated for display.
+
+def _caller_is_from_library(
+    start_frame, prefixes: tuple[str, ...] = _WARNING_LIBRARY_PREFIXES
+) -> tuple[bool, str, int, str]:
+    """Walk the call stack looking for a frame whose module matches one of
+    the library ``prefixes`` (e.g. ``("diff_diff", "statsmodels")``).
+
+    Returns ``(matched, filename, lineno, library)``. ``library`` is the
+    bare prefix string of the matched frame (e.g. ``"diff_diff"``,
+    ``"statsmodels"``) so the caller can attribute the event without
+    re-walking. When unmatched, returns ``(False, "", 0, "")``.
+
+    A frame's module matches a prefix iff its ``__name__`` equals the
+    prefix or starts with ``"<prefix>."``. The first match wins, so the
+    nearest library frame is attributed (avoids cross-attribution when a
+    diff_diff function calls a statsmodels function which calls
+    ``warnings.warn``).
     """
     frame = start_frame
     while frame is not None:
         mod = frame.f_globals.get("__name__", "") or ""
-        if mod == "diff_diff" or mod.startswith("diff_diff."):
-            return True, frame.f_code.co_filename, frame.f_lineno
+        for prefix in prefixes:
+            if mod == prefix or mod.startswith(prefix + "."):
+                return True, frame.f_code.co_filename, frame.f_lineno, prefix
         frame = frame.f_back
-    return False, "", 0
+    return False, "", 0, ""
 
 
 def _install_warning_hook() -> None:
     """Override `warnings.warn` to record warnings whose call stack passes
-    through diff_diff. Idempotent."""
+    through diff_diff OR statsmodels. The event carries a ``library``
+    field so the merger's record-builder routes the event to the right
+    arm without re-walking the stack. Idempotent."""
     if getattr(warnings.warn, "_pyruntime_wrapped", False):
         return
     original_warn = warnings.warn
@@ -355,11 +486,13 @@ def _install_warning_hook() -> None:
     @functools.wraps(original_warn)
     def _pyruntime_warn(message, category=UserWarning, stacklevel=1, source=None, **kwargs):
         # sys._getframe(1) is the immediate caller (one frame up from our
-        # wrapper). Walk upward; record if a diff_diff frame is present.
+        # wrapper). Walk upward; record if a tracked library frame is present.
         try:
-            matched, frame_filename, frame_lineno = _caller_is_from_diff_diff(sys._getframe(1))
+            matched, frame_filename, frame_lineno, library = _caller_is_from_library(
+                sys._getframe(1)
+            )
         except ValueError:
-            matched, frame_filename, frame_lineno = False, "", 0
+            matched, frame_filename, frame_lineno, library = False, "", 0, ""
         if matched:
             try:
                 category_name = category.__name__ if isinstance(category, type) else str(category)
@@ -371,6 +504,7 @@ def _install_warning_hook() -> None:
                     "category": category_name,
                     "filename": frame_filename,
                     "lineno": frame_lineno,
+                    "library": library,
                     "message": str(message)[:500],
                     "ts": _utc_iso_now(),
                 }
@@ -427,15 +561,15 @@ def _attach_diff_diff_hooks(module) -> None:
         if cls is None:
             continue
         if hasattr(cls, "__init__"):
-            cls.__init__ = _wrap_estimator_init(cls.__init__, class_name)
+            cls.__init__ = _wrap_estimator_init(cls.__init__, class_name, library="diff_diff")
         if hasattr(cls, "fit"):
-            cls.fit = _wrap_estimator_fit(cls.fit, class_name)
+            cls.fit = _wrap_estimator_fit(cls.fit, class_name, library="diff_diff")
 
     for func_name in _DIAGNOSTIC_FUNCTION_NAMES:
         original = getattr(module, func_name, None)
         if original is None or not callable(original):
             continue
-        wrapped = _wrap_diagnostic(original, func_name)
+        wrapped = _wrap_diagnostic(original, func_name, library="diff_diff")
         setattr(module, func_name, wrapped)
         # Mirror to the defining submodule so
         # `from diff_diff.<submod> import <func>` paths reach the wrapper
@@ -445,6 +579,64 @@ def _attach_diff_diff_hooks(module) -> None:
             src_module = sys.modules.get(src_module_name)
             if src_module is not None and getattr(src_module, func_name, None) is original:
                 setattr(src_module, func_name, wrapped)
+
+
+def _attach_statsmodels_hooks(module) -> None:
+    """Patch the loaded ``statsmodels`` package to record library entry-point
+    calls. Called from ``_StatsmodelsPostImportHook.exec_module`` after Python
+    finishes importing ``statsmodels``.
+
+    Walks :data:`_STATSMODELS_ESTIMATOR_CLASSES`, :data:`_STATSMODELS_DIAGNOSTIC_FUNCTIONS`,
+    and :data:`_STATSMODELS_RESULTS_METHODS`. For each, imports the named
+    submodule (``importlib.import_module``), looks up the attribute, and
+    wraps it in place. Imports cascade through statsmodels' submodule
+    graph; this is bounded by what the agent would import anyway (the
+    agent's first ``import statsmodels.api`` already loads most of these).
+
+    Idempotency is enforced at the per-callable level (each ``_wrap_*``
+    sets a ``_pyruntime_wrapped`` flag; re-wrap is a no-op). Submodule
+    import failures are tolerated silently (a future statsmodels release
+    that drops a submodule should not break shim attach for the rest).
+    """
+    del module  # signature parity with _attach_diff_diff_hooks; we re-import below
+    for submodule_path, class_name in _STATSMODELS_ESTIMATOR_CLASSES:
+        try:
+            submodule = importlib.import_module(submodule_path)
+        except ImportError:
+            continue
+        cls = getattr(submodule, class_name, None)
+        if cls is None:
+            continue
+        if hasattr(cls, "__init__"):
+            cls.__init__ = _wrap_estimator_init(cls.__init__, class_name, library="statsmodels")
+        if hasattr(cls, "fit"):
+            cls.fit = _wrap_estimator_fit(cls.fit, class_name, library="statsmodels")
+
+    for submodule_path, func_name in _STATSMODELS_DIAGNOSTIC_FUNCTIONS:
+        try:
+            submodule = importlib.import_module(submodule_path)
+        except ImportError:
+            continue
+        original = getattr(submodule, func_name, None)
+        if original is None or not callable(original):
+            continue
+        wrapped = _wrap_diagnostic(original, func_name, library="statsmodels")
+        setattr(submodule, func_name, wrapped)
+
+    for submodule_path, class_name, method_name in _STATSMODELS_RESULTS_METHODS:
+        try:
+            submodule = importlib.import_module(submodule_path)
+        except ImportError:
+            continue
+        cls = getattr(submodule, class_name, None)
+        if cls is None:
+            continue
+        original = getattr(cls, method_name, None)
+        if original is None or not callable(original):
+            continue
+        setattr(
+            cls, method_name, _wrap_results_method(original, method_name, library="statsmodels")
+        )
 
 
 class _DiffDiffPostImportHook:
@@ -509,6 +701,60 @@ class _DiffDiffPostImportHook:
                 }
             )
             _attach_diff_diff_hooks(module)
+
+        _wrapped_exec_module._pyruntime_wrapped = True  # type: ignore[attr-defined]
+        spec.loader.exec_module = _wrapped_exec_module  # type: ignore[method-assign]
+        return spec
+
+
+class _StatsmodelsPostImportHook:
+    """``sys.meta_path`` finder that triggers hook attachment after
+    ``statsmodels`` loads. Architectural mirror of
+    :class:`_DiffDiffPostImportHook`.
+
+    Only the top-level ``statsmodels`` package import triggers attachment;
+    Python's import machinery guarantees the parent package is imported
+    before any submodule, so a single hook firing on the parent is
+    sufficient to schedule the wrap-pass over
+    :data:`_STATSMODELS_ESTIMATOR_CLASSES` /
+    :data:`_STATSMODELS_DIAGNOSTIC_FUNCTIONS` /
+    :data:`_STATSMODELS_RESULTS_METHODS`.
+
+    Reentrancy + idempotency semantics are identical to the diff_diff hook;
+    see its docstring for the rationale on the in-lookup flag and the
+    exec_module wrap idempotency check.
+    """
+
+    _in_lookup = False
+
+    def find_spec(self, fullname, path, target=None):
+        del path, target
+        if fullname != "statsmodels":
+            return None
+        cls = type(self)
+        if cls._in_lookup:
+            return None
+        cls._in_lookup = True
+        try:
+            spec = importlib.util.find_spec("statsmodels")
+        finally:
+            cls._in_lookup = False
+        if spec is None or spec.loader is None:
+            return spec
+        if getattr(spec.loader.exec_module, "_pyruntime_wrapped", False):
+            return spec
+        original_exec_module = spec.loader.exec_module
+
+        def _wrapped_exec_module(module):
+            original_exec_module(module)
+            _safe_write(
+                {
+                    "event": "module_import",
+                    "module": "statsmodels",
+                    "ts": _utc_iso_now(),
+                }
+            )
+            _attach_statsmodels_hooks(module)
 
         _wrapped_exec_module._pyruntime_wrapped = True  # type: ignore[attr-defined]
         spec.loader.exec_module = _wrapped_exec_module  # type: ignore[method-assign]
@@ -649,9 +895,11 @@ def _install_production_state() -> None:
     except (ImportError, ValueError, AttributeError):
         pass
 
-    # Insert post-import hook at FRONT of meta_path so it beats the default
-    # PathFinder for `diff_diff`.
+    # Insert post-import hooks at FRONT of meta_path so they beat the default
+    # PathFinder for the respective parent packages. Each hook's ``find_spec``
+    # returns ``None`` for non-matching names; coexistence is by-construction.
     sys.meta_path.insert(0, _DiffDiffPostImportHook())
+    sys.meta_path.insert(0, _StatsmodelsPostImportHook())
     _install_warning_hook()
     _install_open_hook()
 

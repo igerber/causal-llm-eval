@@ -57,6 +57,13 @@ dev = [
     # validated against. PR #5 (per-arm venv pool) will manage the eval-time
     # pin separately.
     "diff-diff==3.3.2",
+    # statsmodels (arm 2) for the same reason: the bidirectional regression
+    # tests in `test_sitecustomize.py` and the end-to-end shim integration
+    # tests use real `import statsmodels` to verify `_STATSMODELS_*` constants
+    # resolve and hooks fire. Pinned exactly to match the per-arm venv pin
+    # (`harness/venv_pool.py::_ARM_TO_PIP_PACKAGE`) and the `@slow`
+    # venv-build tests.
+    "statsmodels==0.14.6",
 ]
 
 [tool.setuptools.packages.find]
