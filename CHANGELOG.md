@@ -89,6 +89,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fail-closed.
 
 ### Fixed (PR #6)
+- Locked invocation now passes `--permission-mode bypassPermissions`. In
+  `--print` mode there is no TTY for the operator to approve Bash
+  invocations, so any tool requiring approval blocks at "This command
+  requires approval" and the agent reports the call was not executed
+  (which broke the probe's structural python command). The agent runs
+  in a sandboxed tmpdir with HOME=tmpdir + clean_env, so bypassing
+  permissions does not leak operator state — it just lets the agent
+  actually use its tools.
+- Probe blacklist no longer includes `project_` (false-fires on
+  `CLAUDE_PROJECT_DIR`, which is the env-var name the probe prompt
+  itself recites in the structural python command). `feedback_` and
+  `user_role` remain as auto-memory-file-name signatures.
 - Locked invocation argv reordered: `--add-dir <tmpdir>` is now followed
   by `--model <model>` rather than the prompt. Claude CLI's `--add-dir
   <dirs...>` is variadic; with the prompt immediately after `--add-dir

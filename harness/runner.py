@@ -534,6 +534,15 @@ def _build_command(
         # would still exit 0 but produce a 0-byte transcript, which the
         # merger has no way to distinguish from "agent emitted nothing".
         "--verbose",
+        # Bypass interactive permission prompts. In --print mode there is
+        # no TTY for the operator to approve Bash invocations, so any
+        # tool requiring approval blocks at "This command requires
+        # approval" and the agent reports the call was not executed.
+        # The agent runs in a sandboxed tmpdir with HOME=tmpdir and
+        # clean_env, so bypassing permissions does not leak operator
+        # state — it just lets the agent actually USE its tools.
+        "--permission-mode",
+        "bypassPermissions",
         "--add-dir",
         str(tmpdir),
         "--model",

@@ -81,10 +81,13 @@ _LEAKAGE_BLACKLIST: tuple[str, ...] = (
     "/revise-plan",
     "/read-feedback-revise",
     "/push-pr-update",
-    # Auto-memory file naming convention.
+    # Auto-memory file naming convention. NOTE: ``project_`` is intentionally
+    # NOT in this list — it would false-fire on ``CLAUDE_PROJECT_DIR`` (the
+    # env-var name the probe prompt itself recites in the structural python
+    # command). ``feedback_`` and ``user_role`` are sufficiently specific to
+    # auto-memory file names without colliding with prompt-recited terms.
     "MEMORY.md",
     "feedback_",
-    "project_",
     "user_role",
     # Operator's primary project name.
     "diff-diff",
