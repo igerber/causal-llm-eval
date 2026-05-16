@@ -31,7 +31,7 @@
       }
     }
   },
-  "notes": "Starter parameters; calibration loop pending. The persisted data.parquet drops the DGP's `true_effect` column to preserve eval validity (agent must estimate, not read, the effect).",
+  "notes": "Starter parameters; calibration loop pending. The persisted data.parquet drops the DGP's `true_effect` column to preserve eval validity (agent must estimate, not read, the effect). Byte-identical regeneration requires matching writer_versions; see tests/test_dgp.py::test_committed_dataset_matches_regeneration.",
   "parameters": {
     "cohort_periods": [
       4,
@@ -67,5 +67,9 @@
     "n_rows": 2000
   },
   "seed": 42,
-  "uncalibrated": true
+  "uncalibrated": true,
+  "writer_versions": {
+    "pandas": "3.0.3",
+    "pyarrow": "24.0.0"
+  }
 }

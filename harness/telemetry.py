@@ -6,10 +6,17 @@ Layer 1 - Stream-JSON event log from Claude Code:
     with arguments and results, and file reads with paths.
 
 Layer 2 - In-process Python instrumentation (the discoverability ground truth):
-    A `sitecustomize.py` installed in the per-run venv hooks the target library
-    and writes per-event JSON records. Catches access that stream-JSON misses
-    (e.g., `python -c "from diff_diff import get_llm_guide"` reads the file via
-    Python, not Claude's Read tool). See `harness/sitecustomize_template.py`.
+    A `_pyruntime_shim.py` plus `_pyruntime_shim.pth` installed in the per-run
+    venv's site-packages hooks the target library and writes per-event JSON
+    records. The .pth file's `import _pyruntime_shim` line is processed by
+    Python's site machinery during initialization (BEFORE `execsitecustomize`
+    runs), so our shim loads even when the operator's system Python ships its
+    own stdlib-level `sitecustomize.py` (PR #6 fix; canonical workaround used
+    by coverage.py / pytest-cov). Catches access that stream-JSON misses
+    (e.g., `python -c "from diff_diff import get_llm_guide"` reads the file
+    via Python, not Claude's Read tool). See `harness/sitecustomize_template.py`
+    (the source file is named for the historical sitecustomize mechanism but
+    is installed under the `_pyruntime_shim` name).
 
 Layer 3 - Subprocess stderr capture:
     Captures CLI-level errors emitted by `claude --bare` and any other stderr

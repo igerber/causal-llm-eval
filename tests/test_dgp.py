@@ -69,10 +69,18 @@ def test_dgp_truth_json_schema(tmp_path: Path) -> None:
         "parameters",
         "ground_truth",
         "schema",
+        "writer_versions",  # PR #6 R3 DT-1: pandas/pyarrow versions for byte-identity
         "uncalibrated",
         "notes",
     }
     assert required_top_level.issubset(payload.keys())
+
+    # writer_versions records the exact pandas/pyarrow versions used to
+    # write the parquet, so the regeneration test can detect when
+    # byte-identity will not hold under newer writer versions.
+    wv = payload["writer_versions"]
+    assert set(wv.keys()) == {"pandas", "pyarrow"}
+    assert all(isinstance(v, str) and v.strip() for v in wv.values())
 
     assert payload["dgp_version"] == CASE_STUDY_V1_DGP_VERSION
     assert payload["seed"] == 42
@@ -110,17 +118,36 @@ def test_committed_dataset_matches_regeneration(tmp_path: Path) -> None:
     without bumping CASE_STUDY_V1_DGP_VERSION and regenerating the
     committed artifact, this test fails loudly.
 
-    Recovery if pyarrow drift breaks bit-identity (not parameter drift):
-    re-run ``python -m harness.dgp datasets/case_study_v1 --seed 42``,
-    commit the new bytes, note in CHANGELOG.
+    PR #6 R3 DT-1: parquet bit-identity depends on the exact pandas +
+    pyarrow versions used to write the committed bytes. The committed
+    ``dgp_truth.json::writer_versions`` records those versions; this
+    test SKIPS when the local installed versions differ, with a clear
+    actionable message. Operators on matching versions get the strict
+    byte-identity guarantee; operators on drifted versions see a skip
+    rather than a confusing failure (the per-run ``dataset_sha`` in
+    ``RunMetadata`` remains the load-bearing reproducibility anchor).
     """
+    import pandas as pd
+    import pyarrow as pa
+
     if not _COMMITTED_DATASET.exists():
         pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed_truth = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+    committed_writer = committed_truth.get("writer_versions", {})
+    local_writer = {"pandas": pd.__version__, "pyarrow": pa.__version__}
+    if committed_writer != local_writer:
+        pytest.skip(
+            "Local pandas/pyarrow versions differ from committed "
+            f"writer_versions ({local_writer} vs {committed_writer}); "
+            "byte-identity is not expected. Re-pin or regenerate "
+            "datasets/case_study_v1/ on a matching environment."
+        )
     parquet = generate_case_study_v1(tmp_path, seed=42)
     assert _sha256(parquet) == _sha256(_COMMITTED_DATASET), (
-        "Regenerated parquet does not match committed bytes. "
-        "If parameter drift: bump CASE_STUDY_V1_DGP_VERSION + regenerate. "
-        "If pyarrow drift: regenerate + recommit + note in CHANGELOG."
+        "Regenerated parquet does not match committed bytes despite "
+        "matching writer_versions. If parameter drift: bump "
+        "CASE_STUDY_V1_DGP_VERSION + regenerate. If unexpected: "
+        "regenerate + recommit + note in CHANGELOG."
     )
 
 

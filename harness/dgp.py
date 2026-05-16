@@ -30,7 +30,11 @@ import json
 import sys
 from pathlib import Path
 
-import diff_diff
+# PR #6 R3 CQ-1: ``diff_diff`` is in the ``dev`` extras only. Other modules
+# (notably ``harness.probe``) import the dependency-light ``_deterministic_write_parquet``
+# helper from this module; importing diff_diff at module load would force
+# every harness import path to depend on diff_diff. Lazy-import inside
+# ``generate_case_study_v1`` instead, where the dependency is actually used.
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -138,12 +142,24 @@ def _compute_ground_truth(df: pd.DataFrame) -> dict:
     }
 
 
-def _write_dgp_truth(out_path: Path, *, seed: int, df_full: pd.DataFrame, n_rows: int) -> None:
-    """Write the ground-truth sidecar JSON with deterministic key order."""
+def _write_dgp_truth(
+    out_path: Path,
+    *,
+    seed: int,
+    df_full: pd.DataFrame,
+    n_rows: int,
+    diff_diff_version: str,
+) -> None:
+    """Write the ground-truth sidecar JSON with deterministic key order.
+
+    Records the diff_diff/pandas/pyarrow versions used to materialize the
+    parquet so a future regenerator can detect when byte-identity will not
+    hold under newer writer versions (PR #6 R3 DT-1).
+    """
     payload = {
         "dgp_version": CASE_STUDY_V1_DGP_VERSION,
         "generator_function": "diff_diff.generate_staggered_data",
-        "diff_diff_version": diff_diff.__version__,
+        "diff_diff_version": diff_diff_version,
         "seed": int(seed),
         "parameters": _DGP_CALL_KWARGS,
         "ground_truth": _compute_ground_truth(df_full),
@@ -152,11 +168,17 @@ def _write_dgp_truth(out_path: Path, *, seed: int, df_full: pd.DataFrame, n_rows
             "dtypes": dict(_PERSISTED_DTYPES),
             "n_rows": int(n_rows),
         },
+        "writer_versions": {
+            "pandas": pd.__version__,
+            "pyarrow": pa.__version__,
+        },
         "uncalibrated": True,
         "notes": (
             "Starter parameters; calibration loop pending. The persisted "
             "data.parquet drops the DGP's `true_effect` column to preserve "
-            "eval validity (agent must estimate, not read, the effect)."
+            "eval validity (agent must estimate, not read, the effect). "
+            "Byte-identical regeneration requires matching writer_versions; "
+            "see tests/test_dgp.py::test_committed_dataset_matches_regeneration."
         ),
     }
     with open(out_path, "w") as f:
@@ -221,6 +243,11 @@ def generate_case_study_v1(out_dir: Path, *, seed: int = 42) -> Path:
     Returns:
         ``out_dir / "data.parquet"`` — the path the agent reads from.
     """
+    # Lazy import: see module-level note. Importing diff_diff here keeps
+    # ``import harness.dgp`` (and transitively ``import harness.probe``)
+    # free of the dev-extras-only diff_diff dependency.
+    import diff_diff
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -236,6 +263,7 @@ def generate_case_study_v1(out_dir: Path, *, seed: int = 42) -> Path:
         seed=seed,
         df_full=df_full,
         n_rows=len(df_persist),
+        diff_diff_version=diff_diff.__version__,
     )
 
     (out_dir / "README.md").write_text(_README_TEXT)
