@@ -391,17 +391,44 @@ def _read_events(path: Path, *, venv_path: Path | None = None) -> list[dict]:
 # strict producer-side control (see ``harness/sitecustomize_template.py``);
 # missing required fields means the event is malformed and would silently
 # zero out telemetry fields if accepted as-is. Reject at parse time.
+# Library-surface events carry a ``library: str`` attribution field set by
+# the shim's ``_wrap_*`` decorators. PR #7 added the field so the merger
+# can route events by arm without re-walking the call stack. The set below
+# is the closed list of event types for which ``library`` is REQUIRED;
+# malformed events that name a tracked surface but omit ``library`` would
+# silently disappear from the arm-filtered record builders.
+_LIBRARY_ATTRIBUTED_EVENTS: frozenset[str] = frozenset(
+    {
+        "estimator_init",
+        "estimator_fit",
+        "diagnostic_call",
+        "estimator_diagnostic_method",
+        "warning_emitted",
+        "guide_file_read",
+    }
+)
+_LIBRARY_ENUM: frozenset[str] = frozenset({"diff_diff", "statsmodels"})
+
 _EVENT_SCHEMA: dict[str, tuple[str, ...]] = {
     "session_start": ("argv", "pid"),
     "session_end": ("pid",),
+    # module_import is structural (no library-surface attribution); the shim
+    # emits it from the post-import hook chain for both arms. ``module`` is
+    # the tracked-package name ("diff_diff" or "statsmodels").
     "module_import": ("module",),
-    "guide_file_read": (
-        "via",
-    ),  # via=='get_llm_guide' needs variant; via=='open' needs filename - checked below
-    "estimator_init": ("class",),
-    "estimator_fit": ("class",),
-    "diagnostic_call": ("name",),
-    "warning_emitted": ("filename",),
+    # guide_file_read is library-attributed (diff_diff only in practice — the
+    # statsmodels arm ships no guides). PR #7 added the ``library`` field;
+    # required per _LIBRARY_ATTRIBUTED_EVENTS.
+    "guide_file_read": ("via", "library"),
+    "estimator_init": ("class", "library"),
+    "estimator_fit": ("class", "library"),
+    "diagnostic_call": ("name", "library"),
+    # PR #7: post-fit results-method calls (e.g. OLSResults.summary).
+    # ``class`` is recorded at call time via ``type(self).__name__`` so a
+    # patch on a parent class (e.g. RegressionResults) reports the actual
+    # subclass for OLSResults / RLMResults / etc.
+    "estimator_diagnostic_method": ("class", "method", "library"),
+    "warning_emitted": ("filename", "library"),
     # PR #5: layer-1.5 wrapper-emitted exec_python event. Required fields per
     # the wrapper script + venv-root-anchored executable check applied when
     # ``venv_path`` is supplied to ``merge_layers``.
@@ -535,10 +562,35 @@ def _validate_event_schemas(
             name = event["name"]
             if not isinstance(name, str):
                 _bail(f"name must be str, got {type(name).__name__}={name!r}")
+        elif event_type == "estimator_diagnostic_method":
+            class_name = event["class"]
+            if not isinstance(class_name, str):
+                _bail(f"class must be str, got {type(class_name).__name__}={class_name!r}")
+            method = event["method"]
+            if not isinstance(method, str):
+                _bail(f"method must be str, got {type(method).__name__}={method!r}")
         elif event_type == "warning_emitted":
             filename = event["filename"]
             if not isinstance(filename, str):
                 _bail(f"filename must be str, got " f"{type(filename).__name__}={filename!r}")
+
+        # Library-attribution check (PR #7 R1 EV-1): every event whose type
+        # is in _LIBRARY_ATTRIBUTED_EVENTS must carry library: str and the
+        # value must be one of the recognized arms. _EVENT_SCHEMA above
+        # marks the field required for presence; this block enforces type
+        # and enum so a malformed value can't silently filter out of the
+        # arm-keyed record builders (_build_diff_diff_record /
+        # _build_statsmodels_record). Surface-event guarantee documented in
+        # harness/COLD_START_VERIFICATION.md "Layer-2 event schema".
+        if event_type in _LIBRARY_ATTRIBUTED_EVENTS:
+            library = event["library"]
+            if not isinstance(library, str):
+                _bail(f"library must be str, got {type(library).__name__}={library!r}")
+            if library not in _LIBRARY_ENUM:
+                _bail(
+                    f"library={library!r} is not a recognized arm; "
+                    f"expected one of {sorted(_LIBRARY_ENUM)}"
+                )
         elif event_type == "exec_python":
             pid = event["pid"]
             if not isinstance(pid, int) or isinstance(pid, bool):
@@ -1690,6 +1742,7 @@ def _validate_shim_loaded(
             "estimator_init",
             "estimator_fit",
             "diagnostic_call",
+            "estimator_diagnostic_method",
             "warning_emitted",
         }
         for e in events
@@ -1748,17 +1801,18 @@ def _build_diff_diff_record(
     explicit bool encoding per `TelemetryRecord.__post_init__`). Any event
     flips its field to ``True``.
 
-    PR #7: every event is filtered by ``library == "diff_diff"`` (or missing,
-    for backward compatibility with PR #5/#6 records that pre-date the
-    ``library`` attribution field). A statsmodels-attributed event in a
-    diff_diff arm's log would otherwise inflate the diff_diff record's
-    counts — by construction the merger sees only one arm's events per run,
-    but the filter prevents future test fixtures or cross-arm bleed-through
-    from causing silent miscounts.
+    PR #7: every event is filtered by ``library == "diff_diff"``. A
+    statsmodels-attributed event in a diff_diff arm's log would otherwise
+    inflate the diff_diff record's counts — by construction the merger sees
+    only one arm's events per run, but the filter prevents future test
+    fixtures or cross-arm bleed-through from causing silent miscounts.
+
+    PR #7 R1 EV-1: ``library`` is REQUIRED on every library-surface event
+    by the schema validator (see ``_EVENT_SCHEMA`` +
+    ``_LIBRARY_ATTRIBUTED_EVENTS``); events that reach this builder are
+    guaranteed to carry it.
     """
-    # Backward-compat: events lacking ``library`` are treated as diff_diff
-    # (matches PR #5/#6 records on disk that pre-date the field).
-    dd_events = [e for e in events if e.get("library", "diff_diff") == "diff_diff"]
+    dd_events = [e for e in events if e.get("library") == "diff_diff"]
     guide_reads = [e for e in dd_events if e.get("event") == "guide_file_read"]
     warnings_emitted = [e for e in dd_events if e.get("event") == "warning_emitted"]
     estimator_inits = [e for e in dd_events if e.get("event") == "estimator_init"]

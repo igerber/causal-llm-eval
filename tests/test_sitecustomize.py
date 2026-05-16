@@ -955,6 +955,41 @@ def test_statsmodels_OLSResults_summary_emits_diagnostic_method_event(event_log)
 
 
 @pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_GLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R1 EV-2 regression: GLMResults inherits from
+    LikelihoodModelResults, NOT RegressionResults, so the original
+    RegressionResults-only patch missed it. The expanded
+    ``_STATSMODELS_RESULTS_METHODS`` now patches GLMResults explicitly;
+    this test proves the wiring actually fires."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.genmod.families import Gaussian
+    from statsmodels.genmod.generalized_linear_model import GLM
+
+    y, x = _tiny_ols_data()
+    x_with_const = np.column_stack([np.ones(len(x)), x])
+    result = GLM(y, x_with_const, family=Gaussian()).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "GLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(method_events) >= 1, (
+        f"GLMResults.summary() did not fire estimator_diagnostic_method; "
+        f"the RegressionResults-only patch missed it. Events: {events}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
 def test_statsmodels_het_breuschpagan_emits_diagnostic_call(event_log):
     _drop_statsmodels_from_sys_modules()
     _import_shim_fresh()

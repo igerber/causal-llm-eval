@@ -73,6 +73,19 @@ _LIBRARY_AND_ESTIMATOR_DENYLIST: tuple[str, ...] = (
     "fixed effect",
     "fixed effects",
     "difference-in-differences",
+    # PR #7 R1 P2 (review-rubric expansion): additional terms a prompt
+    # could leak that would pre-disclose diagnostics or methodology
+    # the rubric grades. Names of pre-trends / parallel-trends /
+    # sensitivity / robustness machinery that an arm-specific guide
+    # might emphasize.
+    "pre-trends",
+    "pretrends",
+    "parallel trends",
+    "sensitivity",
+    "dCDH",
+    "Chaisemartin",
+    "honest",
+    "placebo",
     # Statsmodels-native names
     "OLS",
     "WLS",

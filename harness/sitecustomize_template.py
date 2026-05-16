@@ -84,13 +84,33 @@ _STATSMODELS_DIAGNOSTIC_FUNCTIONS: tuple[tuple[str, str], ...] = (
 
 
 # (submodule_path, class_name, method_name) for post-fit results inspection.
-# Patched on RegressionResults (the parent class); the wrapper records
-# ``type(self).__name__`` at call time so OLSResults / RLMResults /
-# MixedLMResults / etc. instances all surface as the correct class without
-# enumerating every subclass.
+# Each entry's wrapper records ``type(self).__name__`` at call time, so
+# subclasses surface as the correct runtime class (e.g. ``OLSResults`` even
+# when ``RegressionResults`` is the patched class).
+#
+# PR #7 R1 EV-2: statsmodels' result-class graph is forked at
+# ``LikelihoodModelResults`` — ``OLSResults`` / ``WLSResults`` /
+# ``GLSResults`` inherit from ``RegressionResults``, but ``RLMResults`` /
+# ``GLMResults`` / ``MixedLMResults`` inherit directly from
+# ``LikelihoodModelResults`` (not from RegressionResults), and
+# ``LogitResults`` / ``ProbitResults`` inherit from ``BinaryResults``.
+# Patching only ``RegressionResults`` would silently undercount the
+# non-linear arms. The list below patches at the smallest parent class for
+# each tracked-estimator family so every subclass-call resolves via MRO to
+# the wrapped method.
 _STATSMODELS_RESULTS_METHODS: tuple[tuple[str, str, str], ...] = (
+    # OLS / WLS / GLS / GLSAR → RegressionResults
     ("statsmodels.regression.linear_model", "RegressionResults", "summary"),
     ("statsmodels.regression.linear_model", "RegressionResults", "get_robustcov_results"),
+    # RLM (robust) → RLMResults (own .summary)
+    ("statsmodels.robust.robust_linear_model", "RLMResults", "summary"),
+    # GLM (genmod) → GLMResults (own .summary)
+    ("statsmodels.genmod.generalized_linear_model", "GLMResults", "summary"),
+    # MixedLM → MixedLMResults (own .summary)
+    ("statsmodels.regression.mixed_linear_model", "MixedLMResults", "summary"),
+    # Logit / Probit → BinaryResults (parent of both LogitResults and
+    # ProbitResults; .summary defined on BinaryResults / DiscreteResults).
+    ("statsmodels.discrete.discrete_model", "BinaryResults", "summary"),
 )
 
 
@@ -406,6 +426,11 @@ def _install_open_hook() -> None:
                         "event": "guide_file_read",
                         "via": "open",
                         "filename": filename,
+                        # PR #7 R1 EV-1: open-based guide reads are always
+                        # diff_diff (statsmodels ships no guides under
+                        # tracked filenames). Required for library
+                        # attribution invariant.
+                        "library": "diff_diff",
                         "ts": _utc_iso_now(),
                     }
                 )

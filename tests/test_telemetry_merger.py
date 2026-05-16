@@ -23,8 +23,24 @@ from harness.telemetry import (
 # ---------------------------------------------------------------------------
 
 
+_LIBRARY_ATTRIBUTED_EVENT_TYPES = frozenset(
+    {
+        "estimator_init",
+        "estimator_fit",
+        "diagnostic_call",
+        "estimator_diagnostic_method",
+        "warning_emitted",
+        "guide_file_read",
+    }
+)
+
+
 def _write_events_jsonl(
-    path: Path, events: list[dict], *, skip_auto_session_end: bool = False
+    path: Path,
+    events: list[dict],
+    *,
+    skip_auto_session_end: bool = False,
+    skip_auto_library: bool = False,
 ) -> None:
     """Write a list of event dicts as one JSON object per line.
 
@@ -35,7 +51,24 @@ def _write_events_jsonl(
     about that check directly, so the helper keeps existing test setups
     working without per-test changes. Tests exercising the
     session_end-missing fail-closed path pass ``skip_auto_session_end=True``
-    so the omission survives."""
+    so the omission survives.
+
+    PR #7 R1 EV-1: ``library`` is required on every library-surface event
+    by the schema validator. Unless ``skip_auto_library=True``, this helper
+    auto-injects ``library="diff_diff"`` on any library-surface event that
+    doesn't already carry it. Tests asserting the validator REJECTS
+    missing-library records pass ``skip_auto_library=True`` so the
+    omission survives; statsmodels-arm tests pass ``library="statsmodels"``
+    explicitly and the helper leaves it alone (only fills in when absent)."""
+    if not skip_auto_library:
+        augmented_for_library: list[dict] = []
+        for e in events:
+            if e.get("event") in _LIBRARY_ATTRIBUTED_EVENT_TYPES and "library" not in e:
+                augmented_for_library.append({**e, "library": "diff_diff"})
+            else:
+                augmented_for_library.append(e)
+        events = augmented_for_library
+
     if skip_auto_session_end:
         augmented = events
     else:
@@ -4117,26 +4150,157 @@ def test_build_statsmodels_record_ignores_diff_diff_events(tmp_path):
     assert record.diagnostic_methods_invoked == ("het_white",)
 
 
-def test_build_diff_diff_record_treats_library_missing_as_diff_diff(tmp_path):
-    """Backward compatibility: PR #5/#6 records on disk lack a ``library``
-    field on every event. The diff_diff record-builder treats such events
-    as diff_diff-attributed (``e.get("library", "diff_diff")``), so old
-    records remain parseable.
-    """
+def test_library_attributed_event_missing_library_field_rejected(tmp_path):
+    """PR #7 R1 EV-1: ``library`` is required on every library-surface
+    event by the schema validator; missing-library events would otherwise
+    silently disappear from the arm-keyed record builders (which filter
+    strictly on ``library == "<arm>"``). The validator rejects them at
+    parse time so the malformed record can't reach the builder.
+
+    ``skip_auto_library=True`` keeps the missing-library record on disk
+    (the helper would otherwise inject ``library="diff_diff"`` to keep
+    legacy fixtures passing)."""
     events_path, transcript, stderr_log = _make_paths(tmp_path)
     _write_events_jsonl(
         events_path,
         [
             _session_start_event(),
-            # NO `library` field — PR #5/#6 record shape
+            # NO `library` field — pre-PR-#7 record shape
             {"event": "estimator_init", "class": "TwoWayFixedEffects", "ts": "x"},
-            {"event": "estimator_fit", "class": "TwoWayFixedEffects", "ts": "x"},
-            {"event": "diagnostic_call", "name": "compute_pretrends_power", "ts": "x"},
+        ],
+        skip_auto_library=True,
+    )
+    with pytest.raises(TelemetryMergeError, match="missing required field 'library'"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_library_attributed_event_unknown_library_value_rejected(tmp_path):
+    """PR #7 R1 EV-1: ``library`` must be one of the recognized arms.
+    A typo or future arm name would otherwise filter out of every
+    record builder silently."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "estimator_init",
+                "class": "TwoWayFixedEffects",
+                "library": "not-an-arm",
+                "ts": "x",
+            },
+        ],
+        skip_auto_library=True,  # keep the bogus library value
+    )
+    with pytest.raises(TelemetryMergeError, match="not a recognized arm"):
+        merge_layers("diff_diff", transcript, events_path, stderr_log)
+
+
+def test_estimator_diagnostic_method_missing_class_rejected(tmp_path):
+    """PR #7 R1 EV-1: ``class`` is required on estimator_diagnostic_method
+    events; absence would silently drop a record from
+    ``diagnostic_methods_invoked``."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            # No `class` field
+            {
+                "event": "estimator_diagnostic_method",
+                "method": "summary",
+                "library": "statsmodels",
+                "ts": "x",
+            },
         ],
     )
-    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
-    assert record.estimator_classes_instantiated == ("TwoWayFixedEffects",)
-    assert record.diagnostic_methods_invoked == ("compute_pretrends_power",)
+    with pytest.raises(TelemetryMergeError, match="missing required field 'class'"):
+        merge_layers("statsmodels", transcript, events_path, stderr_log)
+
+
+def test_estimator_diagnostic_method_missing_method_rejected(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "estimator_diagnostic_method",
+                "class": "OLSResults",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="missing required field 'method'"):
+        merge_layers("statsmodels", transcript, events_path, stderr_log)
+
+
+def test_estimator_diagnostic_method_non_string_method_rejected(tmp_path):
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "estimator_diagnostic_method",
+                "class": "OLSResults",
+                "method": 123,
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="method must be str"):
+        merge_layers("statsmodels", transcript, events_path, stderr_log)
+
+
+def test_every_shim_emitted_event_type_has_schema_entry():
+    """PR #7 R1 P2 maintainability: every event type the shim emits must
+    have an entry in ``_EVENT_SCHEMA``. Scans the shim source for
+    ``"event": "<name>"`` literals and asserts each is registered.
+
+    The non-validating sentinel types (``telemetry_missing``, ``run_invalid``)
+    are NOT emitted by the shim; they're runner-side sentinels with empty
+    required-fields tuples in ``_EVENT_SCHEMA``. Excluded from the scan.
+    """
+    import re
+
+    from harness.telemetry import _EVENT_SCHEMA
+
+    shim_src = (Path(__file__).parent.parent / "harness" / "sitecustomize_template.py").read_text()
+    # Match `"event": "<name>"` literals (the shim's _safe_write payload key).
+    emitted = set(re.findall(r'"event":\s*"([^"]+)"', shim_src))
+    missing = emitted - set(_EVENT_SCHEMA)
+    assert not missing, (
+        f"shim emits these event types that are NOT registered in "
+        f"_EVENT_SCHEMA: {sorted(missing)}. Add a schema entry (and "
+        f"type/enum validation in _validate_event_schemas) so a malformed "
+        f"record fails closed instead of silently zeroing out telemetry."
+    )
+
+
+def test_estimator_diagnostic_method_triggers_session_start_completeness(tmp_path):
+    """PR #7 R1 EV-1: ``estimator_diagnostic_method`` is a hook event;
+    a log containing one without ``session_start`` is treated as truncated
+    / fabricated, matching the existing fail-closed posture for other
+    hook event types."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            # NO session_start
+            {
+                "event": "estimator_diagnostic_method",
+                "class": "OLSResults",
+                "method": "summary",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    with pytest.raises(TelemetryMergeError, match="hook events but no session_start"):
+        merge_layers("statsmodels", transcript, events_path, stderr_log)
 
 
 def test_build_diff_diff_record_ignores_statsmodels_events(tmp_path):
