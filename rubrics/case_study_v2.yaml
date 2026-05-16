@@ -1,0 +1,72 @@
+version: "v2.0"
+task: "case_study_v1"
+notes: |
+  Phase 1 case-study grading rubric. Pre-defined BEFORE any case-study
+  runs land (CLAUDE.md item 5: "Pre-defined rubrics: Grading rubrics are
+  written before runs, not tuned after seeing transcripts. Same rubric
+  across arms.").
+
+  Once recorded against any run via RunConfig.rubric_version="case_study_v2",
+  this file is IMMUTABLE; new criteria = case_study_v3.yaml. See
+  rubrics/README.md.
+
+  Estimator classification covers both arms in one enum so a TWFE choice
+  resolves to the right bucket regardless of arm: `ols_with_explicit_fe`
+  is statsmodels' TWFE expression (OLS + unit/period dummies);
+  `twoway_fixed_effects` is diff_diff's library-native expression.
+
+criteria:
+  - id: estimator_classification
+    prompt: |
+      Classify the agent's chosen primary estimator into one of the bucket
+      ids below. If the agent fit multiple estimators, classify the one
+      whose point estimate they report as their final ATT.
+    output_type: enum
+    enum_values:
+      - twoway_fixed_effects
+      - callaway_santanna
+      - sun_abraham
+      - did_basic_2x2
+      - chaisemartin_dhaultfoeuille
+      - ols_naive
+      - ols_with_explicit_fe
+      - mixedlm_panel
+      - other_statsmodels_regressor
+      - other_diff_diff_estimator
+      - no_estimator_instantiated
+
+  - id: estimator_classification_evidence
+    prompt: |
+      What text or code evidence supports the classification? Quote up to
+      200 characters from the agent's transcript or solution.py.
+    output_type: string
+
+  - id: diagnostics_invoked
+    prompt: |
+      List the diagnostic methods/functions the agent invoked, using
+      canonical names. Include both module-level functions (e.g.
+      `het_breuschpagan`) and post-fit results methods (e.g.
+      `OLSResults.summary`).
+    output_type: list_of_strings
+
+  - id: reasoning_quality
+    prompt: |
+      Categorize the reasoning quality of the agent's methodology choice.
+    output_type: enum
+    enum_values:
+      - rigorous_with_alternatives
+      - rigorous_no_alternatives
+      - minimal_justification
+      - incorrect_or_invalid
+
+  - id: confidence_intervals_reported
+    prompt: |
+      Did the agent report a confidence interval (or standard error)
+      alongside their point estimate?
+    output_type: bool
+
+  - id: final_att_estimate
+    prompt: |
+      Extract the agent's final numerical point estimate of the ATT. Null
+      if the agent did not produce a numerical estimate.
+    output_type: float_or_null

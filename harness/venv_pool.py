@@ -6,9 +6,10 @@ and cloned per run; never mutated post-clone.
 
 The shape of this module is set in Phase 0 so Phase 2 doesn't require rewrites.
 
-PR #5 implements ``build_arm_template`` end-to-end: create venv, pip install the
-arm library at the pinned version, copy the sitecustomize shim into
-site-packages, install the layer-1.5 ``python`` wrapper. ``clone_for_run``
+``build_arm_template`` builds a fresh venv per run end-to-end: create venv,
+pip install the arm library at the pinned version, copy the sitecustomize
+shim into site-packages, install the layer-1.5 ``python`` wrapper. Both
+arms (diff_diff, statsmodels) are supported as of PR #7. ``clone_for_run``
 remains a stub (Phase 2; PR #6+).
 """
 
@@ -23,7 +24,7 @@ from pathlib import Path
 
 _ARM_TO_PIP_PACKAGE: dict[str, str] = {
     "diff_diff": "diff-diff",
-    # "statsmodels" deferred to PR #7 (statsmodels arm instrumentation).
+    "statsmodels": "statsmodels",
 }
 
 # Filenames inside ${venv}/bin/ that must point at the layer-1.5 wrapper after
@@ -68,9 +69,9 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
     operator's ``_PYRUNTIME_EVENT_LOG`` is set).
 
     Args:
-        arm: ``"diff_diff"`` or ``"statsmodels"``. Statsmodels deferred to PR #7.
+        arm: ``"diff_diff"`` or ``"statsmodels"``.
         library_version: PyPI version string for the arm library
-            (e.g., ``"3.3.2"`` for diff-diff).
+            (e.g., ``"3.3.2"`` for diff-diff; ``"0.14.6"`` for statsmodels).
         template_dir: where to materialize the template venv. Created if missing;
             its parent directory must exist.
 
@@ -78,19 +79,12 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
         ``template_dir`` (the path to the materialized template venv).
 
     Raises:
-        NotImplementedError: if ``arm == "statsmodels"`` (PR #7).
         ValueError: if ``arm`` is not a recognized arm name.
         subprocess.CalledProcessError: if pip install fails (network,
             version-not-found, etc.).
     """
-    if arm == "statsmodels":
-        raise NotImplementedError(
-            "statsmodels arm: deferred to PR #7 (statsmodels arm instrumentation)"
-        )
     if arm not in _ARM_TO_PIP_PACKAGE:
-        raise ValueError(
-            f"unknown arm {arm!r}; expected one of {sorted(_ARM_TO_PIP_PACKAGE) + ['statsmodels']}"
-        )
+        raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(_ARM_TO_PIP_PACKAGE)}")
 
     template_dir = Path(template_dir)
     template_dir.parent.mkdir(parents=True, exist_ok=True)

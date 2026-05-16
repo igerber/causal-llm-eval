@@ -96,7 +96,11 @@ The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_d
 - `sys.modules['_pyruntime_shim']` is present after the venv's `_pyruntime_shim.pth` fires (PR #6). The historical `sys.modules['sitecustomize']` slot is occupied by Homebrew Python's own stdlib-level `sitecustomize.py` on affected systems and by no module at all elsewhere.
 - `warnings.warn is not <original>` reveals a custom warning handler is installed (the override wraps `warn` rather than `showwarning` so it can inspect the call stack before `stacklevel` rewrites the displayed filename).
 - `builtins.open is not <original>` and `io.open is not <original>` could be detected — both are overridden so pathlib/importlib.resources reads of guide files are recorded.
-- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading the shim source (`venv/lib/python3.X/site-packages/_pyruntime_shim.py`) can see exactly which estimators and diagnostics are monitored.
+- The shim's `_ESTIMATOR_CLASS_NAMES`, `_DIAGNOSTIC_FUNCTION_NAMES`, `_STATSMODELS_ESTIMATOR_CLASSES`, `_STATSMODELS_DIAGNOSTIC_FUNCTIONS`, and `_STATSMODELS_RESULTS_METHODS` constants enumerate the methodology surface the eval tracks for both arms. An agent reading the shim source (`venv/lib/python3.X/site-packages/_pyruntime_shim.py`) can see exactly which estimators and diagnostics are monitored.
+
+## Layer-2 event schema (PR #7 addition: `library` attribution)
+
+Every event the in-process shim emits to `_PYRUNTIME_EVENT_LOG` carries a `library: str` field (`"diff_diff"` or `"statsmodels"`). The merger's record-builders filter events by `library` so cross-arm bleed-through cannot inflate either arm's counts. Backward compatibility: events that lack a `library` field are treated as `"diff_diff"` (matches PR #5/#6 records on disk that pre-date the field). PR #7 also adds a new event type `estimator_diagnostic_method` for post-fit results-method calls (e.g. `OLSResults.summary`); the wrapper records `type(self).__name__` at call time so subclass attribution works without enumerating every subclass.
 - The package name `"diff_diff"` appears as a string literal in the warning filter and patch targets. Visible to introspecting agents.
 
 The shim contains NO string literals naming the eval framework, the agent under test, the comparator arm, or the rubric. `grep -r causal_llm_eval $(python -c 'import sys; print(sys.prefix)')` finds nothing in the shim. Helper names use a neutral `_pyruntime_*` prefix matching the env-var convention (`_PYRUNTIME_EVENT_LOG`).
@@ -156,7 +160,7 @@ The merger's three-layer cross-check uses `ppid == runner_pid` as a binary parti
 `harness.venv_pool.build_arm_template(arm, library_version, template_dir)` builds a fresh per-run venv:
 
 1. `venv.create(template_dir, with_pip=True)` materializes the venv with pip.
-2. `${venv}/bin/python -m pip install <arm-pkg>==<library_version>` installs the arm library at the pinned PyPI version (`diff-diff==3.3.2` today; `statsmodels` is deferred to PR #7).
+2. `${venv}/bin/python -m pip install <arm-pkg>==<library_version>` installs the arm library at the pinned PyPI version (`diff-diff==3.3.2` or `statsmodels==0.14.6`; both arms supported as of PR #7).
 3. `_install_shim_into_venv` copies `harness/sitecustomize_template.py` into the venv's `site-packages` as `_pyruntime_shim.py` and writes a `_pyruntime_shim.pth` file containing `import _pyruntime_shim`. Python's site machinery processes the `.pth` file during `addsitepackages()` (BEFORE `execsitecustomize`), so our shim loads regardless of whether the operator's system Python has its own stdlib-level `sitecustomize.py`. Homebrew's `python@3.13` (Feb 2026+) ships such a stdlib-level `sitecustomize.py` that would otherwise shadow any `sitecustomize.py` installed in venv site-packages because stdlib comes before site-packages in `sys.path`. The `.pth` approach is the canonical workaround (used by `coverage.py` and `pytest-cov`).
 4. `_install_python_wrapper` installs the layer-1.5 wrapper (see above).
 

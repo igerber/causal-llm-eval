@@ -4004,3 +4004,189 @@ def test_merge_layers_legacy_mode_rejects_log_with_exec_python_events(tmp_path):
             # runner_pid + venv_path both omitted -> legacy fixture mode,
             # but the log contains exec_python events -> fail closed.
         )
+
+
+# ---------------------------------------------------------------------------
+# PR #7: library-attributed record builders (statsmodels arm + backward compat)
+# ---------------------------------------------------------------------------
+
+
+def test_build_statsmodels_record_populates_estimator_classes(tmp_path):
+    """estimator_init/library=statsmodels and estimator_fit/library=statsmodels
+    events populate ``record.estimator_classes_instantiated`` (was: hard-coded
+    empty tuple pre-PR-#7).
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {"event": "estimator_init", "class": "OLS", "library": "statsmodels", "ts": "x"},
+            {"event": "estimator_init", "class": "WLS", "library": "statsmodels", "ts": "x"},
+            {"event": "estimator_fit", "class": "OLS", "library": "statsmodels", "ts": "x"},
+        ],
+    )
+    record = merge_layers("statsmodels", transcript, events_path, stderr_log)
+    assert record.estimator_classes_instantiated == ("OLS", "WLS")
+
+
+def test_build_statsmodels_record_populates_diagnostic_methods_from_both_sources(tmp_path):
+    """``diagnostic_methods_invoked`` aggregates module-level
+    ``diagnostic_call`` events and post-fit ``estimator_diagnostic_method``
+    events; the latter are prefixed ``<ClassName>.<method>`` to disambiguate
+    them from module-level functions."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "diagnostic_call",
+                "name": "het_breuschpagan",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+            {
+                "event": "estimator_diagnostic_method",
+                "class": "OLSResults",
+                "method": "summary",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    record = merge_layers("statsmodels", transcript, events_path, stderr_log)
+    assert record.diagnostic_methods_invoked == ("OLSResults.summary", "het_breuschpagan")
+
+
+def test_build_statsmodels_record_populates_saw_fit_time_warning(tmp_path):
+    """warning_emitted/library=statsmodels flips saw_fit_time_warning True."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "warning_emitted",
+                "category": "UserWarning",
+                "filename": "/some/path/regression/linear_model.py",
+                "lineno": 1,
+                "library": "statsmodels",
+                "message": "convergence not achieved",
+                "ts": "x",
+            },
+        ],
+    )
+    record = merge_layers("statsmodels", transcript, events_path, stderr_log)
+    assert record.saw_fit_time_warning is True
+
+
+def test_build_statsmodels_record_ignores_diff_diff_events(tmp_path):
+    """A statsmodels-arm record built from a mixed log (e.g. a future test
+    fixture, or cross-arm bleed-through) must not count diff_diff events.
+    The library-attribution field on each event is the structural filter."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "estimator_init",
+                "class": "TwoWayFixedEffects",
+                "library": "diff_diff",
+                "ts": "x",
+            },
+            {"event": "estimator_init", "class": "OLS", "library": "statsmodels", "ts": "x"},
+            {
+                "event": "diagnostic_call",
+                "name": "bacon_decompose",
+                "library": "diff_diff",
+                "ts": "x",
+            },
+            {
+                "event": "diagnostic_call",
+                "name": "het_white",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    record = merge_layers("statsmodels", transcript, events_path, stderr_log)
+    # Only the statsmodels-attributed events show up.
+    assert record.estimator_classes_instantiated == ("OLS",)
+    assert record.diagnostic_methods_invoked == ("het_white",)
+
+
+def test_build_diff_diff_record_treats_library_missing_as_diff_diff(tmp_path):
+    """Backward compatibility: PR #5/#6 records on disk lack a ``library``
+    field on every event. The diff_diff record-builder treats such events
+    as diff_diff-attributed (``e.get("library", "diff_diff")``), so old
+    records remain parseable.
+    """
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            # NO `library` field — PR #5/#6 record shape
+            {"event": "estimator_init", "class": "TwoWayFixedEffects", "ts": "x"},
+            {"event": "estimator_fit", "class": "TwoWayFixedEffects", "ts": "x"},
+            {"event": "diagnostic_call", "name": "compute_pretrends_power", "ts": "x"},
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.estimator_classes_instantiated == ("TwoWayFixedEffects",)
+    assert record.diagnostic_methods_invoked == ("compute_pretrends_power",)
+
+
+def test_build_diff_diff_record_ignores_statsmodels_events(tmp_path):
+    """Mirror of the statsmodels-side filter: a diff_diff arm's record must
+    not count statsmodels-attributed events. Defends against test fixtures
+    or future cross-arm bleed-through."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {
+                "event": "estimator_init",
+                "class": "TwoWayFixedEffects",
+                "library": "diff_diff",
+                "ts": "x",
+            },
+            {"event": "estimator_init", "class": "OLS", "library": "statsmodels", "ts": "x"},
+        ],
+    )
+    record = merge_layers("diff_diff", transcript, events_path, stderr_log)
+    assert record.estimator_classes_instantiated == ("TwoWayFixedEffects",)
+
+
+def test_statsmodels_record_guide_fields_remain_none_with_rich_events(tmp_path):
+    """Sentinel invariant: even when a statsmodels arm's log has rich
+    estimator + diagnostic + warning events, the guide-discovery fields
+    stay ``None`` (statsmodels ships no LLM-targeted guides). The
+    ``TelemetryRecord(arm="statsmodels")`` ``__post_init__`` enforces
+    this; the builder must not put bools there."""
+    events_path, transcript, stderr_log = _make_paths(tmp_path)
+    _write_events_jsonl(
+        events_path,
+        [
+            _session_start_event(),
+            {"event": "estimator_init", "class": "OLS", "library": "statsmodels", "ts": "x"},
+            {"event": "estimator_fit", "class": "OLS", "library": "statsmodels", "ts": "x"},
+            {
+                "event": "estimator_diagnostic_method",
+                "class": "OLSResults",
+                "method": "summary",
+                "library": "statsmodels",
+                "ts": "x",
+            },
+        ],
+    )
+    record = merge_layers("statsmodels", transcript, events_path, stderr_log)
+    assert record.opened_llms_txt is None
+    assert record.opened_llms_practitioner is None
+    assert record.opened_llms_autonomous is None
+    assert record.opened_llms_full is None
+    assert record.called_get_llm_guide is None
+    assert record.get_llm_guide_variants == ()

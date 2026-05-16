@@ -1747,12 +1747,23 @@ def _build_diff_diff_record(
     Discoverability fields default to ``False`` (the diff-diff arm requires
     explicit bool encoding per `TelemetryRecord.__post_init__`). Any event
     flips its field to ``True``.
+
+    PR #7: every event is filtered by ``library == "diff_diff"`` (or missing,
+    for backward compatibility with PR #5/#6 records that pre-date the
+    ``library`` attribution field). A statsmodels-attributed event in a
+    diff_diff arm's log would otherwise inflate the diff_diff record's
+    counts — by construction the merger sees only one arm's events per run,
+    but the filter prevents future test fixtures or cross-arm bleed-through
+    from causing silent miscounts.
     """
-    guide_reads = [e for e in events if e.get("event") == "guide_file_read"]
-    warnings_emitted = [e for e in events if e.get("event") == "warning_emitted"]
-    estimator_inits = [e for e in events if e.get("event") == "estimator_init"]
-    estimator_fits = [e for e in events if e.get("event") == "estimator_fit"]
-    diagnostic_calls = [e for e in events if e.get("event") == "diagnostic_call"]
+    # Backward-compat: events lacking ``library`` are treated as diff_diff
+    # (matches PR #5/#6 records on disk that pre-date the field).
+    dd_events = [e for e in events if e.get("library", "diff_diff") == "diff_diff"]
+    guide_reads = [e for e in dd_events if e.get("event") == "guide_file_read"]
+    warnings_emitted = [e for e in dd_events if e.get("event") == "warning_emitted"]
+    estimator_inits = [e for e in dd_events if e.get("event") == "estimator_init"]
+    estimator_fits = [e for e in dd_events if e.get("event") == "estimator_fit"]
+    diagnostic_calls = [e for e in dd_events if e.get("event") == "diagnostic_call"]
 
     opened = {filename: False for filename in _VARIANT_TO_FILENAME.values()}
     variants_seen: set[str] = set()
@@ -1813,16 +1824,36 @@ def _build_statsmodels_record(
 ) -> TelemetryRecord:
     """Construct a TelemetryRecord for arm='statsmodels' from parsed events.
 
-    Guide-related fields are ``None`` (sentinel: not applicable). Bool/tuple
-    fields are populated from events targeting `statsmodels` — the shim
-    in PR #4 has no statsmodels-specific hooks, so these will be False/()
-    until the statsmodels arm instrumentation lands.
+    Guide-related fields are ``None`` (sentinel: not applicable; statsmodels
+    ships no LLM-targeted guides — collapsing "not applicable" into
+    True/False would bias the comparator-fairness analysis).
+
+    PR #7: bool/tuple fields are populated from statsmodels-attributed
+    events. Events are filtered structurally by ``library == "statsmodels"``
+    (the shim sets this at write time). The previous filename-substring
+    filter (``"statsmodels" in str(e.get("filename", ""))``) is removed —
+    it could false-match a user file named ``my_statsmodels_test.py``.
+
+    Diagnostic field ``diagnostic_methods_invoked`` aggregates BOTH
+    module-level ``diagnostic_call`` events (e.g. ``het_breuschpagan``) and
+    post-fit ``estimator_diagnostic_method`` events (e.g. ``OLSResults.summary``);
+    the latter are prefixed ``"<ClassName>.<method>"`` to disambiguate them
+    from module-level functions.
     """
-    statsmodels_warnings = [
-        e
-        for e in events
-        if e.get("event") == "warning_emitted" and "statsmodels" in str(e.get("filename", ""))
-    ]
+    sm_events = [e for e in events if e.get("library") == "statsmodels"]
+    sm_warnings = [e for e in sm_events if e.get("event") == "warning_emitted"]
+    sm_estimator_inits = [e for e in sm_events if e.get("event") == "estimator_init"]
+    sm_estimator_fits = [e for e in sm_events if e.get("event") == "estimator_fit"]
+    sm_diagnostic_calls = [e for e in sm_events if e.get("event") == "diagnostic_call"]
+    sm_method_calls = [e for e in sm_events if e.get("event") == "estimator_diagnostic_method"]
+
+    estimator_classes = sorted(
+        {e["class"] for e in (sm_estimator_inits + sm_estimator_fits) if "class" in e}
+    )
+    diagnostic_names = {e["name"] for e in sm_diagnostic_calls if "name" in e}
+    method_names = {
+        f"{e['class']}.{e['method']}" for e in sm_method_calls if "class" in e and "method" in e
+    }
     return TelemetryRecord(
         arm="statsmodels",
         stream_json_path=stream_json_path,
@@ -1834,9 +1865,9 @@ def _build_statsmodels_record(
         opened_llms_full=None,
         called_get_llm_guide=None,
         get_llm_guide_variants=(),
-        saw_fit_time_warning=bool(statsmodels_warnings),
-        diagnostic_methods_invoked=(),
-        estimator_classes_instantiated=(),
+        saw_fit_time_warning=bool(sm_warnings),
+        diagnostic_methods_invoked=tuple(sorted(diagnostic_names | method_names)),
+        estimator_classes_instantiated=tuple(estimator_classes),
     )
 
 

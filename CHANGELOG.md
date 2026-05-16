@@ -6,6 +6,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (PR #7)
+- Statsmodels arm instrumentation in `harness/sitecustomize_template.py`:
+  hooks for `OLS`, `WLS`, `GLS`, `GLSAR`, `RLM`, `GLM`, `MixedLM`, `Logit`,
+  `Probit` (estimator `__init__` + `fit`); statsmodels-relevant diagnostic
+  functions (`het_breuschpagan`, `het_white`, `linear_reset`,
+  `acorr_breusch_godfrey`, `acorr_ljungbox`, `durbin_watson`); and post-fit
+  results methods (`RegressionResults.summary`,
+  `RegressionResults.get_robustcov_results`). Result-method wrapper records
+  `type(self).__name__` at call time, so OLSResults / RLMResults /
+  MixedLMResults instances surface as the correct class without enumerating
+  every subclass. `_attach_statsmodels_hooks` walks each submodule and
+  patches the target attribute; `_StatsmodelsPostImportHook` (mirrored
+  architecture of `_DiffDiffPostImportHook`) triggers attachment when
+  `statsmodels` is imported.
+- `library: str` attribution field on every event the shim emits
+  (`"diff_diff"` or `"statsmodels"`). The merger's record-builders filter
+  events by `library` rather than by filename substring, eliminating
+  cross-arm bleed-through. Backward compatible: events lacking `library`
+  default to `"diff_diff"` so PR #5/#6 records on disk remain parseable.
+- New event type `estimator_diagnostic_method` (distinct from
+  `estimator_init` / `estimator_fit` / `diagnostic_call`) for post-fit
+  results-method calls.
+- `prompts/case_study/v2.txt`: Phase 1 case-study task prompt. Task-only
+  by design — names no library and no estimator-class so both arms see
+  identical text. Properties asserted by `tests/test_case_study_prompt.py`.
+- `prompts/case_study/README.md`: documents v1 reserved-stub state, v2
+  active prompt, and the new-version-on-edit policy.
+- `rubrics/case_study_v2.yaml`: Phase 1 grading rubric (6 pre-defined
+  criteria covering estimator classification, evidence, diagnostics,
+  reasoning quality, confidence intervals, and final ATT estimate). The
+  estimator-classification enum covers both arms in one rubric so a
+  TWFE choice resolves correctly regardless of arm.
+- `rubrics/README.md`: documents the v2 schema shape.
+- ~15 new tests in `tests/test_sitecustomize.py` covering statsmodels
+  hooks (OLS/OLSResults/het_breuschpagan), warning attribution via stack
+  walk for both libraries, library-field presence on diff_diff events,
+  result-method runtime-class recording, idempotency, and bidirectional
+  constants regression.
+- 7 new tests in `tests/test_telemetry_merger.py` covering
+  `_build_statsmodels_record` field population (estimator classes,
+  diagnostics from both event types, fit-time warnings), cross-arm
+  event filtering, backward compatibility (events without `library`),
+  and the sentinel-fields-stay-None invariant.
+- 3 new `@pytest.mark.slow` tests in `tests/test_venv_pool.py` covering
+  the statsmodels-arm template build end-to-end (correct library version
+  installed, `_pyruntime_shim.py` + `_pyruntime_shim.pth` present,
+  `module_import` event fires on `import statsmodels`).
+- New test files `tests/test_case_study_prompt.py` (5 tests) and
+  `tests/test_case_study_rubric.py` (8 tests).
+
+### Changed (PR #7)
+- `harness/venv_pool.py::_ARM_TO_PIP_PACKAGE` now includes
+  `"statsmodels": "statsmodels"`; `build_arm_template` no longer raises
+  `NotImplementedError` for `arm="statsmodels"`.
+- `harness/telemetry.py::_build_statsmodels_record` now populates
+  `estimator_classes_instantiated`, `diagnostic_methods_invoked`, and
+  `saw_fit_time_warning` from real statsmodels-attributed events (was:
+  hard-coded `False`/`()` since PR #4). `diagnostic_methods_invoked`
+  aggregates both module-level `diagnostic_call` events and post-fit
+  `estimator_diagnostic_method` events (the latter prefixed
+  `<ClassName>.<method>` to disambiguate them from module-level functions).
+  Filename-substring filter for warnings replaced by structural
+  `library == "statsmodels"` check.
+- `harness/telemetry.py::_build_diff_diff_record` now defensively filters
+  events by `library in ("diff_diff", missing)` so a cross-arm bleed-through
+  doesn't pollute the record. Backward-compat default preserves PR #5/#6
+  record readability.
+- `_caller_is_from_diff_diff` renamed and generalized to
+  `_caller_is_from_library(start_frame, prefixes)`; returns the matched
+  prefix so the warning hook can stamp the `library` field without a
+  second stack walk. Called for both diff_diff and statsmodels frames.
+- `_wrap_estimator_init` / `_wrap_estimator_fit` / `_wrap_diagnostic`
+  decorators now take a keyword-only `library: str = "diff_diff"` argument;
+  the diff_diff attach call sites pass it explicitly. The default
+  preserves backward compatibility with any external caller.
+
 ### Added (PR #6)
 - `harness/dgp.py`: synthetic data-generating process for the Phase 1
   case study. Wraps `diff_diff.generate_staggered_data` with locked

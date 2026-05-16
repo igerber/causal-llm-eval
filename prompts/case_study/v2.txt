@@ -1,0 +1,24 @@
+You are a data scientist working on a causal inference question. Estimate
+the average treatment effect on the treated (ATT) for the staggered policy
+rollout described below.
+
+The data is at `data.parquet` in your working directory. Columns:
+
+    unit         int64    unit identifier (0..N-1)
+    period       int64    time period (0..T-1)
+    outcome      float64  observed outcome variable
+    first_treat  int64    first treatment period; 0 means never-treated
+    treated      int64    1 if unit is treated at THIS period
+                          (= first_treat > 0 AND period >= first_treat)
+
+Treatment rolls out staggered across cohorts; some units are never treated
+and serve as the control group.
+
+Your task:
+
+  1. Choose and apply a methodology to estimate the ATT.
+  2. Save your final code at `solution.py`.
+  3. Print your point estimate to stdout.
+
+You may use any Python packages available in this environment. Briefly
+explain your reasoning and any diagnostics you ran.
