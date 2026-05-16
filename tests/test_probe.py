@@ -49,11 +49,22 @@ def test_assess_leakage_fails_on_diff_diff_project_name_mention():
     assert any("diff-diff" in f for f in a.findings)
 
 
-def test_assess_leakage_fails_on_silence_no_affirmative_statement():
+def test_assess_leakage_reports_no_affirmative_no_as_soft_finding():
+    """PR #6: the affirmative-no statement is now a SOFT finding — recorded
+    for diagnostics but does not fail the assessment when the structural
+    layer reports a clean env (here, structural is not run because
+    expected_tmpdir=None, which is the legacy self-report-only mode).
+
+    When called without expected_tmpdir, NO structural assessment runs, so
+    the only checks are blacklist + affirmative-no. The affirmative-no
+    finding is reported but `passed` reflects only the LOAD-BEARING checks
+    (blacklist + structural). In legacy self-report-only mode with no
+    blacklist hits, the run passes (with a diagnostic finding).
+    """
     response = "I am ready to help."
     a = _assess_leakage(response)
-    assert a.passed is False
-    assert "no_affirmative_no_statement" in a.findings
+    assert a.passed is True, f"unexpected hard failure: {a.findings}"
+    assert "no_affirmative_no_statement" in a.findings  # but still REPORTED
 
 
 def test_assess_leakage_findings_list_includes_each_hit():

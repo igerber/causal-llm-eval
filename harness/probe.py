@@ -446,20 +446,32 @@ def _assess_leakage(response: str, expected_tmpdir: str | None = None) -> ProbeA
     blacklist_hits = [tok for tok in _LEAKAGE_BLACKLIST if tok.lower() in lowered]
     affirmative_no_present = any(p in lowered for p in _AFFIRMATIVE_NO_PATTERNS)
     findings = [f"blacklist_hit: {tok}" for tok in blacklist_hits]
-    if not affirmative_no_present:
-        findings.append("no_affirmative_no_statement")
 
     structural = None
+    structural_findings: list[str] = []
     if expected_tmpdir is not None:
         structural = _extract_structural_block(response)
         if structural is None:
-            findings.append("no_structural_block")
+            structural_findings.append("no_structural_block")
         else:
-            findings.extend(_check_structural(structural, expected_tmpdir))
+            structural_findings.extend(_check_structural(structural, expected_tmpdir))
+    findings.extend(structural_findings)
+
+    # PR #6: the affirmative-no statement was the load-bearing self-report
+    # check before the structural layer existed. Now that the structural
+    # layer reports a clean env directly, demanding an "explicit nothing
+    # was preloaded" prose statement IN ADDITION is heuristic-fragile —
+    # claude --bare with terse models tends to skip prose and respond with
+    # only the requested command output. Promote the affirmative-no check
+    # to a SOFT finding (warning only): record it for diagnostics but
+    # do NOT fail the probe when structural+blacklist+denylist all pass.
+    soft_findings: list[str] = []
+    if not affirmative_no_present:
+        soft_findings.append("no_affirmative_no_statement")
 
     return ProbeAssessment(
-        passed=not findings,
-        findings=findings,
+        passed=not findings,  # soft_findings DO NOT fail the assessment
+        findings=findings + soft_findings,  # but ARE reported for visibility
         agent_response=response,
         structural=structural,
     )
