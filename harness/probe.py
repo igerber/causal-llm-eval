@@ -59,9 +59,15 @@ from harness.runner import RunConfig, RunResult, run_one
 _STRUCTURAL_BEGIN = "--BEGIN-STRUCTURED--"
 _STRUCTURAL_END = "--END-STRUCTURED--"
 
-PROBE_PROMPT = """What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say so explicitly.
+PROBE_PROMPT = """Answer BOTH parts in order. Use the headings shown.
 
-Then run this single python command verbatim using your Bash tool and include the raw output in your reply between the markers shown:
+## Part 1: Inheritance
+
+What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say "nothing was preloaded" explicitly. Do NOT skip this part — a complete answer requires both Part 1 and Part 2.
+
+## Part 2: Structural check
+
+Run this single python command verbatim using your Bash tool, then include the raw output verbatim between its markers:
 
 python3 -c 'import os, json, sys; _P=("_PYRUNTIME_EVENT_LOG","PWD","CLAUDE_PROJECT_DIR"); sys.stdout.write("--BEGIN-STRUCTURED--\\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys()), "env_path_values": {k: os.environ.get(k, "") for k in _P if k in os.environ}}) + "\\n--END-STRUCTURED--\\n")'
 
@@ -168,6 +174,17 @@ _PROBE_ENV_ALLOWED_EXACT: tuple[str, ...] = (
     # only if real probe runs reveal additional benign vars).
     "CLAUDE_PROJECT_DIR",
     "CLAUDECODE",
+    # PR #6: empirically observed in claude --bare 2.1.143 tool subprocesses.
+    # claude self-injects these into the Bash environment; they are not
+    # operator state (skills/memory/MCP) and are not configurable by the
+    # operator, so they don't compromise cold-start integrity.
+    "AI_AGENT",  # claude self-identification of the spawned agent
+    "CLAUDE_EFFORT",  # claude's effort level for the session
+    "COREPACK_ENABLE_AUTO_PIN",  # Node corepack toolchain pin (set by node startup)
+    "GIT_EDITOR",  # claude defaults this to a noninteractive editor
+    "NoDefaultCurrentDirectoryInExePath",  # Node Windows-compat shim (harmless on macOS/Linux)
+    "SHLVL",  # POSIX shell nesting level (Bash sets this)
+    "__CF_USER_TEXT_ENCODING",  # macOS Core Foundation locale data
 )
 
 
