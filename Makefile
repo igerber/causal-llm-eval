@@ -1,4 +1,4 @@
-.PHONY: help smoke test lint format type case-study-v1 calibration preflight clean
+.PHONY: help smoke test lint format type case-study-v1 calibration preflight dgp clean
 
 help:
 	@echo "Available targets:"
@@ -7,6 +7,7 @@ help:
 	@echo "  lint            - run ruff check"
 	@echo "  format          - run black + ruff format"
 	@echo "  type            - run mypy"
+	@echo "  dgp             - regenerate datasets/case_study_v1/ from harness/dgp.py (idempotent)"
 	@echo "  preflight       - run comparator-asymmetry pre-flight (3-5 sample agents per arm)"
 	@echo "  calibration     - run DGP calibration loop (statsmodels arm vs candidate DGP)"
 	@echo "  case-study-v1   - run the full Phase 1 case study (N=15 per arm = 30 runs)"
@@ -30,6 +31,9 @@ format:
 
 type:
 	mypy harness graders analysis
+
+dgp:
+	python -m harness.dgp datasets/case_study_v1 --seed 42
 
 preflight:
 	@echo "Comparator-asymmetry pre-flight not yet implemented (Phase 0 skeleton)."

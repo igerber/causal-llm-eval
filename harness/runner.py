@@ -3,7 +3,9 @@
 Spawns standalone `claude --bare` processes in isolated tmpdirs with a per-run
 venv carrying one library at a time (diff-diff XOR statsmodels for Phase 1).
 
-The locked invocation:
+The locked invocation (PR #6 added --verbose, --permission-mode
+bypassPermissions, --model, and the --add-dir-before---model ordering;
+see _build_command for per-flag rationale):
 
     claude --bare \\
            --setting-sources "" \\
@@ -11,7 +13,10 @@ The locked invocation:
            --disable-slash-commands \\
            --print \\
            --output-format stream-json \\
+           --verbose \\
+           --permission-mode bypassPermissions \\
            --add-dir <tmpdir> \\
+           --model <model> \\
            <prompt>
 
 The `--bare` flag is load-bearing: it suppresses CLAUDE.md auto-discovery,
@@ -30,10 +35,13 @@ per run) lands in PR #6+ when eval volume justifies the optimization.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -113,14 +121,16 @@ EXIT_CODE_DESCENDANTS_LIVE = -3
 class RunConfig:
     """Configuration for a single agent run.
 
-    **Note:** `dataset_path` is plumbed through for metadata tracking but the
-    runner does NOT yet copy the dataset into the per-run tmpdir. Dataset
-    copy + symlink guard + reject-non-file-paths logic land in PR #6+
-    alongside the synthetic DGP generator (`harness/dgp.py`). Until then,
-    probe/test runs pass `Path("/dev/null")` as a placeholder. Real eval
-    runs that reach `run_one()` before PR #6 lands would not exercise the
-    isolation guarantee documented in `COLD_START_VERIFICATION.md`; PR #3's
-    runner is intended for the probe + smoke tests only.
+    ``dataset_path`` MUST be a regular file (not a symlink, directory,
+    device, FIFO, or socket). The runner validates this strictly at the
+    top of :func:`run_one` and copies the file into ``tmpdir/data.parquet``
+    before spawning the agent. Symlinks are rejected via ``lstat()`` to
+    preserve the cold-start integrity claim (an operator-home symlink
+    would otherwise leak operator state into a "cold-start" agent).
+
+    ``rubric_version`` matches ``graders.ai_judge.JudgeResult.rubric_version``
+    semantically: both carry the registry id of the rubric the run is
+    graded against.
     """
 
     arm: str  # "diff_diff" or "statsmodels"
@@ -128,6 +138,7 @@ class RunConfig:
     dataset_path: Path
     prompt_path: Path
     prompt_version: str
+    rubric_version: str  # registry id (e.g. "case_study_v1"); see graders/ai_judge.py
     model: str = "claude-opus-4-7"
     timeout_seconds: int = 1800
     random_seed: int | None = None
@@ -154,40 +165,89 @@ class RunResult:
     exit_code: int
     venv_path: Path | None = None
     runner_pid: int | None = None
+    # PR #6: the dataset copied into the per-run tmpdir at start; populated
+    # by ``run_one`` from ``config.dataset_path``. Always Path for runs that
+    # go through ``run_one`` (which now requires a regular-file dataset).
+    dataset_in_tmpdir_path: Path | None = None
+    # PR #6: ``output_dir/metadata.json``. Populated only on CLEAN exit
+    # (exit_code == 0 AND not descendants_live AND no telemetry_missing
+    # sentinel). Absence is the signal: "this run did not complete cleanly
+    # enough to be a reproducibility-anchored record."
+    metadata_json_path: Path | None = None
 
 
 @dataclass
 class RunMetadata:
     """Reproducibility metadata pinned per run.
 
-    **Note:** PR #3 locks this schema but `run_one()` does NOT yet emit a
-    populated `RunMetadata` sidecar. Population + `metadata.json` emission
-    land in PR #6+ alongside the case-study runner, which knows the dataset
-    SHA, prompt registry id, rubric registry id, and other fields PR #3
-    cannot wire (no DGP, no prompt registry, no rubric registry yet).
-    The schema is locked HERE so subsequent PRs cannot quietly omit fields.
+    Serialized to ``output_dir/metadata.json`` by :func:`run_one` ONLY on
+    clean exit (``exit_code == 0`` AND no descendants_live AND no
+    telemetry_missing sentinel). Absence of ``metadata.json`` is itself
+    the signal that the run did not complete cleanly enough to be a
+    reproducibility-anchored record.
 
-    Every per-run record MUST carry these fields. Missing any one of them
-    invalidates the reproducibility schema check in `make case-study-v1`
-    (see plan section "Reproducibility schema"). Defining the contract here
-    in Phase 0 prevents subsequent PRs from satisfying the surface tests
-    while quietly omitting reproducibility metadata.
+    Every per-run record carries these fields; ``__post_init__`` enforces
+    format invariants (sha shapes, non-empty version strings, recognized
+    arm). The schema is checked in :mod:`tests.test_harness_smoke` so
+    additions or removals are caught at PR-time.
     """
 
     # Versioning: every layer that influences the per-run record's bytes
-    harness_version: str  # git SHA of causal-llm-eval at run time
+    harness_version: str  # git SHA of causal-llm-eval at run time, optionally suffixed "-dirty"
     library_version: str  # PyPI version (arm 1: diff-diff; arm 2: statsmodels)
     claude_code_version: str  # output of `claude --version`
     model_version: str  # the string passed to claude's --print (e.g. "claude-opus-4-7")
     # Inputs
-    dataset_sha: str  # sha256 of the dataset parquet
+    dataset_sha: str  # sha256 of the dataset parquet (64 hex chars)
     prompt_version: str  # registry id (e.g. "case_study/v1")
-    rubric_version: str  # registry id (e.g. "case_study_v1")
+    rubric_version: str  # registry id (e.g. "case_study_v1"); see graders/ai_judge.py::JudgeResult.rubric_version
     # Stochasticity
-    random_seed: int  # captured per cell for any harness-side randomness
+    random_seed: (
+        int | None
+    )  # None = no harness-side seed configured for this run; serialized as JSON null
     # Identity
     run_id: str  # ULID or equivalent unique id; primary key for the record
     arm: str  # "diff_diff" or "statsmodels"
+
+    def __post_init__(self) -> None:
+        """Format validation so a malformed record can't be silently constructed.
+
+        Every locked reproducibility field that PINS a run (versions, registry
+        ids, identity, seed) is checked. Empty/whitespace strings are rejected
+        because they would let a clean ``run_one()`` exit emit a metadata.json
+        that does not actually pin the run.
+        """
+        import re
+
+        if not re.fullmatch(r"[0-9a-f]{40}(-dirty)?", self.harness_version):
+            raise ValueError(
+                f"harness_version must be 40-hex SHA + optional -dirty: {self.harness_version!r}"
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_sha):
+            raise ValueError(f"dataset_sha must be 64-hex sha256: {self.dataset_sha!r}")
+        # Required-non-empty version/registry-id strings. Any of these being
+        # blank means the run isn't actually pinned to a reproducible source.
+        for field_name in (
+            "library_version",
+            "claude_code_version",
+            "model_version",
+            "prompt_version",
+            "rubric_version",
+            "run_id",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string (got {value!r})")
+        # random_seed is int | None. ``bool`` is an int subclass in Python; we
+        # explicitly reject it because a True/False seed almost certainly means
+        # a config bug (someone passed a flag where a seed was expected).
+        if self.random_seed is not None:
+            if isinstance(self.random_seed, bool) or not isinstance(self.random_seed, int):
+                raise ValueError(
+                    f"random_seed must be int or None (got {type(self.random_seed).__name__}: {self.random_seed!r})"
+                )
+        if self.arm not in ("diff_diff", "statsmodels"):
+            raise ValueError(f"arm must be 'diff_diff' or 'statsmodels': {self.arm!r}")
 
 
 def clean_env(
@@ -336,6 +396,122 @@ def _resolve_claude_invocation_prefix(claude_path: str) -> list[str]:
     return [interp_abs, *interp_args, claude_path]
 
 
+def _harness_version() -> str:
+    """Return the harness git SHA, plus '-dirty' suffix if working tree dirty.
+
+    Walks upward from this file looking for ``.git`` so editable installs
+    (where ``__file__`` may live in site-packages) still resolve correctly.
+    Untracked files COUNT as dirty: a stray ``harness/dgp.py.bak`` could
+    shadow imports and the ``-dirty`` flag is the operator's signal.
+    """
+    candidate = Path(__file__).resolve().parent
+    repo_root = None
+    for parent in (candidate, *candidate.parents):
+        if (parent / ".git").exists():
+            repo_root = parent
+            break
+    if repo_root is None:
+        raise RunValidityError(
+            f".git not found walking up from {Path(__file__).resolve()}; "
+            f"cannot pin harness_version (running from a tarball or "
+            f"non-git checkout?)"
+        )
+    sha_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if sha_result.returncode != 0:
+        raise RunValidityError(f"git rev-parse HEAD failed: {sha_result.stderr!r}")
+    # 30s timeout for ``git status``: on a repo with a large untracked tree
+    # (e.g. accumulated runs/ artifacts), porcelain status walks the working
+    # tree and can be slow on cold caches.
+    dirty_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if dirty_result.returncode != 0:
+        raise RunValidityError(f"git status --porcelain failed: {dirty_result.stderr!r}")
+    suffix = "-dirty" if dirty_result.stdout.strip() else ""
+    return sha_result.stdout.strip() + suffix
+
+
+def _claude_version() -> str:
+    """Return ``claude --version`` output, last non-empty line only.
+
+    Scrubbed env so the operator's ``_PYRUNTIME_EVENT_LOG`` cannot leak
+    into the claude CLI subprocess and write stray events to a stale path.
+    PATH is the only operator var passed (claude needs it to resolve node
+    in the npm-installed-script case). Resolution uses operator PATH (same
+    as :func:`_resolve_claude_executable`) since the agent's sanitized PATH
+    is irrelevant for harness-side metadata capture.
+
+    Returns the last non-empty line of stdout — strips deprecation banners
+    and node-engine warnings that may precede the version string in future
+    CLI releases.
+    """
+    result = subprocess.run(
+        [_resolve_claude_executable(), "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+    if result.returncode != 0:
+        raise RunValidityError(
+            f"`claude --version` exited {result.returncode}; stderr={result.stderr!r}"
+        )
+    output = result.stdout.strip()
+    if not output:
+        raise RunValidityError("`claude --version` produced empty stdout")
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    return lines[-1].strip()
+
+
+def _validate_dataset_path(src: Path) -> None:
+    """Strict-reject validation: regular file only.
+
+    Catches symlinks via ``lstat()`` (NOT ``stat()``, which follows
+    symlinks). Runs BEFORE any tmpdir is created so failure cleanup is
+    automatic.
+    """
+    if "\x00" in str(src):
+        raise RunValidityError(f"dataset_path contains NUL byte: {src!r}")
+    if not src.exists():
+        raise RunValidityError(f"dataset_path does not exist: {src!r}")
+    if src.is_symlink():
+        raise RunValidityError(f"dataset_path is a symlink (regular file required): {src!r}")
+    mode = src.lstat().st_mode
+    if not stat.S_ISREG(mode):
+        raise RunValidityError(
+            f"dataset_path is not a regular file (got mode={stat.filemode(mode)}): {src!r}"
+        )
+
+
+def _copy_dataset_into_tmpdir(src: Path, tmpdir: Path) -> tuple[Path, str]:
+    """Copy dataset into ``tmpdir/data.parquet``; return (dst_path, sha256_hex).
+
+    ``sha256`` is computed from the COPIED bytes (the artifact-of-record).
+    If a kernel bug ever corrupts bytes during copy, the in-tmpdir file is
+    what the agent saw; that's what we record.
+    """
+    dst = tmpdir / "data.parquet"
+    try:
+        shutil.copy2(src, dst)
+    except OSError as e:
+        raise RunValidityError(f"failed to copy dataset_path into tmpdir: {e}") from e
+    sha = hashlib.sha256(dst.read_bytes()).hexdigest()
+    return dst, sha
+
+
 def _build_command(
     claude_invocation: list[str], prompt: str, tmpdir: Path, model: str
 ) -> list[str]:
@@ -345,6 +521,9 @@ def _build_command(
     --strict-mcp-config, --disable-slash-commands, --print, --output-format
     stream-json, --add-dir <tmpdir>. COLD_START_VERIFICATION.md specifies
     the contract; the pre-merge-check skill verifies it via AST scan.
+
+    Plus ``--verbose`` (CLI 2.1.143+ requirement when --print is combined
+    with --output-format=stream-json; without it the CLI produces no output).
 
     `--model <id>` is additional: it pins the model so CLI defaults can't
     drift across runs. The value is `RunConfig.model`.
@@ -358,6 +537,15 @@ def _build_command(
     and may not include the interpreter's or claude's directory, so
     both are absolute by construction.
     """
+    # CRITICAL argv ordering: ``--add-dir <dirs...>`` is variadic
+    # (claude CLI 2.1.143+; possibly earlier). If the prompt immediately
+    # follows ``--add-dir <tmpdir>``, claude consumes the prompt as a
+    # second directory, leaving --print with no prompt and silently
+    # blocking on stdin for ~30s before exiting 0 with a 0-byte
+    # transcript. Placing --add-dir BEFORE a non-positional flag
+    # (here: --model) terminates the variadic consumption at the next
+    # flag, so the prompt at the end of argv is the unambiguous
+    # positional prompt argument.
     return [
         *claude_invocation,
         "--bare",
@@ -368,10 +556,26 @@ def _build_command(
         "--print",
         "--output-format",
         "stream-json",
-        "--model",
-        model,
+        # Claude CLI 2.1.143+ requires --verbose when --print is combined
+        # with --output-format=stream-json; without it, the CLI emits no
+        # transcript output (silent on --bare; "Error: ... requires
+        # --verbose" on the non-bare path). Without this flag the runner
+        # would still exit 0 but produce a 0-byte transcript, which the
+        # merger has no way to distinguish from "agent emitted nothing".
+        "--verbose",
+        # Bypass interactive permission prompts. In --print mode there is
+        # no TTY for the operator to approve Bash invocations, so any
+        # tool requiring approval blocks at "This command requires
+        # approval" and the agent reports the call was not executed.
+        # The agent runs in a sandboxed tmpdir with HOME=tmpdir and
+        # clean_env, so bypassing permissions does not leak operator
+        # state — it just lets the agent actually USE its tools.
+        "--permission-mode",
+        "bypassPermissions",
         "--add-dir",
         str(tmpdir),
+        "--model",
+        model,
         prompt,
     ]
 
@@ -400,6 +604,16 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     See harness/COLD_START_VERIFICATION.md for the cold-start invocation
     contract.
     """
+    # PR #6: pre-tmpdir validation — fail fast before any compute is spent.
+    # ``_harness_version`` and ``_claude_version`` are captured here (not
+    # later) so a transient git/claude failure cannot invalidate an
+    # otherwise-clean agent run that's already produced telemetry.
+    # ``_validate_dataset_path`` runs before ``tempfile.mkdtemp`` so a
+    # dataset failure does NOT leak a tmpdir.
+    harness_version = _harness_version()
+    claude_code_version = _claude_version()
+    _validate_dataset_path(config.dataset_path)
+
     run_id = uuid.uuid4().hex[:16]
     # Resolve to an absolute path so the subprocess (running with cwd=tmpdir)
     # cannot misinterpret a relative `output_dir` against its own cwd. Without
@@ -411,8 +625,14 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     transcript_jsonl_path = output_dir / "transcript.jsonl"
     final_event_log_path = output_dir / "in_process_events.jsonl"
     cli_stderr_log_path = output_dir / "cli_stderr.log"
+    metadata_json_path = output_dir / "metadata.json"
 
-    for preexisting in (transcript_jsonl_path, final_event_log_path, cli_stderr_log_path):
+    for preexisting in (
+        transcript_jsonl_path,
+        final_event_log_path,
+        cli_stderr_log_path,
+        metadata_json_path,
+    ):
         if preexisting.exists():
             raise FileExistsError(
                 f"{preexisting} already exists. The runner refuses to overwrite "
@@ -421,6 +641,13 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             )
 
     tmpdir = Path(tempfile.mkdtemp(prefix="causal_run_"))
+
+    # PR #6: copy the dataset into the per-run tmpdir at top-level
+    # ``data.parquet``. Symlink guard + regular-file check already passed
+    # via ``_validate_dataset_path`` above. ``dataset_sha`` is captured
+    # from the COPIED bytes (the artifact-of-record) and recorded in
+    # metadata.json on clean exit (PR #6 step 6).
+    dataset_in_tmpdir_path, dataset_sha = _copy_dataset_into_tmpdir(config.dataset_path, tmpdir)
 
     # R4 P1 fix: the in-process shim writes to a path INSIDE the agent tmpdir
     # during execution. After the subprocess exits we move the file to
@@ -432,7 +659,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
 
     # PR #5: build a per-arm venv with the layer-1.5 wrapper + sitecustomize
     # shim installed. This is the per-run cost of Phase 1 (~10-30s); Phase 2
-    # (PR #6+) replaces this with a clone-from-template.
+    # replaces this with a clone-from-template (deferred; ROADMAP).
     venv_dir = tmpdir / "venv"
     build_arm_template(config.arm, config.library_version, venv_dir)
 
@@ -544,6 +771,7 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
             cmd,
             cwd=str(tmpdir),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
             text=True,
@@ -649,6 +877,75 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         if exit_code == 0:
             exit_code = EXIT_CODE_TELEMETRY_MISSING
 
+    # PR #6: emit metadata.json ONLY on clean exit. Absence is the signal
+    # that the run did not complete cleanly enough to be a
+    # reproducibility-anchored record. The three failure-path sentinels
+    # (timeout / descendants_live / telemetry_missing) all suppress the
+    # metadata write; downstream extractors branch on file presence.
+    #
+    # PR #6 R5 EV-1: ALSO suppress metadata.json when the layer-1 stream-JSON
+    # transcript is empty / malformed / truncated. Without this check, an
+    # exit_code-0 + no-descendants + telemetry-not-missing run with an
+    # unmergeable transcript would emit metadata.json — and downstream
+    # consumers branching on metadata.json presence would treat the
+    # unmergeable run as clean. Reuses the merger's preflight check so the
+    # absence-is-signal contract holds end-to-end.
+    metadata_emitted_path: Path | None = None
+    clean_exit = (
+        exit_code == 0 and not descendants_live and exit_code != EXIT_CODE_TELEMETRY_MISSING
+    )
+    if clean_exit:
+        # Lazy import: keeps top-level runner.py import free of telemetry
+        # parsing surface, and the merger preflight is only needed on the
+        # clean-exit branch.
+        from harness.telemetry import TelemetryMergeError, _validate_layer_artifacts
+
+        try:
+            _validate_layer_artifacts(transcript_jsonl_path, cli_stderr_log_path)
+        except TelemetryMergeError:
+            # Transcript empty/malformed/truncated. Suppress metadata.json
+            # so consumers branching on its presence treat this run as
+            # incomplete. Matches the descendants_live / telemetry_missing
+            # absence-is-signal convention.
+            return RunResult(
+                run_id=run_id,
+                arm=config.arm,
+                tmpdir=tmpdir,
+                transcript_jsonl_path=transcript_jsonl_path,
+                in_process_events_path=final_event_log_path,
+                cli_stderr_log_path=cli_stderr_log_path,
+                record_parquet_path=None,
+                final_code_path=None,
+                wall_clock_seconds=wall_clock_seconds,
+                exit_code=exit_code,
+                venv_path=venv_dir,
+                runner_pid=os.getpid(),
+                dataset_in_tmpdir_path=dataset_in_tmpdir_path,
+                metadata_json_path=None,
+            )
+        metadata = RunMetadata(
+            harness_version=harness_version,
+            library_version=config.library_version,
+            claude_code_version=claude_code_version,
+            model_version=config.model,
+            dataset_sha=dataset_sha,
+            prompt_version=config.prompt_version,
+            rubric_version=config.rubric_version,
+            random_seed=config.random_seed,
+            run_id=run_id,
+            arm=config.arm,
+        )
+        with open(metadata_json_path, "w") as f:
+            json.dump(
+                dataclasses.asdict(metadata),
+                f,
+                sort_keys=True,
+                indent=2,
+                ensure_ascii=True,
+            )
+            f.write("\n")
+        metadata_emitted_path = metadata_json_path
+
     return RunResult(
         run_id=run_id,
         arm=config.arm,
@@ -662,4 +959,6 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
         exit_code=exit_code,
         venv_path=venv_dir,
         runner_pid=os.getpid(),
+        dataset_in_tmpdir_path=dataset_in_tmpdir_path,
+        metadata_json_path=metadata_emitted_path,
     )

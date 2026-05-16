@@ -1,0 +1,284 @@
+"""Tests for harness.dgp.
+
+Headline contract: ``generate_case_study_v1`` produces bit-identical
+``data.parquet`` bytes given the same seed + same harness commit + same
+pyarrow version. The committed-vs-regenerated test guards against silent
+parameter drift.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import pytest
+
+from harness.dgp import (
+    _DGP_CALL_KWARGS,
+    _PERSISTED_COLUMNS,
+    _PERSISTED_DTYPES,
+    CASE_STUDY_V1_DGP_VERSION,
+    generate_case_study_v1,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_COMMITTED_DATASET = _REPO_ROOT / "datasets" / "case_study_v1" / "data.parquet"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_generate_case_study_v1_deterministic(tmp_path: Path) -> None:
+    """Two invocations with the same seed produce bit-identical bytes.
+
+    This is the headline determinism contract. Justifies emitting a stable
+    dataset_sha into per-run RunMetadata.
+    """
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    parquet_a = generate_case_study_v1(out_a, seed=42)
+    parquet_b = generate_case_study_v1(out_b, seed=42)
+    assert _sha256(parquet_a) == _sha256(parquet_b)
+
+
+def test_seed_changes_bytes(tmp_path: Path) -> None:
+    """Different seed produces different bytes — verifies seed is wired."""
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    parquet_a = generate_case_study_v1(out_a, seed=42)
+    parquet_b = generate_case_study_v1(out_b, seed=43)
+    assert _sha256(parquet_a) != _sha256(parquet_b)
+
+
+def test_dgp_truth_json_schema(tmp_path: Path) -> None:
+    """Sidecar has the locked schema and the 2-level effects shape."""
+    out_dir = tmp_path / "out"
+    generate_case_study_v1(out_dir, seed=42)
+    payload = json.loads((out_dir / "dgp_truth.json").read_text())
+
+    required_top_level = {
+        "dgp_version",
+        "generator_function",
+        "diff_diff_version",
+        "seed",
+        "parameters",
+        "ground_truth",
+        "schema",
+        "writer_versions",  # PR #6 R3 DT-1: pandas/pyarrow versions for byte-identity
+        "data_sha256",  # PR #6 R5 DT-1: unconditional sidecar-to-bytes binding
+        "uncalibrated",
+        "notes",
+    }
+    assert required_top_level.issubset(payload.keys())
+
+    # data_sha256 binds the sidecar to the parquet bytes. Length 64 hex,
+    # case-insensitive (writer always emits lowercase but we accept both).
+    assert isinstance(payload["data_sha256"], str)
+    assert len(payload["data_sha256"]) == 64
+    assert all(c in "0123456789abcdefABCDEF" for c in payload["data_sha256"])
+
+    # writer_versions records the exact pandas/pyarrow versions used to
+    # write the parquet, so the regeneration test can detect when
+    # byte-identity will not hold under newer writer versions.
+    wv = payload["writer_versions"]
+    assert set(wv.keys()) == {"pandas", "pyarrow"}
+    assert all(isinstance(v, str) and v.strip() for v in wv.values())
+
+    assert payload["dgp_version"] == CASE_STUDY_V1_DGP_VERSION
+    assert payload["seed"] == 42
+    assert payload["uncalibrated"] is True
+    assert payload["parameters"] == _DGP_CALL_KWARGS
+
+    gt = payload["ground_truth"]
+    assert set(gt.keys()) == {
+        "n_units_per_cohort",
+        "true_effects_per_event_time_per_cohort",
+        "overall_att_unweighted",
+    }
+    # 2-level dict shape per plan §1
+    effects = gt["true_effects_per_event_time_per_cohort"]
+    assert isinstance(effects, dict)
+    for cohort_key, inner in effects.items():
+        assert isinstance(cohort_key, str)
+        assert isinstance(inner, dict)
+        for et_key, tau in inner.items():
+            assert isinstance(et_key, str)
+            assert isinstance(tau, (int, float))
+    # never_treated key is reserved for the always-untreated cohort
+    assert "never_treated" in gt["n_units_per_cohort"]
+
+    schema = payload["schema"]
+    assert schema["columns"] == list(_PERSISTED_COLUMNS)
+    assert schema["dtypes"] == dict(_PERSISTED_DTYPES)
+    assert isinstance(schema["n_rows"], int)
+
+
+def test_committed_dataset_matches_regeneration(tmp_path: Path) -> None:
+    """Regenerating with seed=42 reproduces the committed bytes.
+
+    Catches silent parameter drift: if someone edits _DGP_CALL_KWARGS
+    without bumping CASE_STUDY_V1_DGP_VERSION and regenerating the
+    committed artifact, this test fails loudly.
+
+    PR #6 R3 DT-1: parquet bit-identity depends on the exact pandas +
+    pyarrow versions used to write the committed bytes. The committed
+    ``dgp_truth.json::writer_versions`` records those versions; this
+    test SKIPS when the local installed versions differ, with a clear
+    actionable message. Operators on matching versions get the strict
+    byte-identity guarantee; operators on drifted versions see a skip
+    rather than a confusing failure (the per-run ``dataset_sha`` in
+    ``RunMetadata`` remains the load-bearing reproducibility anchor).
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    if not _COMMITTED_DATASET.exists():
+        pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed_truth = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+    committed_writer = committed_truth.get("writer_versions", {})
+    local_writer = {"pandas": pd.__version__, "pyarrow": pa.__version__}
+    if committed_writer != local_writer:
+        pytest.skip(
+            "Local pandas/pyarrow versions differ from committed "
+            f"writer_versions ({local_writer} vs {committed_writer}); "
+            "byte-identity is not expected. Re-pin or regenerate "
+            "datasets/case_study_v1/ on a matching environment."
+        )
+    parquet = generate_case_study_v1(tmp_path, seed=42)
+    assert _sha256(parquet) == _sha256(_COMMITTED_DATASET), (
+        "Regenerated parquet does not match committed bytes despite "
+        "matching writer_versions. If parameter drift: bump "
+        "CASE_STUDY_V1_DGP_VERSION + regenerate. If unexpected: "
+        "regenerate + recommit + note in CHANGELOG."
+    )
+
+
+def test_committed_dgp_truth_matches_current_constants() -> None:
+    """Always-on parameter-drift guard: committed dgp_truth.json fields match
+    the current constants in harness.dgp.
+
+    Complements ``test_committed_dataset_matches_regeneration`` (which skips
+    when pandas/pyarrow versions drift). This test fires UNCONDITIONALLY
+    and catches the case where someone edits ``_DGP_CALL_KWARGS`` /
+    ``CASE_STUDY_V1_DGP_VERSION`` / ``_PERSISTED_COLUMNS`` /
+    ``_PERSISTED_DTYPES`` without regenerating the committed
+    ``dgp_truth.json``. Without this guard, a writer-version drift could
+    skip the byte-identity test AND the parameter-drift detection at the
+    same time.
+    """
+    if not _COMMITTED_DATASET.exists():
+        pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+
+    assert committed["dgp_version"] == CASE_STUDY_V1_DGP_VERSION, (
+        f"committed dgp_version {committed['dgp_version']!r} != current "
+        f"CASE_STUDY_V1_DGP_VERSION {CASE_STUDY_V1_DGP_VERSION!r}; "
+        "regenerate datasets/case_study_v1/ via `make dgp`."
+    )
+    assert committed["seed"] == 42, (
+        f"committed seed {committed['seed']!r} != locked default 42; " "regenerate via `make dgp`."
+    )
+    assert committed["parameters"] == _DGP_CALL_KWARGS, (
+        "committed _DGP_CALL_KWARGS drifted from current; bump "
+        "CASE_STUDY_V1_DGP_VERSION and regenerate via `make dgp`."
+    )
+    assert committed["schema"]["columns"] == list(_PERSISTED_COLUMNS), (
+        "committed schema.columns drifted from current _PERSISTED_COLUMNS; "
+        "regenerate via `make dgp`."
+    )
+    assert committed["schema"]["dtypes"] == dict(_PERSISTED_DTYPES), (
+        "committed schema.dtypes drifted from current _PERSISTED_DTYPES; "
+        "regenerate via `make dgp`."
+    )
+
+
+def test_committed_dgp_truth_data_sha() -> None:
+    """Always-on artifact-binding guard: committed dgp_truth.json::data_sha256
+    matches the actual sha256 of the committed data.parquet bytes.
+
+    Complements:
+      - test_committed_dataset_matches_regeneration (skips on writer drift)
+      - test_committed_dgp_truth_matches_current_constants (parameters only)
+
+    This test fires UNCONDITIONALLY on the COMMITTED bytes themselves,
+    so a data-only artifact swap (someone replaces data.parquet without
+    updating dgp_truth.json) is caught even when writer-version drift
+    skips the byte-regen test. Without this guard, downstream graders
+    consuming dgp_truth.json's ground_truth could attribute it to the
+    wrong parquet bytes.
+    """
+    if not _COMMITTED_DATASET.exists():
+        pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+    expected_sha = committed.get("data_sha256")
+    assert expected_sha, "dgp_truth.json missing data_sha256 field"
+    actual_sha = _sha256(_COMMITTED_DATASET)
+    assert actual_sha == expected_sha, (
+        f"committed data.parquet sha256 {actual_sha!r} does not match "
+        f"committed dgp_truth.json::data_sha256 {expected_sha!r}. "
+        "Either the parquet was edited without regenerating the sidecar "
+        "(suspicious) or the sidecar was edited without regenerating the "
+        "parquet. Recovery: re-run `make dgp`."
+    )
+
+
+def test_round_trip_dataframe_equals(tmp_path: Path) -> None:
+    """Reading the parquet back yields the same DataFrame we wrote."""
+    parquet = generate_case_study_v1(tmp_path, seed=42)
+    df_read = pd.read_parquet(parquet)
+    assert list(df_read.columns) == list(_PERSISTED_COLUMNS)
+    # Re-generate the in-memory equivalent and compare column-by-column.
+    import diff_diff
+
+    df_full = diff_diff.generate_staggered_data(seed=42, **_DGP_CALL_KWARGS)
+    df_expected = df_full[list(_PERSISTED_COLUMNS)].copy()
+    for col, dtype in _PERSISTED_DTYPES.items():
+        df_expected[col] = df_expected[col].astype(dtype)
+    pd.testing.assert_frame_equal(
+        df_read.reset_index(drop=True), df_expected.reset_index(drop=True)
+    )
+
+
+def test_dgp_dtypes_pinned(tmp_path: Path) -> None:
+    """Parquet columns have the exact pinned dtypes (cross-platform stability).
+
+    Without explicit casts, pandas defaults can vary (e.g., Windows int32
+    vs linux/macOS int64), breaking the byte-identity contract. This test
+    encodes the contract that ``_coerce_dgp_dtypes`` enforces.
+    """
+    parquet = generate_case_study_v1(tmp_path, seed=42)
+    table = pq.read_table(parquet)
+    actual_arrow_dtypes = {field.name: str(field.type) for field in table.schema}
+    expected_arrow_dtypes = {
+        "unit": "int64",
+        "period": "int64",
+        "outcome": "double",  # pyarrow renders float64 as 'double'
+        "first_treat": "int64",
+        "treated": "int64",
+    }
+    assert actual_arrow_dtypes == expected_arrow_dtypes
+
+    # Also confirm via pandas that the dtypes survive the round-trip.
+    df = pd.read_parquet(parquet)
+    assert df["unit"].dtype == np.int64
+    assert df["period"].dtype == np.int64
+    assert df["outcome"].dtype == np.float64
+    assert df["first_treat"].dtype == np.int64
+    assert df["treated"].dtype == np.int64
+
+
+def test_persisted_parquet_excludes_true_effect(tmp_path: Path) -> None:
+    """The DGP's ground-truth `true_effect` column MUST NOT leak to the agent.
+
+    Eval validity: the agent's task is to ESTIMATE the effect; if true_effect
+    is in the parquet, the agent can read the answer (df["true_effect"].mean()).
+    """
+    parquet = generate_case_study_v1(tmp_path, seed=42)
+    df = pd.read_parquet(parquet)
+    assert "true_effect" not in df.columns
+    assert "treat" not in df.columns  # also dropped (derivable from first_treat)

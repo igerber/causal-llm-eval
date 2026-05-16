@@ -561,9 +561,12 @@ def _install_production_state() -> None:
     """Production initialization: env-var check, fd open, session_start
     emit, atexit register, hook install.
 
-    Called exactly once when Python's site machinery loads the file as
-    ``sitecustomize`` from the per-arm venv's site-packages (via the
-    ``__name__ == "sitecustomize"`` gate below). Also called by test
+    Called exactly once when Python's site machinery processes the
+    ``_pyruntime_shim.pth`` file in the per-arm venv's site-packages,
+    which executes ``import _pyruntime_shim`` and triggers the
+    ``__name__ == "_pyruntime_shim"`` gate below. (PR #6 changed the
+    load mechanism from a stdlib-shadow-vulnerable ``sitecustomize.py``
+    install to a robust ``.pth``-based load.) Also called by test
     fixtures via ``_import_shim_fresh()`` to fire the side effects on the
     importlib-imported module's namespace (so classes defined here and
     instances inserted into ``sys.meta_path`` are the same identity the
@@ -690,11 +693,21 @@ def _install_production_state() -> None:
                 sys._base_executable = _wrapper_path
 
 
-if __name__ == "sitecustomize":
-    # Production path: Python's site machinery loads this file as
-    # ``sitecustomize`` from the per-arm venv's site-packages. Fire the
-    # production state install exactly once. Tests / docs tooling that
-    # import the module as ``harness.sitecustomize_template`` skip this
-    # block and call ``_install_production_state()`` explicitly via
-    # ``_import_shim_fresh()``.
+if __name__ == "_pyruntime_shim":
+    # Production path: Python's site machinery processes ``_pyruntime_shim.pth``
+    # in the per-arm venv's site-packages, which executes ``import _pyruntime_shim``,
+    # which loads this file (installed by ``_install_shim_into_venv`` as
+    # ``_pyruntime_shim.py``).
+    #
+    # The .pth-based load supersedes the previous ``sitecustomize.py``-based
+    # load: a Homebrew-installed ``sitecustomize.py`` in the system stdlib
+    # (introduced in homebrew python@3.13 around Feb 2026) shadows any
+    # ``sitecustomize.py`` we install in venv site-packages because stdlib
+    # comes before site-packages in sys.path. .pth files are processed
+    # during site-init regardless of stdlib's sitecustomize, so this load
+    # path is robust to operator system-Python configuration.
+    #
+    # Tests / docs tooling that import the module as
+    # ``harness.sitecustomize_template`` skip this block and call
+    # ``_install_production_state()`` explicitly via ``_import_shim_fresh()``.
     _install_production_state()

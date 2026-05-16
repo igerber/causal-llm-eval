@@ -13,9 +13,19 @@ claude --bare \
        --disable-slash-commands \
        --print \
        --output-format stream-json \
+       --verbose \
+       --permission-mode bypassPermissions \
        --add-dir <tmpdir> \
+       --model <model> \
        <prompt>
 ```
+
+**Note:** PR #6 added `--verbose`, `--permission-mode bypassPermissions`, and `--model <model>` to the previously-locked argv. Plus an ordering constraint: `--add-dir <tmpdir>` MUST be followed by another flag (here: `--model`), NOT by the prompt. Each addition has a CLI-compat or eval-validity rationale:
+
+- `--verbose` is required by claude CLI 2.1.143+ when `--print` is combined with `--output-format=stream-json`. Without it the CLI produces no transcript output (silent on `--bare`; explicit "Error: ... requires --verbose" on the non-bare path). Does not affect cold-start isolation.
+- `--permission-mode bypassPermissions` is required because `--print` mode has no TTY for the operator to approve Bash invocations; without bypass the agent's tool calls return "This command requires approval" and the run is useless. The agent runs in a sandboxed tmpdir with `HOME=tmpdir` + `clean_env`, so bypass does not leak operator state — it just lets the agent actually use its tools.
+- `--model <model>` pins the model so CLI defaults can't drift across runs (`RunConfig.model`).
+- The `--add-dir` ordering constraint: `--add-dir <dirs...>` is variadic in claude CLI 2.1.143+. With `[--add-dir, <tmpdir>, <prompt>]` at the end of argv, claude consumes the prompt as a second directory and `--print` blocks on stdin. The runner places `--add-dir <tmpdir>` BEFORE `--model <model>` (a flag) so the variadic terminates cleanly. Defense-in-depth: `subprocess.Popen(stdin=subprocess.DEVNULL)` so any future variadic regression bails immediately.
 
 `--bare` is load-bearing - it suppresses CLAUDE.md auto-discovery, auto-memory, plugin sync, attribution, and keychain reads. The other flags strip the remaining surfaces.
 
@@ -39,6 +49,18 @@ CLI flags are necessary but not sufficient. The runner also pins:
 
 - **No symlink tricks**: the per-run tmpdir is a real directory containing the dataset, the prompt, and a hidden runner-owned `.pyruntime/` subdirectory holding the in-process telemetry event log (`.pyruntime/events.jsonl`, kept inside tmpdir so its path does not leak the harness repo location via `_PYRUNTIME_EVENT_LOG`). No symlinks back into the operator's homedir.
 
+## Dataset copy + strict regular-file validation (PR #6)
+
+`run_one()` validates `RunConfig.dataset_path` STRICTLY before spawning the agent: regular files only, rejecting symlinks, directories, devices, FIFOs, sockets, and paths containing NUL bytes. Validation runs at the TOP of `run_one()`, BEFORE `tempfile.mkdtemp()`, so a failed validation does NOT leak a tmpdir. The symlink rejection (via `lstat()` rather than `stat()`, which would follow symlinks) is the load-bearing piece of cold-start hygiene here: an operator-home symlink in `dataset_path` would otherwise leak the operator's filesystem into a "cold-start" agent's view.
+
+After validation, `run_one()` copies the dataset into `tmpdir/data.parquet` (top-level for relative-path simplicity from the agent's perspective) via `shutil.copy2`, and computes the sha256 of the COPIED bytes for `metadata.json::dataset_sha`. The agent reads from the in-tmpdir copy, NOT the operator's source path; the source path's filesystem location never appears in the agent's view.
+
+## Per-run reproducibility metadata (PR #6)
+
+After clean exit (`exit_code == 0` AND no `descendants_live` AND no `telemetry_missing` sentinel), `run_one()` writes `output_dir/metadata.json` with the locked reproducibility schema (`harness_version`, `library_version`, `claude_code_version`, `model_version`, `dataset_sha`, `prompt_version`, `rubric_version`, `random_seed`, `run_id`, `arm`). Bytes are deterministic (`json.dump(..., sort_keys=True, indent=2, ensure_ascii=True)`).
+
+Failure paths SUPPRESS the metadata write — absence of `metadata.json` is itself the signal that a run did not complete cleanly enough to be a reproducibility-anchored record. Downstream extractors and the `analysis/reproducibility_check.py` (PR #8+) branch on file presence rather than parsing partial blobs.
+
 ## Inheritance probe
 
 The smoke test runs the agent with a two-layer probe prompt (defined in `harness/probe.py::PROBE_PROMPT`):
@@ -49,10 +71,12 @@ The smoke test runs the agent with a two-layer probe prompt (defined in `harness
 >
 > `python3 -c 'import os, json, sys; _P=("_PYRUNTIME_EVENT_LOG","PWD","CLAUDE_PROJECT_DIR"); sys.stdout.write("--BEGIN-STRUCTURED--\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys()), "env_path_values": {k: os.environ.get(k, "") for k in _P if k in os.environ}}) + "\n--END-STRUCTURED--\n")'`
 
-The probe assessment has two layers (both must pass):
+The probe assessment has two layers:
 
-1. **Self-report**: parses the prose for operator-state tokens (specific skill names, auto-memory file conventions, the operator's primary project name) and requires an explicit "nothing was preloaded"-style statement. Substring blacklist + affirmative-no requirement.
-2. **Structural**: parses the JSON block between the markers and verifies cwd points at the per-run tmpdir, HOME equals cwd, and runs a fail-closed env-key check:
+**Note:** PR #6 demoted the self-report's `no_affirmative_no_statement` finding to a SOFT finding (recorded for diagnostics, does NOT fail the probe). The structural layer is now the load-bearing integrity check. Rationale: claude --bare with terse Opus 4.7 tends to respond with only the requested command output and skip prose, even when the prompt explicitly asks for both parts. Demanding the prose phrasing in addition to a clean structural report is heuristic-fragile. Substring blacklist hits and structural-layer findings remain HARD failures.
+
+1. **Self-report** (soft): parses the prose for operator-state tokens (specific skill names, auto-memory file conventions, the operator's primary project name) via substring blacklist (HARD failure on hit). Records but does not fail on missing "nothing was preloaded"-style affirmative-no statement (SOFT finding only).
+2. **Structural** (hard): parses the JSON block between the markers and verifies cwd points at the per-run tmpdir, HOME equals cwd, and runs a fail-closed env-key check:
    - **Schema**: `env_keys` must be a non-empty list of strings. Missing, empty, malformed → finding.
    - **Required keys**: `PATH`, `HOME`, and `_PYRUNTIME_EVENT_LOG` must be present (proves `clean_env()` applied at spawn).
    - **Explicit denylist**: `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`, `AWS_*`, `OPENAI_API_KEY`, `CODEX_HOME`, `ANTHROPIC_PROJECT_*`, `ANTHROPIC_AUTH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONUSERBASE`. Any of these → unambiguous operator-state leak (Python interpreter vars are denylisted because they alter import resolution or run operator-controlled startup code).
@@ -68,11 +92,11 @@ The probe assessment has two layers (both must pass):
 
 The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_diff` API entries, `warnings.warn` (call-stack-inspecting, so warnings emitted with `stacklevel=N` are correctly attributed to the diff_diff frame), and `builtins.open` / `io.open` (for guide-file paths). These patches are detectable by an introspecting agent:
 
-- `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper in `sitecustomize.py`; the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
-- `sys.modules['sitecustomize']` is present (Python convention; not eval-specific).
+- `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper from the shim module (`_pyruntime_shim` post-PR-#6; see "Per-arm venv build" section below); the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
+- `sys.modules['_pyruntime_shim']` is present after the venv's `_pyruntime_shim.pth` fires (PR #6). The historical `sys.modules['sitecustomize']` slot is occupied by Homebrew Python's own stdlib-level `sitecustomize.py` on affected systems and by no module at all elsewhere.
 - `warnings.warn is not <original>` reveals a custom warning handler is installed (the override wraps `warn` rather than `showwarning` so it can inspect the call stack before `stacklevel` rewrites the displayed filename).
 - `builtins.open is not <original>` and `io.open is not <original>` could be detected — both are overridden so pathlib/importlib.resources reads of guide files are recorded.
-- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading `sitecustomize.py` source can see exactly which estimators and diagnostics are monitored.
+- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading the shim source (`venv/lib/python3.X/site-packages/_pyruntime_shim.py`) can see exactly which estimators and diagnostics are monitored.
 - The package name `"diff_diff"` appears as a string literal in the warning filter and patch targets. Visible to introspecting agents.
 
 The shim contains NO string literals naming the eval framework, the agent under test, the comparator arm, or the rubric. `grep -r causal_llm_eval $(python -c 'import sys; print(sys.prefix)')` finds nothing in the shim. Helper names use a neutral `_pyruntime_*` prefix matching the env-var convention (`_PYRUNTIME_EVENT_LOG`).
@@ -133,7 +157,7 @@ The merger's three-layer cross-check uses `ppid == runner_pid` as a binary parti
 
 1. `venv.create(template_dir, with_pip=True)` materializes the venv with pip.
 2. `${venv}/bin/python -m pip install <arm-pkg>==<library_version>` installs the arm library at the pinned PyPI version (`diff-diff==3.3.2` today; `statsmodels` is deferred to PR #7).
-3. `_install_shim_into_venv` copies `harness/sitecustomize_template.py` into the venv's `site-packages` as `sitecustomize.py`. Python's site machinery auto-loads it on every interpreter start.
+3. `_install_shim_into_venv` copies `harness/sitecustomize_template.py` into the venv's `site-packages` as `_pyruntime_shim.py` and writes a `_pyruntime_shim.pth` file containing `import _pyruntime_shim`. Python's site machinery processes the `.pth` file during `addsitepackages()` (BEFORE `execsitecustomize`), so our shim loads regardless of whether the operator's system Python has its own stdlib-level `sitecustomize.py`. Homebrew's `python@3.13` (Feb 2026+) ships such a stdlib-level `sitecustomize.py` that would otherwise shadow any `sitecustomize.py` installed in venv site-packages because stdlib comes before site-packages in `sys.path`. The `.pth` approach is the canonical workaround (used by `coverage.py` and `pytest-cov`).
 4. `_install_python_wrapper` installs the layer-1.5 wrapper (see above).
 
 Phase 1 builds a fresh venv per run (~10-30s per build). Phase 2 (PR #6+) replaces this with `clone_for_run`: build the template once per pytest session / per cell, then clone-per-run cuts the cost to <1s.

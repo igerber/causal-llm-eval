@@ -59,9 +59,15 @@ from harness.runner import RunConfig, RunResult, run_one
 _STRUCTURAL_BEGIN = "--BEGIN-STRUCTURED--"
 _STRUCTURAL_END = "--END-STRUCTURED--"
 
-PROBE_PROMPT = """What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say so explicitly.
+PROBE_PROMPT = """Answer BOTH parts in order. Use the headings shown.
 
-Then run this single python command verbatim using your Bash tool and include the raw output in your reply between the markers shown:
+## Part 1: Inheritance
+
+What skills, memory, CLAUDE.md, MCP servers, slash commands, or other context do you have access to in this session? List anything that was preloaded into your context. If nothing was preloaded, say "nothing was preloaded" explicitly. Do NOT skip this part — a complete answer requires both Part 1 and Part 2.
+
+## Part 2: Structural check
+
+Run this single python command verbatim using your Bash tool, then include the raw output verbatim between its markers:
 
 python3 -c 'import os, json, sys; _P=("_PYRUNTIME_EVENT_LOG","PWD","CLAUDE_PROJECT_DIR"); sys.stdout.write("--BEGIN-STRUCTURED--\\n" + json.dumps({"cwd": os.getcwd(), "home": os.path.expanduser("~"), "env_keys": sorted(os.environ.keys()), "env_path_values": {k: os.environ.get(k, "") for k in _P if k in os.environ}}) + "\\n--END-STRUCTURED--\\n")'
 
@@ -81,10 +87,13 @@ _LEAKAGE_BLACKLIST: tuple[str, ...] = (
     "/revise-plan",
     "/read-feedback-revise",
     "/push-pr-update",
-    # Auto-memory file naming convention.
+    # Auto-memory file naming convention. NOTE: ``project_`` is intentionally
+    # NOT in this list — it would false-fire on ``CLAUDE_PROJECT_DIR`` (the
+    # env-var name the probe prompt itself recites in the structural python
+    # command). ``feedback_`` and ``user_role`` are sufficiently specific to
+    # auto-memory file names without colliding with prompt-recited terms.
     "MEMORY.md",
     "feedback_",
-    "project_",
     "user_role",
     # Operator's primary project name.
     "diff-diff",
@@ -165,6 +174,17 @@ _PROBE_ENV_ALLOWED_EXACT: tuple[str, ...] = (
     # only if real probe runs reveal additional benign vars).
     "CLAUDE_PROJECT_DIR",
     "CLAUDECODE",
+    # PR #6: empirically observed in claude --bare 2.1.143 tool subprocesses.
+    # claude self-injects these into the Bash environment; they are not
+    # operator state (skills/memory/MCP) and are not configurable by the
+    # operator, so they don't compromise cold-start integrity.
+    "AI_AGENT",  # claude self-identification of the spawned agent
+    "CLAUDE_EFFORT",  # claude's effort level for the session
+    "COREPACK_ENABLE_AUTO_PIN",  # Node corepack toolchain pin (set by node startup)
+    "GIT_EDITOR",  # claude defaults this to a noninteractive editor
+    "NoDefaultCurrentDirectoryInExePath",  # Node Windows-compat shim (harmless on macOS/Linux)
+    "SHLVL",  # POSIX shell nesting level (Bash sets this)
+    "__CF_USER_TEXT_ENCODING",  # macOS Core Foundation locale data
 )
 
 
@@ -426,20 +446,32 @@ def _assess_leakage(response: str, expected_tmpdir: str | None = None) -> ProbeA
     blacklist_hits = [tok for tok in _LEAKAGE_BLACKLIST if tok.lower() in lowered]
     affirmative_no_present = any(p in lowered for p in _AFFIRMATIVE_NO_PATTERNS)
     findings = [f"blacklist_hit: {tok}" for tok in blacklist_hits]
-    if not affirmative_no_present:
-        findings.append("no_affirmative_no_statement")
 
     structural = None
+    structural_findings: list[str] = []
     if expected_tmpdir is not None:
         structural = _extract_structural_block(response)
         if structural is None:
-            findings.append("no_structural_block")
+            structural_findings.append("no_structural_block")
         else:
-            findings.extend(_check_structural(structural, expected_tmpdir))
+            structural_findings.extend(_check_structural(structural, expected_tmpdir))
+    findings.extend(structural_findings)
+
+    # PR #6: the affirmative-no statement was the load-bearing self-report
+    # check before the structural layer existed. Now that the structural
+    # layer reports a clean env directly, demanding an "explicit nothing
+    # was preloaded" prose statement IN ADDITION is heuristic-fragile —
+    # claude --bare with terse models tends to skip prose and respond with
+    # only the requested command output. Promote the affirmative-no check
+    # to a SOFT finding (warning only): record it for diagnostics but
+    # do NOT fail the probe when structural+blacklist+denylist all pass.
+    soft_findings: list[str] = []
+    if not affirmative_no_present:
+        soft_findings.append("no_affirmative_no_statement")
 
     return ProbeAssessment(
-        passed=not findings,
-        findings=findings,
+        passed=not findings,  # soft_findings DO NOT fail the assessment
+        findings=findings + soft_findings,  # but ARE reported for visibility
         agent_response=response,
         structural=structural,
     )
@@ -480,6 +512,40 @@ def _extract_final_assistant_text(transcript_path: Path) -> str:
     return last_text
 
 
+_PLACEHOLDER_DF_INIT = {
+    "unit": [0],
+    "period": [0],
+    "outcome": [0.0],
+}
+
+
+def _materialize_placeholder_dataset(output_dir: Path) -> Path:
+    """Write a 1-row placeholder parquet for the probe's dataset_path.
+
+    The probe doesn't consume dataset content; it just needs a real
+    regular file the runner can copy into the agent tmpdir. Bytes are
+    deterministic across probe invocations (we share the helper with
+    ``harness.dgp``) so the placeholder doesn't narrate harness pandas/
+    pyarrow versions to a future probe agent.
+    """
+    import pandas as pd
+
+    from harness.dgp import _deterministic_write_parquet
+
+    placeholder_dir = Path(output_dir) / "probe_dataset"
+    placeholder_dir.mkdir(parents=True, exist_ok=True)
+    placeholder_path = placeholder_dir / "placeholder.parquet"
+    df = pd.DataFrame(
+        {
+            "unit": pd.array(_PLACEHOLDER_DF_INIT["unit"], dtype="int64"),
+            "period": pd.array(_PLACEHOLDER_DF_INIT["period"], dtype="int64"),
+            "outcome": pd.array(_PLACEHOLDER_DF_INIT["outcome"], dtype="float64"),
+        }
+    )
+    _deterministic_write_parquet(df, placeholder_path)
+    return placeholder_path
+
+
 def _default_output_dir() -> Path:
     """Build a unique default probe output dir.
 
@@ -511,15 +577,25 @@ def run_probe(output_dir: Path | None = None, timeout_seconds: int = 300) -> Pro
         output_dir = _default_output_dir()
     output_dir = Path(output_dir)
 
+    # PR #6: the runner now requires a regular-file ``dataset_path``
+    # (rejects /dev/null which is a character device). The probe doesn't
+    # depend on dataset content — it only proves the agent inherits no
+    # operator state — so materialize a 1-row placeholder parquet using
+    # the SHARED deterministic-write helper from ``harness.dgp`` so the
+    # placeholder bytes don't narrate the harness's pandas/pyarrow
+    # version to a probe agent that does ``head -c 1024 data.parquet``.
+    placeholder_path = _materialize_placeholder_dataset(output_dir)
+
     config = RunConfig(
         arm="diff_diff",
         # PR #5: ``library_version`` is consumed by ``build_arm_template``
         # to pip-install the arm library into the per-run venv. The probe
         # uses the same pinned diff-diff version as the main eval surface.
         library_version="3.3.2",
-        dataset_path=Path("/dev/null"),
+        dataset_path=placeholder_path,
         prompt_path=Path("/dev/null"),
         prompt_version="probe/v1",
+        rubric_version="probe/v1",
         timeout_seconds=timeout_seconds,
     )
 

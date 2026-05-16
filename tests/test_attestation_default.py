@@ -18,16 +18,23 @@ This file closes that gap with CHEAP default tests:
     4. Assert wiring invariants the runner's post-sentinel attestation
        check would catch.
 
-**Layer-2 sitecustomize coverage caveat**: when the operator's host
-Python ships its own ``sitecustomize.py`` (e.g. Homebrew Python on
-macOS at ``${HOMEBREW_PREFIX}/Cellar/python@.../sitecustomize.py``),
-that system sitecustomize shadows the one we install into the venv's
-site-packages. CPython's ``site.py`` loads only the first
-``sitecustomize`` it can import, so on such systems our layer-2 events
-(``session_start`` / ``session_end``) never fire for the bare-venv
-test. The two layer-2 tests below auto-skip on shadowed systems; the
-layer-1.5 wrapper tests run unconditionally because the wrapper
-emits independently of sitecustomize.
+**Layer-2 sitecustomize coverage caveat (HISTORICAL — see PR #6)**:
+this test was originally written when the layer-2 shim was installed
+as ``sitecustomize.py`` in the venv's site-packages. On systems where
+the host Python ships its own stdlib-level ``sitecustomize.py`` (e.g.
+Homebrew Python on macOS), that system file shadows venv-site-packages
+sitecustomize because stdlib comes before site-packages in ``sys.path``;
+our layer-2 events would not fire. The two layer-2 tests below
+auto-skip on shadowed systems for that historical reason.
+
+PR #6 changed the shim install to ``_pyruntime_shim.py`` +
+``_pyruntime_shim.pth``, which Python's site machinery loads via
+``addsitepackages()`` regardless of whether stdlib has its own
+``sitecustomize.py``. The shadow-detection skip is therefore now
+OVER-CAUTIOUS — the shim would actually load successfully on systems
+the test currently skips. The skip is preserved here as conservative
+behavior; revisit by removing the skip and asserting layer-2 fires
+unconditionally (TODO; tracked separately).
 
 Cost: ~1-2s per test (venv create, no pip install). Default-CI
 compatible.

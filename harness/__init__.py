@@ -8,10 +8,15 @@ structured per-run records suitable for grading by `graders/ai_judge.py`.
 Modules:
     runner       - cold-start agent spawner with the locked --bare invocation
     telemetry    - three-layer capture
-    sitecustomize_template - in-process instrumentation shim, copied per venv
+    sitecustomize_template - in-process instrumentation shim. Installed per
+                             venv as ``_pyruntime_shim.py`` + ``_pyruntime_shim.pth``
+                             (PR #6 fix — the .pth-based load survives Homebrew
+                             Python's stdlib-level sitecustomize.py shadow).
     venv_pool    - per-arm venv management
+    dgp          - synthetic data-generating process for the case study
     scheduler    - parallelism + budget tracking (used Phase 2+)
     extractor    - deterministic result extraction from in-process event log
+    probe        - cold-start inheritance probe (live ``make smoke``)
 
 See the latest plan in ~/.claude/plans/ for locked architectural decisions.
 """

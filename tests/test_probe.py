@@ -49,11 +49,22 @@ def test_assess_leakage_fails_on_diff_diff_project_name_mention():
     assert any("diff-diff" in f for f in a.findings)
 
 
-def test_assess_leakage_fails_on_silence_no_affirmative_statement():
+def test_assess_leakage_reports_no_affirmative_no_as_soft_finding():
+    """PR #6: the affirmative-no statement is now a SOFT finding — recorded
+    for diagnostics but does not fail the assessment when the structural
+    layer reports a clean env (here, structural is not run because
+    expected_tmpdir=None, which is the legacy self-report-only mode).
+
+    When called without expected_tmpdir, NO structural assessment runs, so
+    the only checks are blacklist + affirmative-no. The affirmative-no
+    finding is reported but `passed` reflects only the LOAD-BEARING checks
+    (blacklist + structural). In legacy self-report-only mode with no
+    blacklist hits, the run passes (with a diagnostic finding).
+    """
     response = "I am ready to help."
     a = _assess_leakage(response)
-    assert a.passed is False
-    assert "no_affirmative_no_statement" in a.findings
+    assert a.passed is True, f"unexpected hard failure: {a.findings}"
+    assert "no_affirmative_no_statement" in a.findings  # but still REPORTED
 
 
 def test_assess_leakage_findings_list_includes_each_hit():
@@ -628,3 +639,49 @@ def test_assess_leakage_without_tmpdir_skips_structural_layer():
     assert a.passed is True
     assert a.findings == []
     assert a.structural is None
+
+
+# -- PR #6: placeholder parquet helper ----------------------------------------
+
+
+def test_materialize_placeholder_dataset_writes_real_regular_file(tmp_path):
+    """Probe placeholder is a real regular file the runner will accept."""
+    import stat as stat_module
+
+    from harness.probe import _materialize_placeholder_dataset
+
+    placeholder = _materialize_placeholder_dataset(tmp_path)
+    assert placeholder.exists()
+    assert placeholder.is_file()
+    assert not placeholder.is_symlink()
+    mode = placeholder.lstat().st_mode
+    assert stat_module.S_ISREG(mode)
+
+
+def test_materialize_placeholder_dataset_is_deterministic(tmp_path):
+    """Two probe invocations produce bit-identical placeholder bytes.
+
+    Uses the shared _deterministic_write_parquet helper from harness.dgp,
+    so the placeholder bytes don't narrate harness pandas/pyarrow versions.
+    """
+    import hashlib
+
+    from harness.probe import _materialize_placeholder_dataset
+
+    p1 = _materialize_placeholder_dataset(tmp_path / "a")
+    p2 = _materialize_placeholder_dataset(tmp_path / "b")
+    sha1 = hashlib.sha256(p1.read_bytes()).hexdigest()
+    sha2 = hashlib.sha256(p2.read_bytes()).hexdigest()
+    assert sha1 == sha2
+
+
+def test_probe_run_config_passes_dataset_validation(tmp_path):
+    """End-to-end smoke: the probe's RunConfig can pass _validate_dataset_path
+    without raising. Catches regressions where the probe's placeholder mechanism
+    drifts from the runner's strict-reject contract.
+    """
+    from harness.probe import _materialize_placeholder_dataset
+    from harness.runner import _validate_dataset_path
+
+    placeholder = _materialize_placeholder_dataset(tmp_path)
+    _validate_dataset_path(placeholder)  # must not raise

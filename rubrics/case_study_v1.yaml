@@ -1,0 +1,13 @@
+# STUB ONLY - DO NOT FILL IN PLACE.
+#
+# PR #7+ should write `case_study_v2.yaml` with real grading criteria
+# rather than editing this file. The `case_study_v1` ID is reserved for
+# this stub state. Per-run records' metadata.json files emitted before
+# PR #7 lands will reference this stub via RunConfig.rubric_version, so
+# editing the content in place would silently invalidate any existing
+# records that point at v1.
+#
+# CLAUDE.md item 4: "Once a prompt [or rubric] is recorded against runs,
+# it is immutable. New rubric = new version file."
+version: "v1.0"
+criteria: []

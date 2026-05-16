@@ -47,8 +47,13 @@ def build_arm_template(arm: str, library_version: str, template_dir: Path) -> Pa
         1. Create a fresh venv at ``template_dir`` (no system site packages).
         2. ``pip install`` the arm library at the pinned version.
         3. Copy ``harness/sitecustomize_template.py`` into the venv's
-           ``site-packages`` as ``sitecustomize.py``. Python's site machinery
-           auto-loads this file on every interpreter start.
+           ``site-packages`` as ``_pyruntime_shim.py`` and write a
+           ``_pyruntime_shim.pth`` next to it (PR #6 fix; see
+           ``_install_shim_into_venv`` for the rationale on why .pth-based
+           load is required on Homebrew Python). Python's site machinery
+           processes the .pth file during site init; our shim loads even
+           when the operator's system Python ships its own
+           stdlib-level ``sitecustomize.py``.
         4. Install the layer-1.5 ``python`` wrapper: rename
            ``${venv}/bin/python`` to ``python-real`` and replace with a copy
            of ``harness/python_wrapper.sh``. Repeat for ``python3`` and
@@ -144,9 +149,22 @@ def clone_for_run(template_dir: Path, run_dir: Path) -> Path:
     )
 
 
+_SHIM_INSTALL_NAME = "_pyruntime_shim"
+_SHIM_PTH_CONTENT = "import _pyruntime_shim\n"
+
+
 def _install_shim_into_venv(venv_path: Path) -> None:
     """Copy ``harness/sitecustomize_template.py`` into the venv's site-packages
-    as ``sitecustomize.py``.
+    as ``_pyruntime_shim.py`` and write a ``_pyruntime_shim.pth`` next to it.
+
+    The .pth file's ``import _pyruntime_shim`` line is processed by Python's
+    site machinery during initialization (BEFORE ``execsitecustomize`` runs),
+    so our shim loads regardless of whether the operator's system Python has
+    its own ``sitecustomize.py``. Homebrew's ``python@3.13`` (Feb 2026+)
+    ships a stdlib-level ``sitecustomize.py`` that would otherwise shadow
+    any ``sitecustomize.py`` we install in venv site-packages, because
+    stdlib comes before site-packages in sys.path. The .pth approach is the
+    canonical workaround (used by coverage.py and pytest-cov).
 
     Locates ``site-packages`` via ``sysconfig.get_paths()['purelib']``
     invoked through the venv's own python. Pass a clean env to the
@@ -169,8 +187,10 @@ def _install_shim_into_venv(venv_path: Path) -> None:
         env={"PATH": os.environ.get("PATH", "")},
     )
     site_packages = Path(probe.stdout.strip())
-    target = site_packages / "sitecustomize.py"
-    shutil.copyfile(_SITECUSTOMIZE_SOURCE, target)
+    shim_target = site_packages / f"{_SHIM_INSTALL_NAME}.py"
+    pth_target = site_packages / f"{_SHIM_INSTALL_NAME}.pth"
+    shutil.copyfile(_SITECUSTOMIZE_SOURCE, shim_target)
+    pth_target.write_text(_SHIM_PTH_CONTENT)
 
 
 _REAL_INTERPRETER_DIRNAME = ".pyruntime-real"

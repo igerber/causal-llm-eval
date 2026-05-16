@@ -1,0 +1,1 @@
+# STUB ONLY - DO NOT FILL IN PLACE. PR #7+ should write v2.txt when prompt content lands.

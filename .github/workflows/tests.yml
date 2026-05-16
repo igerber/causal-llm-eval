@@ -9,6 +9,15 @@ on:
       - 'graders/**'
       - 'analysis/**'
       - 'tests/**'
+      # PR #6 R2 DT-1: prompts/, rubrics/, datasets/, and the Makefile dgp
+      # target are now part of the validity surface (committed-vs-regenerated
+      # parquet guard, prompt/rubric registry-id contract, DGP regeneration).
+      # Without these in the path filter, future PRs touching only those
+      # paths would skip pytest and miss validity-surface regressions.
+      - 'prompts/**'
+      - 'rubrics/**'
+      - 'datasets/**'
+      - 'Makefile'
       - 'pyproject.toml'
       - '.github/workflows/tests.yml'
   push:
