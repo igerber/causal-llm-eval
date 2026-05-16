@@ -12,14 +12,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Probit` (estimator `__init__` + `fit`); statsmodels-relevant diagnostic
   functions (`het_breuschpagan`, `het_white`, `linear_reset`,
   `acorr_breusch_godfrey`, `acorr_ljungbox`, `durbin_watson`); and post-fit
-  results methods (`RegressionResults.summary`,
-  `RegressionResults.get_robustcov_results`). Result-method wrapper records
-  `type(self).__name__` at call time, so OLSResults / RLMResults /
-  MixedLMResults instances surface as the correct class without enumerating
-  every subclass. `_attach_statsmodels_hooks` walks each submodule and
-  patches the target attribute; `_StatsmodelsPostImportHook` (mirrored
-  architecture of `_DiffDiffPostImportHook`) triggers attachment when
-  `statsmodels` is imported.
+  results methods (`RegressionResults.summary` and
+  `RegressionResults.get_robustcov_results` cover the OLS / WLS / GLS /
+  GLSAR family via MRO; explicit `RLMResults.summary`,
+  `GLMResults.summary`, `MixedLMResults.summary`, and `BinaryResults.summary`
+  cover the LikelihoodModelResults-family classes that don't inherit from
+  `RegressionResults`, so RLM / GLM / MixedLM / Logit / Probit are also
+  tracked). Result-method wrapper records `type(self).__name__` at call
+  time, so the runtime leaf class (e.g. `LogitResults`) surfaces in the
+  event without enumerating every subclass. `_attach_statsmodels_hooks`
+  walks each submodule and patches the target attribute;
+  `_StatsmodelsPostImportHook` (mirrored architecture of
+  `_DiffDiffPostImportHook`) triggers attachment when `statsmodels` is
+  imported.
 - `library: str` attribution field on every library-surface event the
   shim emits — `estimator_init`, `estimator_fit`, `diagnostic_call`,
   `estimator_diagnostic_method`, `warning_emitted`, `guide_file_read`
