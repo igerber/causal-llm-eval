@@ -151,6 +151,45 @@ def test_committed_dataset_matches_regeneration(tmp_path: Path) -> None:
     )
 
 
+def test_committed_dgp_truth_matches_current_constants() -> None:
+    """Always-on parameter-drift guard: committed dgp_truth.json fields match
+    the current constants in harness.dgp.
+
+    Complements ``test_committed_dataset_matches_regeneration`` (which skips
+    when pandas/pyarrow versions drift). This test fires UNCONDITIONALLY
+    and catches the case where someone edits ``_DGP_CALL_KWARGS`` /
+    ``CASE_STUDY_V1_DGP_VERSION`` / ``_PERSISTED_COLUMNS`` /
+    ``_PERSISTED_DTYPES`` without regenerating the committed
+    ``dgp_truth.json``. Without this guard, a writer-version drift could
+    skip the byte-identity test AND the parameter-drift detection at the
+    same time.
+    """
+    if not _COMMITTED_DATASET.exists():
+        pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+
+    assert committed["dgp_version"] == CASE_STUDY_V1_DGP_VERSION, (
+        f"committed dgp_version {committed['dgp_version']!r} != current "
+        f"CASE_STUDY_V1_DGP_VERSION {CASE_STUDY_V1_DGP_VERSION!r}; "
+        "regenerate datasets/case_study_v1/ via `make dgp`."
+    )
+    assert committed["seed"] == 42, (
+        f"committed seed {committed['seed']!r} != locked default 42; " "regenerate via `make dgp`."
+    )
+    assert committed["parameters"] == _DGP_CALL_KWARGS, (
+        "committed _DGP_CALL_KWARGS drifted from current; bump "
+        "CASE_STUDY_V1_DGP_VERSION and regenerate via `make dgp`."
+    )
+    assert committed["schema"]["columns"] == list(_PERSISTED_COLUMNS), (
+        "committed schema.columns drifted from current _PERSISTED_COLUMNS; "
+        "regenerate via `make dgp`."
+    )
+    assert committed["schema"]["dtypes"] == dict(_PERSISTED_DTYPES), (
+        "committed schema.dtypes drifted from current _PERSISTED_DTYPES; "
+        "regenerate via `make dgp`."
+    )
+
+
 def test_round_trip_dataframe_equals(tmp_path: Path) -> None:
     """Reading the parquet back yields the same DataFrame we wrote."""
     parquet = generate_case_study_v1(tmp_path, seed=42)
