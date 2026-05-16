@@ -1,4 +1,5 @@
 {
+  "data_sha256": "cd87d0dd50b8a3816fef247425ff2871266532741a0ce4b2a3d6f2b5cf78016c",
   "dgp_version": "v1.0",
   "diff_diff_version": "3.3.2",
   "generator_function": "diff_diff.generate_staggered_data",
@@ -31,7 +32,7 @@
       }
     }
   },
-  "notes": "Starter parameters; calibration loop pending. The persisted data.parquet drops the DGP's `true_effect` column to preserve eval validity (agent must estimate, not read, the effect). Byte-identical regeneration requires matching writer_versions; see tests/test_dgp.py::test_committed_dataset_matches_regeneration.",
+  "notes": "Starter parameters; calibration loop pending. The persisted data.parquet drops the DGP's `true_effect` column to preserve eval validity (agent must estimate, not read, the effect). Byte-identical regeneration requires matching writer_versions; see tests/test_dgp.py::test_committed_dataset_matches_regeneration. The data_sha256 field unconditionally binds this sidecar to the parquet bytes; tests/test_dgp.py::test_committed_dgp_truth_data_sha asserts they stay in sync.",
   "parameters": {
     "cohort_periods": [
       4,

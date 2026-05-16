@@ -149,12 +149,16 @@ def _write_dgp_truth(
     df_full: pd.DataFrame,
     n_rows: int,
     diff_diff_version: str,
+    data_sha256: str,
 ) -> None:
     """Write the ground-truth sidecar JSON with deterministic key order.
 
     Records the diff_diff/pandas/pyarrow versions used to materialize the
     parquet so a future regenerator can detect when byte-identity will not
-    hold under newer writer versions (PR #6 R3 DT-1).
+    hold under newer writer versions (PR #6 R3 DT-1). Also records the
+    sha256 of data.parquet so the sidecar is unconditionally bound to the
+    artifact bytes (PR #6 R5 DT-1) — a data-only artifact swap will
+    surface even when writer-version drift skips the byte-regen test.
     """
     payload = {
         "dgp_version": CASE_STUDY_V1_DGP_VERSION,
@@ -172,13 +176,17 @@ def _write_dgp_truth(
             "pandas": pd.__version__,
             "pyarrow": pa.__version__,
         },
+        "data_sha256": data_sha256,
         "uncalibrated": True,
         "notes": (
             "Starter parameters; calibration loop pending. The persisted "
             "data.parquet drops the DGP's `true_effect` column to preserve "
             "eval validity (agent must estimate, not read, the effect). "
             "Byte-identical regeneration requires matching writer_versions; "
-            "see tests/test_dgp.py::test_committed_dataset_matches_regeneration."
+            "see tests/test_dgp.py::test_committed_dataset_matches_regeneration. "
+            "The data_sha256 field unconditionally binds this sidecar to the "
+            "parquet bytes; tests/test_dgp.py::test_committed_dgp_truth_data_sha "
+            "asserts they stay in sync."
         ),
     }
     with open(out_path, "w") as f:
@@ -257,6 +265,7 @@ def generate_case_study_v1(out_dir: Path, *, seed: int = 42) -> Path:
 
     parquet_path = out_dir / "data.parquet"
     _deterministic_write_parquet(df_persist, parquet_path)
+    data_sha256 = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
 
     _write_dgp_truth(
         out_dir / "dgp_truth.json",
@@ -264,6 +273,7 @@ def generate_case_study_v1(out_dir: Path, *, seed: int = 42) -> Path:
         df_full=df_full,
         n_rows=len(df_persist),
         diff_diff_version=diff_diff.__version__,
+        data_sha256=data_sha256,
     )
 
     (out_dir / "README.md").write_text(_README_TEXT)

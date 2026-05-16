@@ -882,11 +882,47 @@ def run_one(config: RunConfig, prompt: str, output_dir: Path) -> RunResult:
     # reproducibility-anchored record. The three failure-path sentinels
     # (timeout / descendants_live / telemetry_missing) all suppress the
     # metadata write; downstream extractors branch on file presence.
+    #
+    # PR #6 R5 EV-1: ALSO suppress metadata.json when the layer-1 stream-JSON
+    # transcript is empty / malformed / truncated. Without this check, an
+    # exit_code-0 + no-descendants + telemetry-not-missing run with an
+    # unmergeable transcript would emit metadata.json — and downstream
+    # consumers branching on metadata.json presence would treat the
+    # unmergeable run as clean. Reuses the merger's preflight check so the
+    # absence-is-signal contract holds end-to-end.
     metadata_emitted_path: Path | None = None
     clean_exit = (
         exit_code == 0 and not descendants_live and exit_code != EXIT_CODE_TELEMETRY_MISSING
     )
     if clean_exit:
+        # Lazy import: keeps top-level runner.py import free of telemetry
+        # parsing surface, and the merger preflight is only needed on the
+        # clean-exit branch.
+        from harness.telemetry import TelemetryMergeError, _validate_layer_artifacts
+
+        try:
+            _validate_layer_artifacts(transcript_jsonl_path, cli_stderr_log_path)
+        except TelemetryMergeError:
+            # Transcript empty/malformed/truncated. Suppress metadata.json
+            # so consumers branching on its presence treat this run as
+            # incomplete. Matches the descendants_live / telemetry_missing
+            # absence-is-signal convention.
+            return RunResult(
+                run_id=run_id,
+                arm=config.arm,
+                tmpdir=tmpdir,
+                transcript_jsonl_path=transcript_jsonl_path,
+                in_process_events_path=final_event_log_path,
+                cli_stderr_log_path=cli_stderr_log_path,
+                record_parquet_path=None,
+                final_code_path=None,
+                wall_clock_seconds=wall_clock_seconds,
+                exit_code=exit_code,
+                venv_path=venv_dir,
+                runner_pid=os.getpid(),
+                dataset_in_tmpdir_path=dataset_in_tmpdir_path,
+                metadata_json_path=None,
+            )
         metadata = RunMetadata(
             harness_version=harness_version,
             library_version=config.library_version,

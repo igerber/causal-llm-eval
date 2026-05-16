@@ -70,10 +70,17 @@ def test_dgp_truth_json_schema(tmp_path: Path) -> None:
         "ground_truth",
         "schema",
         "writer_versions",  # PR #6 R3 DT-1: pandas/pyarrow versions for byte-identity
+        "data_sha256",  # PR #6 R5 DT-1: unconditional sidecar-to-bytes binding
         "uncalibrated",
         "notes",
     }
     assert required_top_level.issubset(payload.keys())
+
+    # data_sha256 binds the sidecar to the parquet bytes. Length 64 hex,
+    # case-insensitive (writer always emits lowercase but we accept both).
+    assert isinstance(payload["data_sha256"], str)
+    assert len(payload["data_sha256"]) == 64
+    assert all(c in "0123456789abcdefABCDEF" for c in payload["data_sha256"])
 
     # writer_versions records the exact pandas/pyarrow versions used to
     # write the parquet, so the regeneration test can detect when
@@ -187,6 +194,36 @@ def test_committed_dgp_truth_matches_current_constants() -> None:
     assert committed["schema"]["dtypes"] == dict(_PERSISTED_DTYPES), (
         "committed schema.dtypes drifted from current _PERSISTED_DTYPES; "
         "regenerate via `make dgp`."
+    )
+
+
+def test_committed_dgp_truth_data_sha() -> None:
+    """Always-on artifact-binding guard: committed dgp_truth.json::data_sha256
+    matches the actual sha256 of the committed data.parquet bytes.
+
+    Complements:
+      - test_committed_dataset_matches_regeneration (skips on writer drift)
+      - test_committed_dgp_truth_matches_current_constants (parameters only)
+
+    This test fires UNCONDITIONALLY on the COMMITTED bytes themselves,
+    so a data-only artifact swap (someone replaces data.parquet without
+    updating dgp_truth.json) is caught even when writer-version drift
+    skips the byte-regen test. Without this guard, downstream graders
+    consuming dgp_truth.json's ground_truth could attribute it to the
+    wrong parquet bytes.
+    """
+    if not _COMMITTED_DATASET.exists():
+        pytest.skip("Committed dataset not present yet (PR #6 step 2 produces it).")
+    committed = json.loads((_COMMITTED_DATASET.parent / "dgp_truth.json").read_text())
+    expected_sha = committed.get("data_sha256")
+    assert expected_sha, "dgp_truth.json missing data_sha256 field"
+    actual_sha = _sha256(_COMMITTED_DATASET)
+    assert actual_sha == expected_sha, (
+        f"committed data.parquet sha256 {actual_sha!r} does not match "
+        f"committed dgp_truth.json::data_sha256 {expected_sha!r}. "
+        "Either the parquet was edited without regenerating the sidecar "
+        "(suspicious) or the sidecar was edited without regenerating the "
+        "parquet. Recovery: re-run `make dgp`."
     )
 
 

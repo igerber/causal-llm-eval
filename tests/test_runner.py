@@ -1446,6 +1446,14 @@ def test_harness_version_walks_up_to_git(tmp_path, monkeypatch):
 # -- metadata.json emission tests (PR #6 step 6) -------------------------------
 
 
+_VALID_TRANSCRIPT = (
+    json.dumps({"type": "system", "subtype": "init"})
+    + "\n"
+    + json.dumps({"type": "result", "subtype": "success", "is_error": False})
+    + "\n"
+)
+
+
 def _run_one_with_full_mocks(
     src_dataset: Path,
     output_dir: Path,
@@ -1453,16 +1461,41 @@ def _run_one_with_full_mocks(
     popen_returncode: int = 0,
     write_event_log: bool = True,
     descendants_live: bool = False,
+    write_valid_transcript: bool = True,
 ):
     """Helper: run run_one() under _mock_venv_setup with a real parquet src.
 
-    Defaults simulate a clean exit. Override to exercise failure paths.
+    Defaults simulate a clean exit AND a minimal valid transcript (init +
+    result success entries) so the layer-1 completeness check at
+    metadata-write time passes. Tests that want to exercise the unmergeable-
+    transcript path pass ``write_valid_transcript=False``.
+
+    PR #6 R5 EV-1: the mocked Popen captures stdout to a file but writes
+    nothing to it; without an explicit valid-transcript write, the
+    layer-1 check would correctly suppress metadata.json on every mock.
+    The helper writes _VALID_TRANSCRIPT to the runner's transcript path
+    AFTER tmpdir creation but BEFORE proc.wait() returns, simulating
+    real claude --print stream-json output.
     """
     with ExitStack() as stack:
         stack.enter_context(_mock_venv_setup())
         mock_popen = stack.enter_context(patch("harness.runner.subprocess.Popen"))
         mock_popen.return_value.wait.return_value = popen_returncode
         mock_popen.return_value.pid = os.getpid()
+
+        if write_valid_transcript:
+            # Override wait() to populate the transcript file before returning,
+            # mimicking claude --print emitting stream-JSON to stdout.
+            real_wait = mock_popen.return_value.wait
+
+            def wait_then_write_transcript(*args, **kwargs):
+                rc = real_wait(*args, **kwargs)
+                transcript_path = output_dir / "transcript.jsonl"
+                if transcript_path.exists():
+                    transcript_path.write_text(_VALID_TRANSCRIPT)
+                return rc
+
+            mock_popen.return_value.wait = wait_then_write_transcript
 
         if descendants_live:
             # Override the killpg patch in _mock_venv_setup so killpg
@@ -1611,5 +1644,62 @@ def test_run_one_does_not_emit_metadata_on_telemetry_missing(tmp_path):
     from harness.runner import EXIT_CODE_TELEMETRY_MISSING
 
     assert result.exit_code == EXIT_CODE_TELEMETRY_MISSING
+    assert result.metadata_json_path is None
+    assert not (output_dir / "metadata.json").exists()
+
+
+def test_run_one_does_not_emit_metadata_on_unmergeable_transcript(tmp_path):
+    """PR #6 R5 EV-1: an exit_code-0 + no-descendants + telemetry-not-missing
+    run with an unmergeable transcript (empty / malformed / truncated)
+    MUST suppress metadata.json emission.
+
+    Pass write_valid_transcript=False so the mocked Popen leaves the
+    transcript file empty. The merger's _validate_layer_artifacts rejects
+    empty transcripts, so the runner should suppress metadata.json even
+    though exit_code == 0.
+    """
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+    result = _run_one_with_full_mocks(src, output_dir, write_valid_transcript=False)
+    transcript_path = output_dir / "transcript.jsonl"
+    assert transcript_path.exists()
+    assert transcript_path.read_text() == ""
+    assert result.metadata_json_path is None, (
+        f"metadata.json was emitted despite an empty transcript "
+        f"(exit_code={result.exit_code}); expected suppression"
+    )
+    assert not (output_dir / "metadata.json").exists()
+
+
+def test_run_one_does_not_emit_metadata_on_truncated_transcript(tmp_path):
+    """PR #6 R5 EV-1: a transcript that ends WITHOUT a `type=result
+    subtype=success` entry (e.g. truncated mid-run, or final result has
+    is_error=True) MUST suppress metadata.json emission.
+    """
+    src = _make_real_parquet(tmp_path / "src.parquet")
+    output_dir = tmp_path / "out"
+
+    with ExitStack() as stack:
+        stack.enter_context(_mock_venv_setup())
+        mock_popen = stack.enter_context(patch("harness.runner.subprocess.Popen"))
+        mock_popen.return_value.wait.return_value = 0
+        mock_popen.return_value.pid = os.getpid()
+
+        real_wait = mock_popen.return_value.wait
+
+        def wait_then_write_truncated(*args, **kwargs):
+            rc = real_wait(*args, **kwargs)
+            # Transcript ends with an assistant message, no result entry.
+            (output_dir / "transcript.jsonl").write_text(
+                json.dumps({"type": "system", "subtype": "init"})
+                + "\n"
+                + json.dumps({"type": "assistant", "message": {}})
+                + "\n"
+            )
+            return rc
+
+        mock_popen.return_value.wait = wait_then_write_truncated
+        result = run_one(_config_with_dataset(src), "prompt", output_dir)
+
     assert result.metadata_json_path is None
     assert not (output_dir / "metadata.json").exists()
