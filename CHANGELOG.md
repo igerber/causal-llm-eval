@@ -20,11 +20,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   patches the target attribute; `_StatsmodelsPostImportHook` (mirrored
   architecture of `_DiffDiffPostImportHook`) triggers attachment when
   `statsmodels` is imported.
-- `library: str` attribution field on every event the shim emits
-  (`"diff_diff"` or `"statsmodels"`). The merger's record-builders filter
-  events by `library` rather than by filename substring, eliminating
-  cross-arm bleed-through. Backward compatible: events lacking `library`
-  default to `"diff_diff"` so PR #5/#6 records on disk remain parseable.
+- `library: str` attribution field on every library-surface event the
+  shim emits — `estimator_init`, `estimator_fit`, `diagnostic_call`,
+  `estimator_diagnostic_method`, `warning_emitted`, `guide_file_read`
+  (`"diff_diff"` or `"statsmodels"`). Structural events
+  (`session_start`, `session_end`, `module_import`) do NOT carry
+  `library`. The merger's schema validator REJECTS library-surface
+  records that omit `library` or carry an unrecognized arm, fail-closed
+  at parse time so cross-arm bleed-through cannot silently filter out of
+  the arm-keyed record builders. (Originally this PR documented a
+  backward-compat default for PR #5/#6 records on disk; that was
+  removed in R1 in favor of fail-closed validation — no production runs
+  pre-date the field, so the backward-compat path was both unused and a
+  silent-loss footgun.)
 - New event type `estimator_diagnostic_method` (distinct from
   `estimator_init` / `estimator_fit` / `diagnostic_call`) for post-fit
   results-method calls.
@@ -47,8 +55,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - 7 new tests in `tests/test_telemetry_merger.py` covering
   `_build_statsmodels_record` field population (estimator classes,
   diagnostics from both event types, fit-time warnings), cross-arm
-  event filtering, backward compatibility (events without `library`),
-  and the sentinel-fields-stay-None invariant.
+  event filtering, and the sentinel-fields-stay-None invariant. Plus
+  6 R1 follow-up tests for the strict-library-required validator
+  (missing-library rejection, unknown-arm rejection,
+  `estimator_diagnostic_method` malformed-event rejection × 3,
+  shim-event-types-have-schema-entry regression).
 - 3 new `@pytest.mark.slow` tests in `tests/test_venv_pool.py` covering
   the statsmodels-arm template build end-to-end (correct library version
   installed, `_pyruntime_shim.py` + `_pyruntime_shim.pth` present,

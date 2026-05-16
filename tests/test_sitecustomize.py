@@ -990,6 +990,109 @@ def test_statsmodels_GLMResults_summary_emits_diagnostic_method_event(event_log)
 
 
 @pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_RLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: RLMResults inherits from
+    LikelihoodModelResults (not RegressionResults), so the explicit
+    RLMResults entry in ``_STATSMODELS_RESULTS_METHODS`` is required.
+    This test proves the wiring fires."""
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.robust.robust_linear_model import RLM
+
+    y, x = _tiny_ols_data()
+    result = RLM(y, x).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "RLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert (
+        len(method_events) >= 1
+    ), f"RLMResults.summary() did not fire estimator_diagnostic_method: {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_MixedLMResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: MixedLMResults inherits from
+    LikelihoodModelResults + ResultMixin (not RegressionResults). Explicit
+    MixedLMResults entry required; this test proves wiring fires."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.regression.mixed_linear_model import MixedLM
+
+    rng = np.random.default_rng(42)
+    n_groups = 5
+    n_per_group = 8
+    n = n_groups * n_per_group
+    groups = np.repeat(np.arange(n_groups), n_per_group)
+    x = rng.normal(size=(n, 2))
+    y = x @ np.array([1.0, -0.5]) + rng.normal(size=n) * 0.5
+    result = MixedLM(y, x, groups=groups).fit()
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "MixedLMResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert (
+        len(method_events) >= 1
+    ), f"MixedLMResults.summary() did not fire estimator_diagnostic_method: {events}"
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
+def test_statsmodels_LogitResults_summary_emits_diagnostic_method_event(event_log):
+    """PR #7 R2 EV-2 follow-up: LogitResults inherits from BinaryResults
+    (which inherits from DiscreteResults → LikelihoodModelResults). The
+    shim patches BinaryResults.summary so both Logit AND Probit instances
+    surface correctly via MRO; the wrapper records ``type(self).__name__``
+    so the class name is the runtime leaf, not the patched parent."""
+    import numpy as np
+
+    _drop_statsmodels_from_sys_modules()
+    _import_shim_fresh()
+    import statsmodels  # noqa: F401
+    from statsmodels.discrete.discrete_model import Logit
+
+    rng = np.random.default_rng(0)
+    n = 50
+    x = np.column_stack([np.ones(n), rng.normal(size=n)])
+    # Binary outcomes from a logistic relationship
+    logits = x @ np.array([0.0, 1.0])
+    y = (rng.uniform(size=n) < (1 / (1 + np.exp(-logits)))).astype(int)
+    result = Logit(y, x).fit(disp=False)
+    result.summary()
+
+    events = _read_events(event_log)
+    method_events = [
+        e
+        for e in events
+        if e.get("event") == "estimator_diagnostic_method"
+        and e.get("method") == "summary"
+        and e.get("class") == "LogitResults"
+        and e.get("library") == "statsmodels"
+    ]
+    assert len(method_events) >= 1, (
+        f"LogitResults.summary() did not fire estimator_diagnostic_method; "
+        f"BinaryResults patch should catch it via MRO. Events: {events}"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_STATSMODELS, reason="statsmodels not importable in this venv")
 def test_statsmodels_het_breuschpagan_emits_diagnostic_call(event_log):
     _drop_statsmodels_from_sys_modules()
     _import_shim_fresh()
