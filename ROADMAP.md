@@ -6,7 +6,7 @@ For tech debt and deferred items, see [TODO.md](TODO.md).
 
 ## Current state
 
-Cold-start infrastructure is fully wired: the runner (`harness.runner.run_one`) spawns `claude --bare` into a per-run venv with the arm library + sitecustomize shim + layer-1.5 wrapper installed, captures three independent telemetry layers, and the merger (`harness.telemetry.merge_layers`) cross-validates them. A build-time sentinel proves wrapper + shim wiring before each agent runs. PR #6 added the synthetic DGP generator and the per-run reproducibility-anchored `metadata.json` sidecar; the runner now copies `RunConfig.dataset_path` into the per-run tmpdir under strict-reject regular-file validation.
+Cold-start infrastructure is fully wired: the runner (`harness.runner.run_one`) spawns `claude --bare` into a per-run venv with the arm library + layer-2 in-process shim (installed as `_pyruntime_shim.py` + `_pyruntime_shim.pth` in site-packages; the `.pth`-based load survives Homebrew Python's stdlib-level `sitecustomize.py`) + layer-1.5 `python` wrapper installed, captures three independent telemetry layers, and the merger (`harness.telemetry.merge_layers`) cross-validates them. A build-time sentinel proves wrapper + shim wiring before each agent runs. PR #6 added the synthetic DGP generator and the per-run reproducibility-anchored `metadata.json` sidecar; the runner now copies `RunConfig.dataset_path` into the per-run tmpdir under strict-reject regular-file validation.
 
 The next substantive deliverable is the **statsmodels arm instrumentation + case-study prompt** (PR #7), which together with the existing DGP + per-run-record pipeline make `make case-study-v1` runnable.
 

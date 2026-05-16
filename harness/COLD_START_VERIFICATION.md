@@ -92,11 +92,11 @@ The probe assessment has two layers:
 
 The in-process shim (`harness/sitecustomize_template.py`) monkey-patches `diff_diff` API entries, `warnings.warn` (call-stack-inspecting, so warnings emitted with `stacklevel=N` are correctly attributed to the diff_diff frame), and `builtins.open` / `io.open` (for guide-file paths). These patches are detectable by an introspecting agent:
 
-- `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper in `sitecustomize.py`; the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
-- `sys.modules['sitecustomize']` is present (Python convention; not eval-specific).
+- `inspect.getsource(diff_diff.TwoWayFixedEffects.fit)` reveals a wrapper from the shim module (`_pyruntime_shim` post-PR-#6; see "Per-arm venv build" section below); the `__wrapped__` attribute points at the original (the shim uses `functools.wraps`).
+- `sys.modules['_pyruntime_shim']` is present after the venv's `_pyruntime_shim.pth` fires (PR #6). The historical `sys.modules['sitecustomize']` slot is occupied by Homebrew Python's own stdlib-level `sitecustomize.py` on affected systems and by no module at all elsewhere.
 - `warnings.warn is not <original>` reveals a custom warning handler is installed (the override wraps `warn` rather than `showwarning` so it can inspect the call stack before `stacklevel` rewrites the displayed filename).
 - `builtins.open is not <original>` and `io.open is not <original>` could be detected — both are overridden so pathlib/importlib.resources reads of guide files are recorded.
-- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading `sitecustomize.py` source can see exactly which estimators and diagnostics are monitored.
+- The shim's `_ESTIMATOR_CLASS_NAMES` and `_DIAGNOSTIC_FUNCTION_NAMES` constants enumerate the methodology surface the eval tracks. An agent reading the shim source (`venv/lib/python3.X/site-packages/_pyruntime_shim.py`) can see exactly which estimators and diagnostics are monitored.
 - The package name `"diff_diff"` appears as a string literal in the warning filter and patch targets. Visible to introspecting agents.
 
 The shim contains NO string literals naming the eval framework, the agent under test, the comparator arm, or the rubric. `grep -r causal_llm_eval $(python -c 'import sys; print(sys.prefix)')` finds nothing in the shim. Helper names use a neutral `_pyruntime_*` prefix matching the env-var convention (`_PYRUNTIME_EVENT_LOG`).

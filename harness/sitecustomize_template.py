@@ -561,9 +561,12 @@ def _install_production_state() -> None:
     """Production initialization: env-var check, fd open, session_start
     emit, atexit register, hook install.
 
-    Called exactly once when Python's site machinery loads the file as
-    ``sitecustomize`` from the per-arm venv's site-packages (via the
-    ``__name__ == "sitecustomize"`` gate below). Also called by test
+    Called exactly once when Python's site machinery processes the
+    ``_pyruntime_shim.pth`` file in the per-arm venv's site-packages,
+    which executes ``import _pyruntime_shim`` and triggers the
+    ``__name__ == "_pyruntime_shim"`` gate below. (PR #6 changed the
+    load mechanism from a stdlib-shadow-vulnerable ``sitecustomize.py``
+    install to a robust ``.pth``-based load.) Also called by test
     fixtures via ``_import_shim_fresh()`` to fire the side effects on the
     importlib-imported module's namespace (so classes defined here and
     instances inserted into ``sys.meta_path`` are the same identity the
